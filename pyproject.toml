@@ -1,0 +1,57 @@
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[project]
+name = "ai-rpg"
+version = "0.1.0"
+description = "LLMと決定的なゲームエンジンを分離したAI TRPG基盤"
+readme = "docs/ai-trpg-architecture-v0.1.md"
+requires-python = ">=3.11"
+dependencies = [
+  "fastapi>=0.115,<1",
+  "pydantic>=2.10,<3",
+  "pydantic-settings>=2.7,<3",
+  "sqlalchemy[asyncio]>=2.0,<3",
+  "psycopg[binary]>=3.2,<4",
+]
+
+[dependency-groups]
+dev = [
+  "httpx>=0.28,<1",
+  "mypy>=1.14,<2",
+  "pytest>=8.3,<9",
+  "pytest-asyncio>=0.25,<1",
+  "ruff>=0.9,<1",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/ai_rpg"]
+
+[tool.pytest.ini_options]
+addopts = "--strict-config --strict-markers -ra"
+testpaths = ["tests"]
+markers = [
+  "integration: Infrastructure adapter間の結合を確認するテスト",
+  "contract: 外部境界が共有契約を満たすことを確認するテスト",
+]
+
+[tool.ruff]
+target-version = "py311"
+line-length = 100
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM", "RUF"]
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+packages = ["ai_rpg"]
+mypy_path = "src"
+plugins = ["pydantic.mypy"]
+
+[[tool.mypy.overrides]]
+module = ["sqlalchemy.*"]
+ignore_missing_imports = true
+
