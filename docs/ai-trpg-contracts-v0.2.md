@@ -2,6 +2,8 @@
 
 版: 0.2 / 2026-09-14 / レビュー用実装案
 
+> **決定の更新:** 本書の暫定値と対象外事項のうち、MVP ruleset、実行時設定、Turn routing、principal境界は [Architecture Decision Records](adr/README.md) で決定済みである。矛盾する場合は採用状態のADRを優先する。
+
 ## 1 今回の具体化
 
 合意済みの論理モデルをPython 3.11以降・Pydantic v2とPostgreSQL向けに具体化する。これは技術選定の最終承認や本番へのマイグレーション実行を意味しない。ゲームルール本体、認証基盤、Director、NPC記憶の詳細は対象外。
@@ -13,7 +15,7 @@
 - Campaign内のゲーム解決はMVPでは一度に1 Turn。LLM待ちの間はDBロックを保持せず、未解決Turnの一意制約で受付を制限する。
 - Event StoreはMVPではCanonical DBに併記する追記ログとする。完全なEvent Sourcingは要求しない。
 - state_versionはCanonicalの更新で増やす。会話のみ、確認質問、描写再生成では増やさない。ログ順序は別のevent_sequenceを使う。
-- Action上限は設定から読み、受付時にTurnへ保存する。既定値3は暫定。LLMのJSON Schemaにも同じ設定を反映する。
+- Action上限は設定から読み、受付時にTurnへ保存する。既定値3と設定元は [ADR-0008](adr/0008-runtime-defaults.md) で固定し、LLMのJSON Schemaにも同じ設定を反映する。
 - 文字数上限など本書で新規に置いた値は初期運用値。ゲームルール上の制限とは別物である。
 
 ## 2 Pythonの境界型
@@ -220,7 +222,7 @@ class DamageFact(Contract):
     amount: NonNegativeInt
     hp_before: SignedInt
     hp_after: SignedInt
-    # HPの下限や軽減後amountの意味はrulesetで定義する
+    # HPの下限や軽減後amountの意味はADR-0007のrulesetで定義する
 
 
 class AppliedResult(Contract):
@@ -391,7 +393,7 @@ DomainEventV1 = Annotated[
 
 Provider情報はすべてデータであり、ContextFragmentのcontentをsystem指示として結合しない。access_scopeは公開範囲、trust_levelは出所の信頼区分であり、互いに独立する。MVPでもApplicationは許可していないFragmentをLLMへ渡さない。
 
-ActionResultのfactsは演出用の公開事実であり、HP更新命令ではない。正確なダメージや状態変化はEngineのDomain Eventsに記録する。ルール固有のイベントpayloadは(type, schema_version)ごとの型レジストリで検証する。戦闘ルール未選定のため、HPの上下限や技能一覧を本書で固定しない。
+ActionResultのfactsは演出用の公開事実であり、HP更新命令ではない。正確なダメージや状態変化はEngineのDomain Eventsに記録する。ルール固有のイベントpayloadは(type, schema_version)ごとの型レジストリで検証する。HPの上下限、技能一覧、攻撃・アイテム・ダイス規則は [ADR-0007](adr/0007-mvp-ruleset.md) の `mvp_v1` に属し、本書の共通契約へ埋め込まない。
 
 DomainEventV1は今回具体化した4種の初期型。ActionResolvedは各Actionの最終結果を表し、DamageAppliedやDiceRolledは個別の出来事を表す。両方のpayloadに含まれるダメージを二重適用しない。MVPではEngineの結果を一度だけCanonicalへ適用し、イベントは記録と表示に使う。PlayerMessageAdded、SceneChanged、WorldFactChanged等は各機能実装時に専用型を追加する。Actionに属さない将来イベントはEventBaseから定義できる。
 
@@ -673,7 +675,7 @@ fallbackからの再描写はゲームの再実行ではないが、MVPでは自
 
 llm_call_countは実行前に条件付きUPDATEで予約する。timeoutや無効出力も1回として数え、SDKの自動retryは無効化するか、各実リクエストを同じ予約経路に通す。Directorの呼び出しは別計測。
 
-NarrativeからResolutionRequiredを受け取ったらrouteをmechanicalへ変更し、その1回をIntent抽出として扱う。Narrativeのままrepairを追加しない。MVPでは独立したRouter LLMを置かず、曖昧な入力をNarrativeDecisionの昇格で処理する案とする。
+NarrativeからResolutionRequiredを受け取ったらrouteをmechanicalへ変更し、その1回をIntent抽出として扱う。Narrativeのままrepairを追加しない。MVPでは独立したRouter LLMを置かず、[ADR-0009](adr/0009-turn-routing.md) の安全条件を満たす分類不能入力だけをNarrativeDecisionの昇格で処理する。
 
 state.updatedやdice.rolledなど確定結果のイベントはcommit後だけ配信する。check.started等の進行表示は揮発的でよい。narration.deltaは未確定の文章として扱い、失敗時には確定fallbackに置き換える。
 
