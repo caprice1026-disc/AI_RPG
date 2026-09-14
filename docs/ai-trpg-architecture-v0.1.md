@@ -4,6 +4,8 @@
 作成日: 2026-09-14  
 ステータス: 仕様固定前の合意事項整理
 
+> **決定の更新:** 本書で「候補」「未確定」「要決定」とした項目のうち、技術選定、MVP ruleset、実行時初期値、Turn routing、principal境界は [Architecture Decision Records](adr/README.md) で決定済みである。矛盾する場合は採用状態のADRを優先する。
+
 ## 1 目的と仕様の位置付け
 
 AIをゲームマスターとして利用するTRPGシステムについて、これまで合意したアーキテクチャを整理する。中心となる原則は、LLMが意図の解釈と描写を担い、Game Engineがルールと結果を決定し、DBに保存した確定状態をゲーム上の真実とすることである。
@@ -76,14 +78,9 @@ Scene GMをNarrative GMとMechanical GMの2種類に分ける。
 
 Mechanicalの3回目は非常口であり、通常経路として常用しない。スキーマ不正、文脈不整合などを修復するための枠とする。
 
-振り分けの初期ルール候補は、攻撃、技能判定、ダイス要求、アイテム使用、HPや状態の変化を伴う行動をMechanicalとし、それ以外をNarrativeとするもの。ただし、最終的な判定条件は要決定である。
+振り分けの初期規則、分類不能入力の安全条件、Narrativeからの昇格は [ADR-0009](adr/0009-turn-routing.md) で決定する。
 
-以下は予算を固定する前に解消する必要がある。
-
-- RouterのLLM補助をターン予算に含めるか。
-- モデルAPIの自動retry、構造化出力のrepair、tool往復を何回として数えるか。
-- Narrativeで途中から判定が必要と判明した場合の昇格経路。
-- 複合行動と、分類不能な入力をどう扱うか。
+呼び出しの数え方、retry、timeout、初期予算は [ADR-0008](adr/0008-runtime-defaults.md)、昇格と複合行動を含むrouteは [ADR-0009](adr/0009-turn-routing.md) で固定する。Directorのjob予算は同期Turnと分離し、後続仕様で決定する。
 
 ## 5 LLMとの入出力契約
 
@@ -192,7 +189,7 @@ Proposalには参照したworld stateのバージョンを持たせる。適用�
 | QUALITY | 重要なSceneなど |
 | BACKGROUND | 要約やシナリオ生成など |
 
-具体的なモデル、プロバイダー、重要Sceneの判定条件、モデル障害時の切替条件は未確定。Tierを変更してもゲームの状態変更権限や呼び出し予算は変えない。
+初期プロバイダーとadapter境界は [ADR-0006](adr/0006-llm-provider.md) で決定する。具体的なmodel IDと重要Sceneの判定条件は設定・後続仕様で扱う。Tierを変更してもゲームの状態変更権限や呼び出し予算は変えない。
 
 ## 10 Streaming と Event Store
 
@@ -217,7 +214,7 @@ Mechanicalでは判定結果を先に表示し、その後に描写を生成で�
 
 イベントはリプレイ、デバッグ、分岐、Undo、分析などへの拡張基盤とする。ただし、イベントを保存するだけでUndoや完全な再構築が実現するわけではなく、これらの機能自体はMVPの確定事項ではない。
 
-Event Storeを唯一の更新元とする完全なEvent Sourcingか、Canonical DBと併記するイベントログかは未確定。表示用イベントと永続ドメインイベントも、必ずしも一対一にはしない。
+MVPではCanonical DBと併記するイベントログとし、クライアント配信は [ADR-0005](adr/0005-streaming.md) のSSEを用いる。表示用イベントと永続ドメインイベントは、必ずしも一対一にはしない。
 
 ## 11 障害復旧
 
@@ -281,9 +278,7 @@ Campaign、Scene、Turn、Actionをどこまで独立Entityとするか、ID、�
 
 ### 13.3 複合Intent
 
-「ゴブリンを挑発しながら剣で斬る」のような入力について、1 Turn = 1 Intentか、1 Turn = N Actionsかは未決定。
-
-actionsのリストとmax_actions_per_turn = 3は提案値に留める。採用する場合は、処理順、依存関係、ルール上の行動回数、途中失敗時の扱いも定義する。自然言語から複数Actionを抽出できることと、ゲームルール上その全行動が許可されることは別である。
+「ゴブリンを挑発しながら剣で斬る」のような入力はMechanicalへ送り、1 Turn = 0〜3 Actionsとして入力順に解決する。処理順、途中失敗時の扱いを含む規則は [ADR-0007](adr/0007-mvp-ruleset.md)、設定元は [ADR-0008](adr/0008-runtime-defaults.md) で固定する。自然言語から複数Actionを抽出できることと、ゲームルール上その全行動が許可されることは別である。
 
 ## 14 計測と評価
 
@@ -330,6 +325,6 @@ Directorの物理上限はテストで調整し、損益分岐点や料金設計
 | 7 | Contextの上限と最低限のアクセス制御 | Context契約 |
 | 8 | Directorの起動・採用・上限とMVP範囲 | Director Job／Proposal仕様 |
 
-技術選定としてPydanticAI、PostgreSQL、FastAPIの名前が議論に登場しているが、共有された範囲だけでは最終採用を確認できない。本書では確定スタックに含めない。ライブラリやモデルが変わっても、LLM・Game Engine・Canonical Stateの責務境界は維持する。
+確定した技術選定は [ADR一覧](adr/README.md) を正本とする。ライブラリやモデルが変わっても、各ADRの交換境界、およびLLM・Game Engine・Canonical Stateの責務境界は維持する。
 
 次の固定作業は、Turn Routerと複合Intentを決めたうえで、データモデルと入出力Schemaを定義し、トランザクション境界へ落とし込む順序を推奨する。
