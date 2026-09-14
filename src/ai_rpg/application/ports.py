@@ -19,9 +19,13 @@ class TurnRepository(Protocol):
     """Turnの永続化を抽象化するrepository port。"""
 
     async def add(
-        self, campaign_id: UUID, principal_id: UUID, turn: PlayerTurnInput
+        self,
+        campaign_id: UUID,
+        principal_id: UUID,
+        turn: PlayerTurnInput,
+        max_actions: int,
     ) -> TurnResponse:
-        """冪等性制約の下でTurnを追加する。"""
+        """Action上限をTurn snapshotへ保存してTurnを追加する。"""
 
 
 class UnitOfWork(AbstractAsyncContextManager["UnitOfWork"], Protocol):
