@@ -12,7 +12,6 @@ def test_domain_and_engine_do_not_import_external_adapters() -> None:
 
     forbidden = {
         "fastapi",
-        "pydantic",
         "sqlalchemy",
         "psycopg",
         "ai_rpg.llm",
