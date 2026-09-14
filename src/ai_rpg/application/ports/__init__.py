@@ -1,11 +1,23 @@
 """Applicationから外部機構へ向くport。"""
 
 from collections.abc import AsyncIterator
-from contextlib import AbstractAsyncContextManager
 from typing import Protocol
 from uuid import UUID
 
-from ai_rpg.contracts import PlayerTurnInput, TurnResponse
+from ai_rpg.application.ports.repositories import (
+    ActionRecord,
+    CanonicalRepository,
+    CanonicalSnapshot,
+    ChoiceDraft,
+    CommitBundle,
+    EventRecord,
+    Lease,
+    NarrationRepository,
+    RepositorySet,
+    TurnRepository,
+    TurnRow,
+    UnitOfWork,
+)
 
 
 class AuthorizationPolicy(Protocol):
@@ -15,26 +27,26 @@ class AuthorizationPolicy(Protocol):
         """actorを操作できる場合だけ真を返す。"""
 
 
-class TurnRepository(Protocol):
-    """Turnの永続化を抽象化するrepository port。"""
-
-    async def add(
-        self, campaign_id: UUID, principal_id: UUID, turn: PlayerTurnInput
-    ) -> TurnResponse:
-        """冪等性制約の下でTurnを追加する。"""
-
-
-class UnitOfWork(AbstractAsyncContextManager["UnitOfWork"], Protocol):
-    """Canonical更新とEvent追記をまとめるtransaction境界。"""
-
-    turns: TurnRepository
-
-    async def commit(self) -> None:
-        """現在のtransactionを確定する。"""
-
-
 class PublicEventSource(Protocol):
     """認可済み公開イベントをcursor以降から購読するport。"""
 
     def subscribe(self, campaign_id: UUID, after: int) -> AsyncIterator[str]:
         """transport非依存のイベント表現を返す。"""
+
+
+__all__ = [
+    "ActionRecord",
+    "AuthorizationPolicy",
+    "CanonicalRepository",
+    "CanonicalSnapshot",
+    "ChoiceDraft",
+    "CommitBundle",
+    "EventRecord",
+    "Lease",
+    "NarrationRepository",
+    "PublicEventSource",
+    "RepositorySet",
+    "TurnRepository",
+    "TurnRow",
+    "UnitOfWork",
+]
