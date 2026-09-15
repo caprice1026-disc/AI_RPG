@@ -137,7 +137,39 @@ class PostgresTurnRepository:
         }
         result = await self._session.execute(
             text(
-                """INSERT INTO turns(id,campaign_id,scene_id,request_id,created_by,actor_id,input_payload,request_hash,input_kind,input_text,selected_choice_id,expected_state_version,max_actions) VALUES(:id,:c,:s,:r,:p,:a,CAST(:payload AS jsonb),:hash,:kind,:input_text,:choice,:version,:max_actions) RETURNING *"""
+                """
+                INSERT INTO turns(
+                    id,
+                    campaign_id,
+                    scene_id,
+                    request_id,
+                    created_by,
+                    actor_id,
+                    input_payload,
+                    request_hash,
+                    input_kind,
+                    input_text,
+                    selected_choice_id,
+                    expected_state_version,
+                    max_actions
+                )
+                VALUES(
+                    :id,
+                    :c,
+                    :s,
+                    :r,
+                    :p,
+                    :a,
+                    CAST(:payload AS jsonb),
+                    :hash,
+                    :kind,
+                    :input_text,
+                    :choice,
+                    :version,
+                    :max_actions
+                )
+                RETURNING *
+                """
             ),
             params,
         )
@@ -146,7 +178,21 @@ class PostgresTurnRepository:
     async def acquire_lease(self, turn_id: UUID, *, lease_seconds: int) -> Lease | None:
         result = await self._session.execute(
             text(
-                """UPDATE turns SET resolution_status='resolving',worker_epoch=worker_epoch+1,lease_until=now()+make_interval(secs=>:seconds) WHERE id=(SELECT id FROM turns WHERE id=:id AND resolution_status IN ('pending','resolving') AND (resolution_status='pending' OR lease_until<now()) FOR UPDATE SKIP LOCKED) RETURNING *"""
+                """
+                UPDATE turns
+                SET resolution_status='resolving',
+                    worker_epoch=worker_epoch+1,
+                    lease_until=now()+make_interval(secs=>:seconds)
+                WHERE id=(
+                    SELECT id
+                    FROM turns
+                    WHERE id=:id
+                      AND resolution_status IN ('pending','resolving')
+                      AND (resolution_status='pending' OR lease_until<now())
+                    FOR UPDATE SKIP LOCKED
+                )
+                RETURNING *
+                """
             ),
             {"id": turn_id, "seconds": lease_seconds},
         )
@@ -159,7 +205,12 @@ class PostgresTurnRepository:
             (
                 await self._session.execute(
                     text(
-                        "SELECT state_version,event_sequence,ruleset_version FROM campaigns WHERE id=:c FOR UPDATE"
+                        """
+                        SELECT state_version,event_sequence,ruleset_version
+                        FROM campaigns
+                        WHERE id=:c
+                        FOR UPDATE
+                        """
                     ),
                     {"c": bundle.campaign_id},
                 )
@@ -190,7 +241,11 @@ class PostgresTurnRepository:
         for entity_id, hp, max_hp in bundle.canonical_updates:
             await self._session.execute(
                 text(
-                    "UPDATE mvp_characters SET current_hp=:hp,max_hp=:max_hp WHERE campaign_id=:c AND entity_id=:e"
+                    """
+                    UPDATE mvp_characters
+                    SET current_hp=:hp,max_hp=:max_hp
+                    WHERE campaign_id=:c AND entity_id=:e
+                    """
                 ),
                 {"hp": hp, "max_hp": max_hp, "c": bundle.campaign_id, "e": entity_id},
             )
@@ -202,14 +257,39 @@ class PostgresTurnRepository:
         )
         await self._session.execute(
             text(
-                "UPDATE turns SET resolution_status='committed',route='mechanical',committed_state_version=:v,committed_at=now(),narration_input=CAST(:ni AS jsonb) WHERE id=:t"
+                """
+                UPDATE turns
+                SET resolution_status='committed',route='mechanical',
+                    committed_state_version=:v,committed_at=now(),
+                    narration_input=CAST(:ni AS jsonb)
+                WHERE id=:t
+                """
             ),
             {"v": version, "ni": _json(bundle.narration_input), "t": bundle.turn_id},
         )
         for action in bundle.actions:
             await self._session.execute(
                 text(
-                    """INSERT INTO actions(id,campaign_id,turn_id,ordinal,actor_id,kind,target_id,item_id,command,result,result_kind,ruleset_version) VALUES(:id,:c,:t,:o,:actor,:kind,:target,:item,CAST(:command AS jsonb),CAST(:result AS jsonb),:rk,:ruleset)"""
+                    """
+                    INSERT INTO actions(
+                        id,campaign_id,turn_id,ordinal,actor_id,kind,
+                        target_id,item_id,command,result,result_kind,ruleset_version
+                    )
+                    VALUES(
+                        :id,
+                        :c,
+                        :t,
+                        :o,
+                        :actor,
+                        :kind,
+                        :target,
+                        :item,
+                        CAST(:command AS jsonb),
+                        CAST(:result AS jsonb),
+                        :rk,
+                        :ruleset
+                    )
+                    """
                 ),
                 {
                     "id": action.id,
@@ -230,7 +310,24 @@ class PostgresTurnRepository:
         for offset, event in enumerate(bundle.events):
             await self._session.execute(
                 text(
-                    """INSERT INTO events(id,campaign_id,scene_id,turn_id,action_id,sequence,state_version,type,schema_version,payload) VALUES(:id,:c,:s,:t,:a,:seq,:v,:type,1,CAST(:payload AS jsonb))"""
+                    """
+                    INSERT INTO events(
+                        id,campaign_id,scene_id,turn_id,action_id,
+                        sequence,state_version,type,schema_version,payload
+                    )
+                    VALUES(
+                        :id,
+                        :c,
+                        :s,
+                        :t,
+                        :a,
+                        :seq,
+                        :v,
+                        :type,
+                        1,
+                        CAST(:payload AS jsonb)
+                    )
+                    """
                 ),
                 {
                     "id": event.id,
@@ -313,7 +410,17 @@ class PostgresNarrationRepository:
         )
         result = await self._session.execute(
             text(
-                """UPDATE turns SET narration_status=:status,narration=:n,recovery_reason=:reason WHERE id=:t AND campaign_id=:c AND worker_epoch=:epoch AND narration_status IN ('pending','generating') RETURNING scene_id,actor_id,committed_state_version"""
+                """
+                UPDATE turns
+                SET narration_status=:status,
+                    narration=:n,
+                    recovery_reason=:reason
+                WHERE id=:t
+                  AND campaign_id=:c
+                  AND worker_epoch=:epoch
+                  AND narration_status IN ('pending','generating')
+                RETURNING scene_id,actor_id,committed_state_version
+                """
             ),
             {
                 "status": "fallback" if fallback_reason else "completed",
@@ -330,7 +437,21 @@ class PostgresNarrationRepository:
         for choice in choices:
             await self._session.execute(
                 text(
-                    """INSERT INTO turn_choices(id,campaign_id,scene_id,source_turn_id,actor_id,ordinal,label,state_version) VALUES(:id,:c,:s,:t,:a,:o,:label,:v)"""
+                    """
+                    INSERT INTO turn_choices(
+                        id,
+                        campaign_id,
+                        scene_id,
+                        source_turn_id,
+                        actor_id,
+                        ordinal,
+                        label,
+                        state_version
+                    )
+                    VALUES(
+                        :id,:c,:s,:t,:a,:o,:label,:v
+                    )
+                    """
                 ),
                 {
                     "id": choice.id,

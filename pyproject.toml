@@ -59,5 +59,4 @@ ignore_missing_imports = true
 
 [tool.ruff.lint.per-file-ignores]
 "migrations/versions/*.py" = ["E501"]
-"src/ai_rpg/infrastructure/postgres/repositories.py" = ["E501"]
 "tests/integration/postgres/*.py" = ["E501", "B017"]

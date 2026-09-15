@@ -3,7 +3,7 @@
 from dataclasses import dataclass
 from typing import Literal
 
-from ai_rpg.domain import ActionResult, CharacterState, SkillCheckCommand
+from ai_rpg.domain.models import ActionResult, CharacterState, SkillCheckCommand
 from ai_rpg.engine.dice import DiceEngine
 
 
