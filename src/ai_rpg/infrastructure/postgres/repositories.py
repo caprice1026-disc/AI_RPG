@@ -8,17 +8,21 @@ from collections.abc import Callable, Mapping, Sequence
 from datetime import UTC, datetime
 from uuid import UUID, uuid4
 
-from sqlalchemy import text
+from sqlalchemy import RowMapping, text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from ai_rpg.application.ports.repositories import (
+    CanonicalRepository,
     CanonicalSnapshot,
     ChoiceDraft,
     CommitBundle,
     Lease,
+    NarrationRepository,
+    TurnRepository,
     TurnRow,
 )
 from ai_rpg.contracts import PlayerTurnInput, TurnResponse
+from ai_rpg.contracts.responses import TurnRecovery
 
 
 def _json(value: object) -> str:
@@ -43,7 +47,7 @@ def request_hash(
     return hashlib.sha256(_json(envelope).encode("utf-8")).digest()
 
 
-def _turn(row: Mapping[str, object]) -> TurnRow:
+def _turn(row: RowMapping) -> TurnRow:
     return TurnRow(
         id=row["id"],
         campaign_id=row["campaign_id"],
@@ -52,7 +56,7 @@ def _turn(row: Mapping[str, object]) -> TurnRow:
         request_id=row["request_id"],
         resolution_status=str(row["resolution_status"]),
         worker_epoch=int(row["worker_epoch"]),
-    )  # type: ignore[arg-type]
+    )
 
 
 class PostgresTurnRepository:
@@ -60,7 +64,11 @@ class PostgresTurnRepository:
         self._session = session
 
     async def add(
-        self, campaign_id: UUID, principal_id: UUID, turn: PlayerTurnInput
+        self,
+        campaign_id: UUID,
+        principal_id: UUID,
+        turn: PlayerTurnInput,
+        max_actions: int,
     ) -> TurnResponse:
         """既存Application API向けにactive Sceneへpending Turnを追加する。"""
         scene_id = (
@@ -74,13 +82,18 @@ class PostgresTurnRepository:
             scene_id,
             principal_id,
             turn,
-            max_actions=3,
+            max_actions=max_actions,
         )
         return TurnResponse(
             turn_id=row.id,
             route=None,
             resolution_status="pending",
             narration_status="pending",
+            committed_state_version=None,
+            narration=None,
+            choices=[],
+            action_results=[],
+            recovery=TurnRecovery(fallback=False, reason=None),
         )
 
     async def find_by_request_id(
@@ -138,7 +151,7 @@ class PostgresTurnRepository:
             {"id": turn_id, "seconds": lease_seconds},
         )
         row = result.mappings().one_or_none()
-        return None if row is None else Lease(_turn(row), row["lease_until"])  # type: ignore[arg-type]
+        return None if row is None else Lease(_turn(row), row["lease_until"])
 
     async def commit_resolution(self, bundle: CommitBundle) -> int:
         # デッドロックを避ける不変順序: Campaign、Turn。
@@ -271,7 +284,7 @@ class PostgresCanonicalRepository:
         ).one()
         value = update()
         if hasattr(value, "__await__"):
-            await value  # type: ignore[misc]
+            await value
         version = int(row[0]) + 1
         await self._session.execute(
             text("UPDATE campaigns SET state_version=:v WHERE id=:c"),
@@ -336,8 +349,13 @@ class PostgresNarrationRepository:
 class PostgresUnitOfWork:
     """例外時に必ずrollbackするsession単位Unit of Work。"""
 
+    turns: TurnRepository
+    canonical: CanonicalRepository
+    narration: NarrationRepository
+
     def __init__(self, factory: async_sessionmaker[AsyncSession]) -> None:
-        self._factory, self._session = factory, None
+        self._factory = factory
+        self._session: AsyncSession | None = None
 
     async def __aenter__(self) -> PostgresUnitOfWork:
         self._session = self._factory()

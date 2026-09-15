@@ -2,16 +2,17 @@
 
 import os
 import subprocess
+from collections.abc import Iterator
 
 import pytest
-from sqlalchemy import create_engine, text
+from sqlalchemy import Engine, create_engine, text
 
 URL = os.getenv("AIRPG_TEST_DATABASE_URL")
 pytestmark = pytest.mark.skipif(not URL, reason="AIRPG_TEST_DATABASE_URLが未設定です")
 
 
 @pytest.fixture()
-def database():
+def database() -> Iterator[Engine]:
     assert URL
     env = {**os.environ, "AIRPG_DATABASE_URL": URL}
     subprocess.run(["alembic", "-x", f"url={URL}", "upgrade", "head"], check=True, env=env)
@@ -20,7 +21,7 @@ def database():
     subprocess.run(["alembic", "-x", f"url={URL}", "downgrade", "base"], check=True, env=env)
 
 
-def test_upgrade_constraints_append_only_and_rollback(database):
+def test_upgrade_constraints_append_only_and_rollback(database: Engine) -> None:
     """複合FK、部分一意、追記禁止とtransaction rollbackをまとめて確認する。"""
     with database.begin() as c:
         c.execute(

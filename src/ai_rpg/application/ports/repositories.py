@@ -81,7 +81,11 @@ class ChoiceDraft:
 
 class TurnRepository(Protocol):
     async def add(
-        self, campaign_id: UUID, principal_id: UUID, turn: PlayerTurnInput
+        self,
+        campaign_id: UUID,
+        principal_id: UUID,
+        turn: PlayerTurnInput,
+        max_actions: int,
     ) -> TurnResponse: ...
 
     async def find_by_request_id(
