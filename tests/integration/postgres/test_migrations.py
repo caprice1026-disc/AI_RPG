@@ -4,14 +4,17 @@ import asyncio
 import os
 import subprocess
 import sys
-from collections.abc import AsyncIterator, Generator, Iterator
+from collections.abc import AsyncIterator, Callable, Generator, Iterator
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from pathlib import Path
+from threading import Event
+from typing import Any
 from unittest.mock import MagicMock
 from uuid import UUID
 
 import pytest
-from sqlalchemy import Connection, Engine, RowMapping, create_engine, text
+from sqlalchemy import Connection, Engine, RowMapping, create_engine, event, text
 from sqlalchemy.engine import make_url
 from sqlalchemy.exc import DBAPIError, IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
@@ -30,6 +33,7 @@ pytestmark = [
 CAMPAIGN_A = "00000000-0000-0000-0000-000000000001"
 CAMPAIGN_B = "00000000-0000-0000-0000-000000000002"
 SCENE_A = "00000000-0000-0000-0000-000000000011"
+SCENE_B = "00000000-0000-0000-0000-000000000012"
 PRINCIPAL_A = "00000000-0000-0000-0000-000000000021"
 PRINCIPAL_B = "00000000-0000-0000-0000-000000000022"
 ACTOR_A = "00000000-0000-0000-0000-000000000031"
@@ -241,6 +245,71 @@ def _accept_from_database(database: Engine, turn: PlayerTurnInput) -> TurnRespon
 
     with asyncio.Runner(loop_factory=asyncio.SelectorEventLoop) as runner:
         return runner.run(accept())
+
+
+def _accept_with_sql_listener(
+    database: Engine,
+    turn: PlayerTurnInput,
+    listener: Callable[[Any, Any, str, Any, Any, bool], None],
+) -> TurnResponse:
+    async def accept() -> TurnResponse:
+        url = database.url.render_as_string(hide_password=False)
+        engine = create_async_engine(url)
+        event.listen(engine.sync_engine, "before_cursor_execute", listener)
+        try:
+            factory = async_sessionmaker(engine, expire_on_commit=False)
+            return await _accept_turn(factory, turn)
+        finally:
+            await engine.dispose()
+
+    with asyncio.Runner(loop_factory=asyncio.SelectorEventLoop) as runner:
+        return runner.run(accept())
+
+
+def _complete_turn_response(connection: Connection, turn_id: UUID) -> None:
+    connection.execute(
+        text(
+            "UPDATE turns SET resolution_status='committed',route='mechanical',"
+            "committed_state_version=0,committed_at=now(),"
+            "narration_status='completed',narration='扉を開けた。' WHERE id=:turn"
+        ),
+        {"turn": turn_id},
+    )
+    connection.execute(
+        text(
+            "INSERT INTO actions("
+            "id,campaign_id,turn_id,ordinal,actor_id,kind,command,result,"
+            "result_kind,ruleset_version"
+            ") VALUES("
+            ":action,:campaign,:turn,1,:actor,'skill_check','{}',"
+            "'{\"kind\":\"not_applicable\",\"reason\":\"rule_precondition\"}',"
+            "'not_applicable','mvp_v1'"
+            ")"
+        ),
+        {
+            "action": ACTION_A,
+            "campaign": CAMPAIGN_A,
+            "turn": turn_id,
+            "actor": ACTOR_A,
+        },
+    )
+    connection.execute(
+        text(
+            "INSERT INTO turn_choices("
+            "id,campaign_id,scene_id,source_turn_id,actor_id,ordinal,label,state_version,"
+            "invalidated_at) VALUES(:choice_a,:campaign,:scene,:turn,:actor,1,'先へ進む',"
+            "0,NULL),"
+            "(:choice_b,:campaign,:scene,:turn,:actor,2,'古い選択肢',0,now())"
+        ),
+        {
+            "choice_a": CHOICE_A,
+            "choice_b": CHOICE_B,
+            "campaign": CAMPAIGN_A,
+            "scene": SCENE_A,
+            "turn": turn_id,
+            "actor": ACTOR_A,
+        },
+    )
 
 
 def _guard_empty_database(url: str) -> Generator[str, None, None]:
@@ -575,49 +644,7 @@ def test_replay_returns_current_committed_turn_response(database: Engine) -> Non
     accepted = _accept_from_database(database, _player_turn())
 
     with database.begin() as connection:
-        connection.execute(
-            text(
-                "UPDATE turns SET resolution_status='committed',route='mechanical',"
-                "committed_state_version=0,committed_at=now(),"
-                "narration_status='completed',narration='扉を開けた。' WHERE id=:turn"
-            ),
-            {"turn": accepted.turn_id},
-        )
-        connection.execute(
-            text(
-                "INSERT INTO actions("
-                "id,campaign_id,turn_id,ordinal,actor_id,kind,command,result,"
-                "result_kind,ruleset_version"
-                ") VALUES("
-                ":action,:campaign,:turn,1,:actor,'skill_check','{}',"
-                "'{\"kind\":\"not_applicable\",\"reason\":\"rule_precondition\"}',"
-                "'not_applicable','mvp_v1'"
-                ")"
-            ),
-            {
-                "action": ACTION_A,
-                "campaign": CAMPAIGN_A,
-                "turn": accepted.turn_id,
-                "actor": ACTOR_A,
-            },
-        )
-        connection.execute(
-            text(
-                "INSERT INTO turn_choices("
-                "id,campaign_id,scene_id,source_turn_id,actor_id,ordinal,label,state_version,"
-                "invalidated_at) VALUES(:choice_a,:campaign,:scene,:turn,:actor,1,'先へ進む',"
-                "0,NULL),"
-                "(:choice_b,:campaign,:scene,:turn,:actor,2,'古い選択肢',0,now())"
-            ),
-            {
-                "choice_a": CHOICE_A,
-                "choice_b": CHOICE_B,
-                "campaign": CAMPAIGN_A,
-                "scene": SCENE_A,
-                "turn": accepted.turn_id,
-                "actor": ACTOR_A,
-            },
-        )
+        _complete_turn_response(connection, accepted.turn_id)
         connection.execute(
             text("UPDATE scenes SET status='closed' WHERE id=:scene"),
             {"scene": SCENE_A},
@@ -643,3 +670,124 @@ def test_replay_returns_current_committed_turn_response(database: Engine) -> Non
     assert replay.action_results[0].ordinal == 1
     assert replay.action_results[0].result.kind == "not_applicable"
     assert replay.action_results[0].result.reason == "rule_precondition"
+
+
+def test_replay_reads_turn_and_children_from_one_snapshot(database: Engine) -> None:
+    with database.begin() as connection:
+        _seed_members_entities_and_scene(connection)
+
+    accepted = _accept_from_database(database, _player_turn())
+    projection_started = Event()
+    release_projection = Event()
+
+    def pause_before_projection(
+        _connection: Any,
+        _cursor: Any,
+        statement: str,
+        _parameters: Any,
+        _context: Any,
+        _executemany: bool,
+    ) -> None:
+        if not projection_started.is_set() and "turn_choices" in statement:
+            projection_started.set()
+            assert release_projection.wait(10)
+
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        future = pool.submit(
+            _accept_with_sql_listener,
+            database,
+            _player_turn(),
+            pause_before_projection,
+        )
+        assert projection_started.wait(10)
+        try:
+            with database.begin() as connection:
+                _complete_turn_response(connection, accepted.turn_id)
+        finally:
+            release_projection.set()
+        replay = future.result(timeout=10)
+
+    assert replay.resolution_status == "committed"
+    assert replay.narration_status == "completed"
+    assert len(replay.action_results) == 1
+    assert [(choice.id, choice.label) for choice in replay.choices] == [
+        (UUID(CHOICE_A), "先へ進む")
+    ]
+
+
+def test_accept_selects_active_scene_after_campaign_lock(database: Engine) -> None:
+    with database.begin() as connection:
+        _seed_members_entities_and_scene(connection)
+
+    lock_attempted = Event()
+
+    def record_campaign_lock(
+        _connection: Any,
+        _cursor: Any,
+        statement: str,
+        _parameters: Any,
+        _context: Any,
+        _executemany: bool,
+    ) -> None:
+        normalized = " ".join(statement.lower().split())
+        if "select id from campaigns" in normalized and "for update" in normalized:
+            lock_attempted.set()
+
+    connection = database.connect()
+    transaction = connection.begin()
+    pool = ThreadPoolExecutor(max_workers=1)
+    future = None
+    try:
+        connection.execute(
+            text("SELECT id FROM campaigns WHERE id=:campaign FOR UPDATE"),
+            {"campaign": CAMPAIGN_A},
+        )
+        future = pool.submit(
+            _accept_with_sql_listener,
+            database,
+            _player_turn(),
+            record_campaign_lock,
+        )
+        assert lock_attempted.wait(10)
+        connection.execute(
+            text("UPDATE scenes SET status='closed' WHERE id=:scene"),
+            {"scene": SCENE_A},
+        )
+        connection.execute(
+            text(
+                "INSERT INTO scenes(id,campaign_id,sequence,status) "
+                "VALUES(:scene,:campaign,2,'active')"
+            ),
+            {"scene": SCENE_B, "campaign": CAMPAIGN_A},
+        )
+        transaction.commit()
+        response = future.result(timeout=10)
+    finally:
+        if transaction.is_active:
+            transaction.rollback()
+        connection.close()
+        pool.shutdown(wait=True)
+
+    with database.connect() as verification:
+        scene_id = verification.scalar(
+            text("SELECT scene_id FROM turns WHERE id=:turn"),
+            {"turn": response.turn_id},
+        )
+    assert scene_id == UUID(SCENE_B)
+
+
+def test_unresolved_turn_without_active_scene_is_turn_in_progress(database: Engine) -> None:
+    with database.begin() as connection:
+        _seed_members_entities_and_scene(connection)
+
+    _accept_from_database(database, _player_turn())
+    with database.begin() as connection:
+        connection.execute(
+            text("UPDATE scenes SET status='closed' WHERE id=:scene"),
+            {"scene": SCENE_A},
+        )
+
+    with pytest.raises(TurnInProgressError) as caught:
+        _accept_from_database(database, _player_turn(request_id=REQUEST_B))
+
+    assert caught.value.code == "TURN_IN_PROGRESS"

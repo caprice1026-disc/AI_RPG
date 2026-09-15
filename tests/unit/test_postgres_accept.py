@@ -27,6 +27,8 @@ async def test_accept_preserves_policy_and_returns_valid_pending_response(max_ac
     existing_result.mappings.return_value.one_or_none.return_value = None
     scene_result = MagicMock()
     scene_result.scalar_one.return_value = scene_id
+    unresolved_result = MagicMock()
+    unresolved_result.scalar_one_or_none.return_value = None
     insert_result = MagicMock()
     insert_result.mappings.return_value.one_or_none.return_value = {
         "id": turn_id,
@@ -38,7 +40,13 @@ async def test_accept_preserves_policy_and_returns_valid_pending_response(max_ac
         "worker_epoch": 0,
     }
     session = AsyncMock(spec=AsyncSession)
-    session.execute.side_effect = [existing_result, scene_result, MagicMock(), insert_result]
+    session.execute.side_effect = [
+        existing_result,
+        MagicMock(),
+        unresolved_result,
+        scene_result,
+        insert_result,
+    ]
     authorization = AsyncMock()
     authorization.can_control.return_value = True
     session_factory = MagicMock(return_value=session)

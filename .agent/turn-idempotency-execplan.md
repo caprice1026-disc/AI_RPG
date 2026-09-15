@@ -10,8 +10,9 @@
 ## 範囲
 
 - 既存のPostgreSQL UNIQUE制約と短いCampaign lockを維持する。
+- Campaign lock取得後に未解決Turnとactive Sceneを再検査し、Scene遷移との競合を防ぐ。
 - `ON CONFLICT DO NOTHING`後に同一requestを再読込し、保存JSONとSHA-256の両方を比較する。
-- 保存済みTurn、Action、Choiceから公開`TurnResponse`を再構築する。
+- 保存済みTurn、Action、Choiceを一つのSQLスナップショットで読み、公開`TurnResponse`を再構築する。
 - 認可、state_version、Choice有効性の追加検査は次の独立作業とし、今回は変更しない。
 - migration、依存パッケージ、新しいRepository階層は追加しない。
 
@@ -23,8 +24,10 @@
    `TurnInProgressError`を追加し、公開importを維持する。
 3. `PostgresTurnRepository.add()`で既存requestをactive Scene検索より先に読み、
    同一性を確認する。INSERT競合時も同じ照合を行い、transactionを失敗状態にしない。
-4. 保存済みTurnのstatus、narration、Action結果、未失効Choiceを`TurnResponse`へ投影する。
-5. 既存mockテストを新しい問い合わせ順へ合わせ、全検証を実施する。
+4. 保存済みTurnのstatus、narration、Action結果、未失効Choiceを一つのSQLで
+   `TurnResponse`へ投影する。
+5. Campaign lock待機中のScene遷移と、再送読込中のTurn確定を同期させた実DBテストを追加する。
+6. 既存mockテストを新しい問い合わせ順へ合わせ、全検証を実施する。
 
 ## 検証
 

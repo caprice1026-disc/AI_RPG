@@ -107,7 +107,6 @@ class TurnRepository(Protocol):
     async def accept_pending(
         self,
         campaign_id: UUID,
-        scene_id: UUID,
         principal_id: UUID,
         turn: PlayerTurnInput,
         *,

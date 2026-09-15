@@ -91,15 +91,8 @@ class PostgresTurnRepository:
         if existing is not None:
             return await self._replay(existing, turn)
 
-        scene_id = (
-            await self._session.execute(
-                text("SELECT id FROM scenes WHERE campaign_id=:campaign_id AND status='active'"),
-                {"campaign_id": campaign_id},
-            )
-        ).scalar_one()
         row = await self.accept_pending(
             campaign_id,
-            scene_id,
             principal_id,
             turn,
             max_actions=max_actions,
@@ -112,6 +105,38 @@ class PostgresTurnRepository:
         return _pending_response(row)
 
     async def _replay(self, existing: RowMapping, turn: PlayerTurnInput) -> TurnResponse:
+        existing = (
+            await self._session.execute(
+                text(
+                    """
+                    SELECT t.*,
+                           COALESCE((
+                               SELECT jsonb_agg(
+                                   jsonb_build_object('id', c.id, 'label', c.label)
+                                   ORDER BY c.ordinal
+                               )
+                               FROM turn_choices AS c
+                               WHERE c.source_turn_id=t.id AND c.invalidated_at IS NULL
+                           ), '[]'::jsonb) AS replay_choices,
+                           COALESCE((
+                               SELECT jsonb_agg(
+                                   jsonb_build_object(
+                                       'id', a.id,
+                                       'ordinal', a.ordinal,
+                                       'result', a.result
+                                   )
+                                   ORDER BY a.ordinal
+                               )
+                               FROM actions AS a
+                               WHERE a.turn_id=t.id
+                           ), '[]'::jsonb) AS replay_actions
+                    FROM turns AS t
+                    WHERE t.id=:turn
+                    """
+                ),
+                {"turn": existing["id"]},
+            )
+        ).mappings().one()
         digest = request_hash(
             int(existing["input_schema_version"]),
             existing["campaign_id"],
@@ -124,21 +149,6 @@ class PostgresTurnRepository:
         ) != digest:
             raise IdempotencyConflictError("同じrequest_idに異なる入力は使用できません")
 
-        choices = (
-            await self._session.execute(
-                text(
-                    "SELECT id,label FROM turn_choices "
-                    "WHERE source_turn_id=:turn AND invalidated_at IS NULL ORDER BY ordinal"
-                ),
-                {"turn": existing["id"]},
-            )
-        ).mappings()
-        actions = (
-            await self._session.execute(
-                text("SELECT id,ordinal,result FROM actions WHERE turn_id=:turn ORDER BY ordinal"),
-                {"turn": existing["id"]},
-            )
-        ).mappings()
         return TurnResponse.model_validate(
             {
                 "turn_id": existing["id"],
@@ -147,14 +157,14 @@ class PostgresTurnRepository:
                 "narration_status": existing["narration_status"],
                 "committed_state_version": existing["committed_state_version"],
                 "narration": existing["narration"],
-                "choices": [{"id": row["id"], "label": row["label"]} for row in choices],
+                "choices": existing["replay_choices"],
                 "action_results": [
                     {
                         "action_id": row["id"],
                         "ordinal": row["ordinal"],
                         "result": row["result"],
                     }
-                    for row in actions
+                    for row in existing["replay_actions"]
                 ],
                 "recovery": {
                     "fallback": existing["narration_status"] == "fallback",
@@ -181,7 +191,6 @@ class PostgresTurnRepository:
     async def accept_pending(
         self,
         campaign_id: UUID,
-        scene_id: UUID,
         principal_id: UUID,
         turn: PlayerTurnInput,
         *,
@@ -191,6 +200,21 @@ class PostgresTurnRepository:
         await self._session.execute(
             text("SELECT id FROM campaigns WHERE id=:c FOR UPDATE"), {"c": campaign_id}
         )
+        unresolved_turn = await self._session.execute(
+            text(
+                "SELECT id FROM turns "
+                "WHERE campaign_id=:c AND resolution_status IN ('pending','resolving')"
+            ),
+            {"c": campaign_id},
+        )
+        if unresolved_turn.scalar_one_or_none() is not None:
+            return None
+        scene_id = (
+            await self._session.execute(
+                text("SELECT id FROM scenes WHERE campaign_id=:c AND status='active'"),
+                {"c": campaign_id},
+            )
+        ).scalar_one()
         content = turn.content.model_dump(mode="json")
         params = {
             "id": uuid4(),
