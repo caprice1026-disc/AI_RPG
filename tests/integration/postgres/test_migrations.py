@@ -19,9 +19,19 @@ from sqlalchemy.engine import make_url
 from sqlalchemy.exc import DBAPIError, IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
-from ai_rpg.application import IdempotencyConflictError, TurnInProgressError
+from ai_rpg.application import (
+    AuthorizationError,
+    ChoiceNotAvailableError,
+    IdempotencyConflictError,
+    StateVersionConflictError,
+    TurnInProgressError,
+)
+from ai_rpg.application.ports import ChoiceDraft
 from ai_rpg.contracts import PlayerTurnInput, TurnResponse
-from ai_rpg.infrastructure.postgres.repositories import PostgresTurnRepository
+from ai_rpg.infrastructure.postgres.repositories import (
+    PostgresNarrationRepository,
+    PostgresTurnRepository,
+)
 
 URL = os.getenv("AIRPG_TEST_DATABASE_URL")
 ROOT = Path(__file__).parents[3]
@@ -38,6 +48,7 @@ PRINCIPAL_A = "00000000-0000-0000-0000-000000000021"
 PRINCIPAL_B = "00000000-0000-0000-0000-000000000022"
 ACTOR_A = "00000000-0000-0000-0000-000000000031"
 ACTOR_B = "00000000-0000-0000-0000-000000000032"
+ACTOR_C = "00000000-0000-0000-0000-000000000033"
 TURN_A = "00000000-0000-0000-0000-000000000041"
 ACTION_A = "00000000-0000-0000-0000-000000000051"
 EVENT_A = "00000000-0000-0000-0000-000000000061"
@@ -45,6 +56,7 @@ REQUEST_A = "00000000-0000-0000-0000-000000000071"
 REQUEST_B = "00000000-0000-0000-0000-000000000072"
 CHOICE_A = "00000000-0000-0000-0000-000000000081"
 CHOICE_B = "00000000-0000-0000-0000-000000000082"
+CHOICE_C = "00000000-0000-0000-0000-000000000083"
 
 
 def _run_alembic(url: str, *arguments: str) -> None:
@@ -187,14 +199,24 @@ def _seed_history(connection: Connection) -> None:
 
 
 def _player_turn(
-    text_value: str = "進む", request_id: str = REQUEST_A
+    text_value: str = "進む",
+    request_id: str = REQUEST_A,
+    *,
+    expected_state_version: int = 0,
+    actor_id: str = ACTOR_A,
+    choice_id: str | None = None,
 ) -> PlayerTurnInput:
+    content: dict[str, object]
+    if choice_id is None:
+        content = {"kind": "text", "text": text_value}
+    else:
+        content = {"kind": "choice", "choice_id": choice_id}
     return PlayerTurnInput.model_validate(
         {
             "request_id": request_id,
-            "expected_state_version": 0,
-            "actor_id": ACTOR_A,
-            "content": {"kind": "text", "text": text_value},
+            "expected_state_version": expected_state_version,
+            "actor_id": actor_id,
+            "content": content,
         }
     )
 
@@ -211,11 +233,13 @@ async def _postgres_sessions(
 
 
 async def _accept_turn(
-    factory: async_sessionmaker[AsyncSession], turn: PlayerTurnInput
+    factory: async_sessionmaker[AsyncSession],
+    turn: PlayerTurnInput,
+    principal_id: str = PRINCIPAL_A,
 ) -> TurnResponse:
     async with factory() as session:
         response = await PostgresTurnRepository(session).add(
-            UUID(CAMPAIGN_A), UUID(PRINCIPAL_A), turn, 3
+            UUID(CAMPAIGN_A), UUID(principal_id), turn, 3
         )
         await session.commit()
         return response
@@ -237,14 +261,40 @@ class _SynchronizedTurnRepository(PostgresTurnRepository):
         return row
 
 
-def _accept_from_database(database: Engine, turn: PlayerTurnInput) -> TurnResponse:
+def _accept_from_database(
+    database: Engine,
+    turn: PlayerTurnInput,
+    principal_id: str = PRINCIPAL_A,
+) -> TurnResponse:
     async def accept() -> TurnResponse:
         url = database.url.render_as_string(hide_password=False)
         async with _postgres_sessions(url) as factory:
-            return await _accept_turn(factory, turn)
+            return await _accept_turn(factory, turn, principal_id)
 
     with asyncio.Runner(loop_factory=asyncio.SelectorEventLoop) as runner:
         return runner.run(accept())
+
+
+def _save_narration_from_database(
+    database: Engine,
+    turn_id: UUID,
+    choices: tuple[ChoiceDraft, ...],
+) -> bool:
+    async def save() -> bool:
+        url = database.url.render_as_string(hide_password=False)
+        async with _postgres_sessions(url) as factory, factory() as session:
+            saved = await PostgresNarrationRepository(session).save_conditionally(
+                UUID(CAMPAIGN_A),
+                turn_id,
+                0,
+                "遅れて届いた描写",
+                choices,
+            )
+            await session.commit()
+            return saved
+
+    with asyncio.Runner(loop_factory=asyncio.SelectorEventLoop) as runner:
+        return runner.run(save())
 
 
 def _accept_with_sql_listener(
@@ -730,7 +780,7 @@ def test_accept_selects_active_scene_after_campaign_lock(database: Engine) -> No
         _executemany: bool,
     ) -> None:
         normalized = " ".join(statement.lower().split())
-        if "select id from campaigns" in normalized and "for update" in normalized:
+        if "select" in normalized and "from campaigns" in normalized and "for update" in normalized:
             lock_attempted.set()
 
     connection = database.connect()
@@ -791,3 +841,270 @@ def test_unresolved_turn_without_active_scene_is_turn_in_progress(database: Engi
         _accept_from_database(database, _player_turn(request_id=REQUEST_B))
 
     assert caught.value.code == "TURN_IN_PROGRESS"
+
+
+def test_inactive_campaign_member_cannot_replay_turn(database: Engine) -> None:
+    with database.begin() as connection:
+        _seed_members_entities_and_scene(connection)
+
+    accepted = _accept_from_database(database, _player_turn())
+    with database.begin() as connection:
+        connection.execute(
+            text(
+                "UPDATE campaign_members SET active=false "
+                "WHERE campaign_id=:campaign AND principal_id=:principal"
+            ),
+            {"campaign": CAMPAIGN_A, "principal": PRINCIPAL_A},
+        )
+
+    with pytest.raises(AuthorizationError):
+        _accept_from_database(database, _player_turn())
+
+    with database.connect() as connection:
+        assert connection.scalar(text("SELECT count(*) FROM turns")) == 1
+        assert connection.scalar(
+            text("SELECT id FROM turns WHERE id=:turn"), {"turn": accepted.turn_id}
+        ) == accepted.turn_id
+
+
+@pytest.mark.parametrize(
+    "actor_mutation",
+    [
+        "UPDATE entities SET controller_id=:other WHERE id=:actor",
+        "UPDATE entities SET archived_at=now() WHERE id=:actor",
+    ],
+    ids=["different-controller", "archived-actor"],
+)
+def test_new_turn_requires_current_actor_control(
+    database: Engine, actor_mutation: str
+) -> None:
+    with database.begin() as connection:
+        _seed_members_entities_and_scene(connection)
+        connection.execute(
+            text(
+                "INSERT INTO campaign_members(campaign_id,principal_id,role) "
+                "VALUES(:campaign,:principal,'player')"
+            ),
+            {"campaign": CAMPAIGN_A, "principal": PRINCIPAL_B},
+        )
+        connection.execute(
+            text(actor_mutation),
+            {"actor": ACTOR_A, "other": PRINCIPAL_B},
+        )
+
+    with pytest.raises(AuthorizationError):
+        _accept_from_database(database, _player_turn())
+
+    with database.connect() as connection:
+        assert connection.scalar(text("SELECT count(*) FROM turns")) == 0
+
+
+def test_actor_control_is_rechecked_after_campaign_lock(database: Engine) -> None:
+    with database.begin() as connection:
+        _seed_members_entities_and_scene(connection)
+
+    lock_attempted = Event()
+
+    def record_campaign_lock(
+        _connection: Any,
+        _cursor: Any,
+        statement: str,
+        _parameters: Any,
+        _context: Any,
+        _executemany: bool,
+    ) -> None:
+        normalized = " ".join(statement.lower().split())
+        if "select" in normalized and "from campaigns" in normalized and "for update" in normalized:
+            lock_attempted.set()
+
+    connection = database.connect()
+    transaction = connection.begin()
+    pool = ThreadPoolExecutor(max_workers=1)
+    future = None
+    try:
+        connection.execute(
+            text("SELECT id FROM campaigns WHERE id=:campaign FOR UPDATE"),
+            {"campaign": CAMPAIGN_A},
+        )
+        future = pool.submit(
+            _accept_with_sql_listener,
+            database,
+            _player_turn(),
+            record_campaign_lock,
+        )
+        assert lock_attempted.wait(10)
+        connection.execute(
+            text(
+                "UPDATE campaign_members SET active=false "
+                "WHERE campaign_id=:campaign AND principal_id=:principal"
+            ),
+            {"campaign": CAMPAIGN_A, "principal": PRINCIPAL_A},
+        )
+        transaction.commit()
+        with pytest.raises(AuthorizationError):
+            future.result(timeout=10)
+    finally:
+        if transaction.is_active:
+            transaction.rollback()
+        connection.close()
+        pool.shutdown(wait=True)
+
+    with database.connect() as verification:
+        assert verification.scalar(text("SELECT count(*) FROM turns")) == 0
+
+
+def test_stale_state_version_preserves_existing_choices(database: Engine) -> None:
+    with database.begin() as connection:
+        _seed_members_entities_and_scene(connection)
+
+    source = _accept_from_database(database, _player_turn())
+    with database.begin() as connection:
+        _complete_turn_response(connection, source.turn_id)
+        connection.execute(
+            text("UPDATE campaigns SET state_version=1 WHERE id=:campaign"),
+            {"campaign": CAMPAIGN_A},
+        )
+
+    with pytest.raises(StateVersionConflictError) as caught:
+        _accept_from_database(database, _player_turn(request_id=REQUEST_B))
+
+    assert caught.value.code == "STATE_VERSION_CONFLICT"
+    with database.connect() as connection:
+        assert connection.scalar(text("SELECT count(*) FROM turns")) == 1
+        assert connection.scalar(
+            text(
+                "SELECT count(*) FROM turn_choices "
+                "WHERE id=:choice AND invalidated_at IS NULL"
+            ),
+            {"choice": CHOICE_A},
+        ) == 1
+
+
+@pytest.mark.parametrize("choice_id", [None, CHOICE_A], ids=["text", "choice"])
+def test_new_turn_invalidates_existing_choices(
+    database: Engine, choice_id: str | None
+) -> None:
+    with database.begin() as connection:
+        _seed_members_entities_and_scene(connection)
+
+    source = _accept_from_database(database, _player_turn())
+    with database.begin() as connection:
+        _complete_turn_response(connection, source.turn_id)
+
+    accepted = _accept_from_database(
+        database,
+        _player_turn(request_id=REQUEST_B, choice_id=choice_id),
+    )
+
+    with database.connect() as connection:
+        selected_choice = connection.scalar(
+            text("SELECT selected_choice_id FROM turns WHERE id=:turn"),
+            {"turn": accepted.turn_id},
+        )
+        active_choices = connection.scalar(
+            text(
+                "SELECT count(*) FROM turn_choices "
+                "WHERE campaign_id=:campaign AND actor_id=:actor AND invalidated_at IS NULL"
+            ),
+            {"campaign": CAMPAIGN_A, "actor": ACTOR_A},
+        )
+    assert selected_choice == (None if choice_id is None else UUID(choice_id))
+    assert active_choices == 0
+
+
+@pytest.mark.parametrize(
+    "choice_mutation",
+    [
+        "UPDATE turn_choices SET invalidated_at=now() WHERE id=:choice",
+        "UPDATE turn_choices SET state_version=1 WHERE id=:choice",
+        "UPDATE turns SET resolution_status='failed',committed_state_version=NULL,"
+        "committed_at=NULL WHERE id=:turn",
+    ],
+    ids=["invalidated", "stale-version", "invalid-source-turn"],
+)
+def test_unavailable_choice_is_rejected_before_turn_insert(
+    database: Engine, choice_mutation: str
+) -> None:
+    with database.begin() as connection:
+        _seed_members_entities_and_scene(connection)
+
+    source = _accept_from_database(database, _player_turn())
+    with database.begin() as connection:
+        _complete_turn_response(connection, source.turn_id)
+        connection.execute(
+            text(choice_mutation),
+            {"choice": CHOICE_A, "turn": source.turn_id},
+        )
+
+    with pytest.raises(ChoiceNotAvailableError) as caught:
+        _accept_from_database(
+            database,
+            _player_turn(request_id=REQUEST_B, choice_id=CHOICE_A),
+        )
+
+    assert caught.value.code == "CHOICE_NOT_AVAILABLE"
+    with database.connect() as connection:
+        assert connection.scalar(text("SELECT count(*) FROM turns")) == 1
+
+
+def test_choice_for_different_actor_is_rejected_as_unavailable(database: Engine) -> None:
+    with database.begin() as connection:
+        _seed_members_entities_and_scene(connection)
+
+    source = _accept_from_database(database, _player_turn())
+    with database.begin() as connection:
+        _complete_turn_response(connection, source.turn_id)
+        connection.execute(
+            text(
+                "INSERT INTO entities(id,campaign_id,kind,controller_id) "
+                "VALUES(:actor,:campaign,'pc',:principal)"
+            ),
+            {"actor": ACTOR_C, "campaign": CAMPAIGN_A, "principal": PRINCIPAL_A},
+        )
+        connection.execute(
+            text("UPDATE turn_choices SET actor_id=:actor WHERE id=:choice"),
+            {"actor": ACTOR_C, "choice": CHOICE_A},
+        )
+
+    with pytest.raises(ChoiceNotAvailableError) as caught:
+        _accept_from_database(
+            database,
+            _player_turn(request_id=REQUEST_B, choice_id=CHOICE_A),
+        )
+
+    assert caught.value.code == "CHOICE_NOT_AVAILABLE"
+    with database.connect() as connection:
+        assert connection.scalar(text("SELECT count(*) FROM turns")) == 1
+
+
+def test_late_narration_does_not_add_choices_after_later_turn(database: Engine) -> None:
+    with database.begin() as connection:
+        _seed_members_entities_and_scene(connection)
+
+    source = _accept_from_database(database, _player_turn())
+    with database.begin() as connection:
+        connection.execute(
+            text(
+                "UPDATE turns SET resolution_status='committed',route='narrative',"
+                "committed_state_version=0,committed_at=now() WHERE id=:turn"
+            ),
+            {"turn": source.turn_id},
+        )
+    _accept_from_database(database, _player_turn(request_id=REQUEST_B))
+
+    saved = _save_narration_from_database(
+        database,
+        source.turn_id,
+        (ChoiceDraft(UUID(CHOICE_C), 1, "遅い選択肢"),),
+    )
+
+    assert saved
+    with database.connect() as connection:
+        assert connection.scalar(
+            text("SELECT narration_status FROM turns WHERE id=:turn"),
+            {"turn": source.turn_id},
+        ) == "completed"
+        assert connection.scalar(
+            text("SELECT count(*) FROM turn_choices WHERE source_turn_id=:turn"),
+            {"turn": source.turn_id},
+        ) == 0

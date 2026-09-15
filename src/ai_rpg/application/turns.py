@@ -4,12 +4,9 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from uuid import UUID
 
+from ai_rpg.application.ports import AuthorizationError as AuthorizationError
 from ai_rpg.application.ports import AuthorizationPolicy, UnitOfWork
 from ai_rpg.contracts import PlayerTurnInput, TurnResponse, make_decision_types
-
-
-class AuthorizationError(Exception):
-    """認証済み主体に対象操作の権限がないことを表す。"""
 
 
 @dataclass(frozen=True, slots=True)
@@ -47,9 +44,9 @@ class TurnService:
     ) -> TurnResponse:
         """権限を検証し、受付時の実効設定と共にTurnを保存する。"""
 
-        allowed = await self._authorization.can_control(principal_id, campaign_id, turn.actor_id)
+        allowed = await self._authorization.can_access_campaign(principal_id, campaign_id)
         if not allowed:
-            raise AuthorizationError("actorを操作する権限がありません")
+            raise AuthorizationError("Campaignを参照する権限がありません")
         async with self._unit_of_work_factory() as unit_of_work:
             response = await unit_of_work.turns.add(
                 campaign_id,

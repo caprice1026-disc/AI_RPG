@@ -6,6 +6,7 @@ from uuid import uuid4
 import pytest
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from ai_rpg.application import AuthorizationError
 from ai_rpg.application.turns import RuntimePolicy, TurnService
 from ai_rpg.contracts import PlayerTurnInput
 from ai_rpg.infrastructure.postgres.repositories import PostgresUnitOfWork
@@ -25,6 +26,15 @@ async def test_accept_preserves_policy_and_returns_valid_pending_response(max_ac
     )
     existing_result = MagicMock()
     existing_result.mappings.return_value.one_or_none.return_value = None
+    access_result = MagicMock()
+    access_result.scalar_one.return_value = True
+    campaign_result = MagicMock()
+    campaign_result.mappings.return_value.one.return_value = {
+        "state_version": 0,
+        "status": "active",
+    }
+    actor_result = MagicMock()
+    actor_result.scalar_one.return_value = True
     scene_result = MagicMock()
     scene_result.scalar_one.return_value = scene_id
     unresolved_result = MagicMock()
@@ -41,14 +51,19 @@ async def test_accept_preserves_policy_and_returns_valid_pending_response(max_ac
     }
     session = AsyncMock(spec=AsyncSession)
     session.execute.side_effect = [
+        access_result,
         existing_result,
-        MagicMock(),
+        campaign_result,
+        access_result,
+        existing_result,
+        actor_result,
         unresolved_result,
         scene_result,
+        MagicMock(),
         insert_result,
     ]
     authorization = AsyncMock()
-    authorization.can_control.return_value = True
+    authorization.can_access_campaign.return_value = True
     session_factory = MagicMock(return_value=session)
     service = TurnService(
         authorization,
@@ -71,3 +86,30 @@ async def test_accept_preserves_policy_and_returns_valid_pending_response(max_ac
     session.commit.assert_awaited_once()
     session.rollback.assert_not_awaited()
     session.close.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_campaign_access_is_checked_before_opening_unit_of_work() -> None:
+    principal_id, campaign_id = uuid4(), uuid4()
+    turn = PlayerTurnInput.model_validate(
+        {
+            "request_id": uuid4(),
+            "actor_id": uuid4(),
+            "expected_state_version": 0,
+            "content": {"kind": "text", "text": "進む"},
+        }
+    )
+    authorization = AsyncMock()
+    authorization.can_access_campaign.return_value = False
+    unit_of_work_factory = MagicMock()
+    service = TurnService(
+        authorization,
+        unit_of_work_factory,
+        RuntimePolicy(3, 1, 3),
+    )
+
+    with pytest.raises(AuthorizationError):
+        await service.accept(principal_id, campaign_id, turn)
+
+    authorization.can_access_campaign.assert_awaited_once_with(principal_id, campaign_id)
+    unit_of_work_factory.assert_not_called()

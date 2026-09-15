@@ -6,15 +6,18 @@ from uuid import UUID
 
 from ai_rpg.application.ports.repositories import (
     ActionRecord,
+    AuthorizationError,
     CanonicalRepository,
     CanonicalSnapshot,
     ChoiceDraft,
+    ChoiceNotAvailableError,
     CommitBundle,
     EventRecord,
     IdempotencyConflictError,
     Lease,
     NarrationRepository,
     RepositorySet,
+    StateVersionConflictError,
     TurnInProgressError,
     TurnRepository,
     TurnRow,
@@ -23,10 +26,10 @@ from ai_rpg.application.ports.repositories import (
 
 
 class AuthorizationPolicy(Protocol):
-    """Campaign単位の操作権限を検査するport。"""
+    """Campaign参照権を検査するport。"""
 
-    async def can_control(self, principal_id: UUID, campaign_id: UUID, actor_id: UUID) -> bool:
-        """actorを操作できる場合だけ真を返す。"""
+    async def can_access_campaign(self, principal_id: UUID, campaign_id: UUID) -> bool:
+        """Campaignを参照できる場合だけ真を返す。"""
 
 
 class PublicEventSource(Protocol):
@@ -38,10 +41,12 @@ class PublicEventSource(Protocol):
 
 __all__ = [
     "ActionRecord",
+    "AuthorizationError",
     "AuthorizationPolicy",
     "CanonicalRepository",
     "CanonicalSnapshot",
     "ChoiceDraft",
+    "ChoiceNotAvailableError",
     "CommitBundle",
     "EventRecord",
     "IdempotencyConflictError",
@@ -49,6 +54,7 @@ __all__ = [
     "NarrationRepository",
     "PublicEventSource",
     "RepositorySet",
+    "StateVersionConflictError",
     "TurnInProgressError",
     "TurnRepository",
     "TurnRow",

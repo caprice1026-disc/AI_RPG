@@ -12,13 +12,16 @@ from sqlalchemy import RowMapping, text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from ai_rpg.application.ports.repositories import (
+    AuthorizationError,
     CanonicalRepository,
     CanonicalSnapshot,
     ChoiceDraft,
+    ChoiceNotAvailableError,
     CommitBundle,
     IdempotencyConflictError,
     Lease,
     NarrationRepository,
+    StateVersionConflictError,
     TurnInProgressError,
     TurnRepository,
     TurnRow,
@@ -87,6 +90,8 @@ class PostgresTurnRepository:
         max_actions: int,
     ) -> TurnResponse:
         """既存Application API向けにactive Sceneへpending Turnを追加する。"""
+        if not await self._can_access_campaign(campaign_id, principal_id):
+            raise AuthorizationError("Campaignを参照する権限がありません")
         existing = await self._request_row(campaign_id, principal_id, turn.request_id)
         if existing is not None:
             return await self._replay(existing, turn)
@@ -103,6 +108,16 @@ class PostgresTurnRepository:
                 raise TurnInProgressError("別の未解決Turnが存在します")
             return await self._replay(existing, turn)
         return _pending_response(row)
+
+    async def _can_access_campaign(self, campaign_id: UUID, principal_id: UUID) -> bool:
+        result = await self._session.execute(
+            text(
+                "SELECT EXISTS(SELECT 1 FROM campaign_members "
+                "WHERE campaign_id=:c AND principal_id=:p AND active)"
+            ),
+            {"c": campaign_id, "p": principal_id},
+        )
+        return bool(result.scalar_one())
 
     async def _replay(self, existing: RowMapping, turn: PlayerTurnInput) -> TurnResponse:
         existing = (
@@ -197,9 +212,39 @@ class PostgresTurnRepository:
         max_actions: int,
     ) -> TurnRow | None:
         # 全Canonical更新経路と同じくCampaignを最初にロックする。
-        await self._session.execute(
-            text("SELECT id FROM campaigns WHERE id=:c FOR UPDATE"), {"c": campaign_id}
+        campaign = (
+            await self._session.execute(
+                text("SELECT state_version,status FROM campaigns WHERE id=:c FOR UPDATE"),
+                {"c": campaign_id},
+            )
+        ).mappings().one()
+        if not await self._can_access_campaign(campaign_id, principal_id):
+            raise AuthorizationError("Campaignを参照する権限がありません")
+        if await self._request_row(campaign_id, principal_id, turn.request_id) is not None:
+            return None
+        if campaign["status"] != "active":
+            raise AuthorizationError("停止中のCampaignへTurnは追加できません")
+        actor_allowed = await self._session.execute(
+            text(
+                """
+                SELECT EXISTS(
+                    SELECT 1
+                    FROM entities AS e
+                    JOIN campaign_members AS m
+                      ON m.campaign_id=e.campaign_id AND m.principal_id=:p
+                    WHERE e.campaign_id=:c
+                      AND e.id=:a
+                      AND e.kind IN ('pc','npc')
+                      AND e.controller_id=:p
+                      AND e.archived_at IS NULL
+                      AND m.active
+                )
+                """
+            ),
+            {"c": campaign_id, "p": principal_id, "a": turn.actor_id},
         )
+        if not actor_allowed.scalar_one():
+            raise AuthorizationError("actorを操作する権限がありません")
         unresolved_turn = await self._session.execute(
             text(
                 "SELECT id FROM turns "
@@ -215,7 +260,49 @@ class PostgresTurnRepository:
                 {"c": campaign_id},
             )
         ).scalar_one()
+        current_version = int(campaign["state_version"])
+        if turn.expected_state_version != current_version:
+            raise StateVersionConflictError("Campaignのstate versionが更新されています")
         content = turn.content.model_dump(mode="json")
+        if turn.content.kind == "choice":
+            available_choice = await self._session.execute(
+                text(
+                    """
+                    SELECT EXISTS(
+                        SELECT 1
+                        FROM turn_choices AS c
+                        JOIN turns AS source ON source.id=c.source_turn_id
+                        WHERE c.id=:choice
+                          AND c.campaign_id=:c
+                          AND c.scene_id=:s
+                          AND c.actor_id=:a
+                          AND c.state_version=:v
+                          AND c.invalidated_at IS NULL
+                          AND source.campaign_id=:c
+                          AND source.scene_id=:s
+                          AND source.actor_id=:a
+                          AND source.resolution_status='committed'
+                          AND source.narration_status IN ('completed','fallback')
+                    )
+                    """
+                ),
+                {
+                    "choice": turn.content.choice_id,
+                    "c": campaign_id,
+                    "s": scene_id,
+                    "a": turn.actor_id,
+                    "v": current_version,
+                },
+            )
+            if not available_choice.scalar_one():
+                raise ChoiceNotAvailableError("指定Choiceは現在利用できません")
+        await self._session.execute(
+            text(
+                "UPDATE turn_choices SET invalidated_at=now() "
+                "WHERE campaign_id=:c AND actor_id=:a AND invalidated_at IS NULL"
+            ),
+            {"c": campaign_id, "a": turn.actor_id},
+        )
         params = {
             "id": uuid4(),
             "c": campaign_id,
@@ -517,7 +604,7 @@ class PostgresNarrationRepository:
                   AND campaign_id=:c
                   AND worker_epoch=:epoch
                   AND narration_status IN ('pending','generating')
-                RETURNING scene_id,actor_id,committed_state_version
+                RETURNING scene_id,actor_id,committed_state_version,created_at
                 """
             ),
             {
@@ -532,6 +619,27 @@ class PostgresNarrationRepository:
         row = result.mappings().one_or_none()
         if row is None:
             return False
+        if choices:
+            later_turn = await self._session.execute(
+                text(
+                    """
+                    SELECT EXISTS(
+                        SELECT 1 FROM turns
+                        WHERE campaign_id=:c
+                          AND actor_id=:a
+                          AND (created_at,id) > (:created_at,:t)
+                    )
+                    """
+                ),
+                {
+                    "c": campaign_id,
+                    "a": row["actor_id"],
+                    "created_at": row["created_at"],
+                    "t": turn_id,
+                },
+            )
+            if later_turn.scalar_one():
+                return True
         for choice in choices:
             await self._session.execute(
                 text(

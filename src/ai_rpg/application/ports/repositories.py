@@ -10,6 +10,18 @@ from uuid import UUID
 from ai_rpg.contracts import PlayerTurnInput, TurnResponse
 
 
+class AuthorizationError(Exception):
+    """認証済み主体にCampaignまたはActorの操作権限がない。"""
+
+    code = "FORBIDDEN"
+
+
+class ChoiceNotAvailableError(Exception):
+    """指定Choiceが現在のTurn受付には利用できない。"""
+
+    code = "CHOICE_NOT_AVAILABLE"
+
+
 class IdempotencyConflictError(Exception):
     """同じrequest_idが異なる正規化入力へ再利用された。"""
 
@@ -20,6 +32,12 @@ class TurnInProgressError(Exception):
     """Campaignに別の未解決Turnが存在する。"""
 
     code = "TURN_IN_PROGRESS"
+
+
+class StateVersionConflictError(Exception):
+    """指定state versionが現在のCampaignと一致しない。"""
+
+    code = "STATE_VERSION_CONFLICT"
 
 
 @dataclass(frozen=True, slots=True)
