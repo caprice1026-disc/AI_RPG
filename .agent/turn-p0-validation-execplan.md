@@ -29,7 +29,7 @@ Campaign lock配下で検証する。再送はこれらの新規受付検証よ�
 - [x] unit testをCampaign参照権portと新しい問い合わせ順へ合わせる。
 - [x] mutation確認後、全pytest、Ruff、mypy、lock同期、buildを実行する。
 - [x] 独立レビューでCritical／Importantを解消する。
-- [ ] main統合後に全検証を再実行してpushする。
+- [x] main統合後に全検証を再実行する。
 
 ## レビュー判断
 
