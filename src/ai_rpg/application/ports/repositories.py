@@ -10,6 +10,18 @@ from uuid import UUID
 from ai_rpg.contracts import PlayerTurnInput, TurnResponse
 
 
+class IdempotencyConflictError(Exception):
+    """同じrequest_idが異なる正規化入力へ再利用された。"""
+
+    code = "IDEMPOTENCY_CONFLICT"
+
+
+class TurnInProgressError(Exception):
+    """Campaignに別の未解決Turnが存在する。"""
+
+    code = "TURN_IN_PROGRESS"
+
+
 @dataclass(frozen=True, slots=True)
 class TurnRow:
     id: UUID
@@ -100,7 +112,7 @@ class TurnRepository(Protocol):
         turn: PlayerTurnInput,
         *,
         max_actions: int,
-    ) -> TurnRow: ...
+    ) -> TurnRow | None: ...
 
     async def acquire_lease(self, turn_id: UUID, *, lease_seconds: int) -> Lease | None: ...
 

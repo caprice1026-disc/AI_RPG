@@ -23,10 +23,12 @@ async def test_accept_preserves_policy_and_returns_valid_pending_response(max_ac
             "content": {"kind": "text", "text": "進む"},
         }
     )
+    existing_result = MagicMock()
+    existing_result.mappings.return_value.one_or_none.return_value = None
     scene_result = MagicMock()
     scene_result.scalar_one.return_value = scene_id
     insert_result = MagicMock()
-    insert_result.mappings.return_value.one.return_value = {
+    insert_result.mappings.return_value.one_or_none.return_value = {
         "id": turn_id,
         "campaign_id": campaign_id,
         "scene_id": scene_id,
@@ -36,7 +38,7 @@ async def test_accept_preserves_policy_and_returns_valid_pending_response(max_ac
         "worker_epoch": 0,
     }
     session = AsyncMock(spec=AsyncSession)
-    session.execute.side_effect = [scene_result, MagicMock(), insert_result]
+    session.execute.side_effect = [existing_result, scene_result, MagicMock(), insert_result]
     authorization = AsyncMock()
     authorization.can_control.return_value = True
     session_factory = MagicMock(return_value=session)

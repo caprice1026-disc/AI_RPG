@@ -1,16 +1,24 @@
 """実PostgreSQLに対するmigration制約テスト。"""
 
+import asyncio
 import os
 import subprocess
 import sys
-from collections.abc import Generator, Iterator
+from collections.abc import AsyncIterator, Generator, Iterator
+from contextlib import asynccontextmanager
 from pathlib import Path
 from unittest.mock import MagicMock
+from uuid import UUID
 
 import pytest
-from sqlalchemy import Connection, Engine, create_engine, text
+from sqlalchemy import Connection, Engine, RowMapping, create_engine, text
 from sqlalchemy.engine import make_url
 from sqlalchemy.exc import DBAPIError, IntegrityError
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
+
+from ai_rpg.application import IdempotencyConflictError, TurnInProgressError
+from ai_rpg.contracts import PlayerTurnInput, TurnResponse
+from ai_rpg.infrastructure.postgres.repositories import PostgresTurnRepository
 
 URL = os.getenv("AIRPG_TEST_DATABASE_URL")
 ROOT = Path(__file__).parents[3]
@@ -29,6 +37,10 @@ ACTOR_B = "00000000-0000-0000-0000-000000000032"
 TURN_A = "00000000-0000-0000-0000-000000000041"
 ACTION_A = "00000000-0000-0000-0000-000000000051"
 EVENT_A = "00000000-0000-0000-0000-000000000061"
+REQUEST_A = "00000000-0000-0000-0000-000000000071"
+REQUEST_B = "00000000-0000-0000-0000-000000000072"
+CHOICE_A = "00000000-0000-0000-0000-000000000081"
+CHOICE_B = "00000000-0000-0000-0000-000000000082"
 
 
 def _run_alembic(url: str, *arguments: str) -> None:
@@ -168,6 +180,67 @@ def _seed_history(connection: Connection) -> None:
             "action": ACTION_A,
         },
     )
+
+
+def _player_turn(
+    text_value: str = "進む", request_id: str = REQUEST_A
+) -> PlayerTurnInput:
+    return PlayerTurnInput.model_validate(
+        {
+            "request_id": request_id,
+            "expected_state_version": 0,
+            "actor_id": ACTOR_A,
+            "content": {"kind": "text", "text": text_value},
+        }
+    )
+
+
+@asynccontextmanager
+async def _postgres_sessions(
+    url: str,
+) -> AsyncIterator[async_sessionmaker[AsyncSession]]:
+    engine = create_async_engine(url)
+    try:
+        yield async_sessionmaker(engine, expire_on_commit=False)
+    finally:
+        await engine.dispose()
+
+
+async def _accept_turn(
+    factory: async_sessionmaker[AsyncSession], turn: PlayerTurnInput
+) -> TurnResponse:
+    async with factory() as session:
+        response = await PostgresTurnRepository(session).add(
+            UUID(CAMPAIGN_A), UUID(PRINCIPAL_A), turn, 3
+        )
+        await session.commit()
+        return response
+
+
+class _SynchronizedTurnRepository(PostgresTurnRepository):
+    def __init__(self, session: AsyncSession, barrier: asyncio.Barrier) -> None:
+        super().__init__(session)
+        self._barrier = barrier
+        self._first_lookup_complete = False
+
+    async def _request_row(
+        self, campaign_id: UUID, principal_id: UUID, request_id: UUID
+    ) -> RowMapping | None:
+        row = await super()._request_row(campaign_id, principal_id, request_id)
+        if not self._first_lookup_complete:
+            self._first_lookup_complete = True
+            await self._barrier.wait()
+        return row
+
+
+def _accept_from_database(database: Engine, turn: PlayerTurnInput) -> TurnResponse:
+    async def accept() -> TurnResponse:
+        url = database.url.render_as_string(hide_password=False)
+        async with _postgres_sessions(url) as factory:
+            return await _accept_turn(factory, turn)
+
+    with asyncio.Runner(loop_factory=asyncio.SelectorEventLoop) as runner:
+        return runner.run(accept())
 
 
 def _guard_empty_database(url: str) -> Generator[str, None, None]:
@@ -359,3 +432,214 @@ def test_constraint_failure_rolls_back_the_whole_transaction(database: Engine) -
             text("SELECT count(*) FROM campaigns WHERE id IN (:campaign_a,:campaign_b)"),
             {"campaign_a": CAMPAIGN_A, "campaign_b": CAMPAIGN_B},
         ) == 0
+
+
+def test_same_request_and_input_returns_existing_turn(database: Engine) -> None:
+    with database.begin() as connection:
+        _seed_members_entities_and_scene(connection)
+
+    first = _accept_from_database(database, _player_turn())
+    replay = _accept_from_database(database, _player_turn())
+
+    assert replay == first
+    with database.connect() as connection:
+        assert connection.scalar(text("SELECT count(*) FROM turns")) == 1
+
+
+def test_same_request_with_different_input_is_idempotency_conflict(database: Engine) -> None:
+    with database.begin() as connection:
+        _seed_members_entities_and_scene(connection)
+
+    _accept_from_database(database, _player_turn())
+    with pytest.raises(IdempotencyConflictError) as caught:
+        _accept_from_database(database, _player_turn("戻る"))
+
+    assert caught.value.code == "IDEMPOTENCY_CONFLICT"
+    with database.connect() as connection:
+        assert connection.scalar(text("SELECT count(*) FROM turns")) == 1
+
+
+@pytest.mark.parametrize(
+    "tamper_statement",
+    [
+        "UPDATE turns SET request_hash=decode(repeat('ff',32),'hex') "
+        "WHERE request_id=:request_id",
+        "UPDATE turns SET input_payload=jsonb_set("
+        "input_payload,'{content,text}',to_jsonb('戻る'::text)) "
+        "WHERE request_id=:request_id",
+    ],
+    ids=["stored-hash", "stored-json"],
+)
+def test_replay_compares_stored_hash_and_json(
+    database: Engine, tamper_statement: str
+) -> None:
+    with database.begin() as connection:
+        _seed_members_entities_and_scene(connection)
+
+    _accept_from_database(database, _player_turn())
+
+    with database.begin() as connection:
+        connection.execute(text(tamper_statement), {"request_id": REQUEST_A})
+
+    with pytest.raises(IdempotencyConflictError) as caught:
+        _accept_from_database(database, _player_turn())
+
+    assert caught.value.code == "IDEMPOTENCY_CONFLICT"
+
+
+def test_different_request_while_turn_is_unresolved_is_turn_in_progress(
+    database: Engine,
+) -> None:
+    with database.begin() as connection:
+        _seed_members_entities_and_scene(connection)
+
+    _accept_from_database(database, _player_turn())
+    with pytest.raises(TurnInProgressError) as caught:
+        _accept_from_database(database, _player_turn(request_id=REQUEST_B))
+
+    assert caught.value.code == "TURN_IN_PROGRESS"
+    with database.connect() as connection:
+        assert connection.scalar(text("SELECT count(*) FROM turns")) == 1
+
+
+def test_concurrent_same_request_creates_one_turn(database: Engine) -> None:
+    with database.begin() as connection:
+        _seed_members_entities_and_scene(connection)
+
+    async def accept_concurrently() -> tuple[TurnResponse, TurnResponse]:
+        url = database.url.render_as_string(hide_password=False)
+        async with _postgres_sessions(url) as factory:
+            barrier = asyncio.Barrier(2)
+
+            async def accept() -> TurnResponse:
+                async with factory() as session:
+                    response = await _SynchronizedTurnRepository(session, barrier).add(
+                        UUID(CAMPAIGN_A), UUID(PRINCIPAL_A), _player_turn(), 3
+                    )
+                    await session.commit()
+                    return response
+
+            first, second = await asyncio.gather(accept(), accept())
+        return first, second
+
+    with asyncio.Runner(loop_factory=asyncio.SelectorEventLoop) as runner:
+        first, second = runner.run(accept_concurrently())
+
+    assert second == first
+    with database.connect() as connection:
+        assert connection.scalar(text("SELECT count(*) FROM turns")) == 1
+
+
+def test_concurrent_same_request_with_different_input_conflicts(database: Engine) -> None:
+    with database.begin() as connection:
+        _seed_members_entities_and_scene(connection)
+
+    async def accept_concurrently() -> list[TurnResponse | BaseException]:
+        url = database.url.render_as_string(hide_password=False)
+        async with _postgres_sessions(url) as factory:
+            barrier = asyncio.Barrier(2)
+
+            async def accept(turn: PlayerTurnInput) -> TurnResponse:
+                async with factory() as session:
+                    response = await _SynchronizedTurnRepository(session, barrier).add(
+                        UUID(CAMPAIGN_A), UUID(PRINCIPAL_A), turn, 3
+                    )
+                    await session.commit()
+                    return response
+
+            return list(
+                await asyncio.gather(
+                    accept(_player_turn("進む")),
+                    accept(_player_turn("戻る")),
+                    return_exceptions=True,
+                )
+            )
+
+    with asyncio.Runner(loop_factory=asyncio.SelectorEventLoop) as runner:
+        results = runner.run(accept_concurrently())
+
+    assert sum(isinstance(result, TurnResponse) for result in results) == 1
+    conflicts = [
+        result for result in results if isinstance(result, IdempotencyConflictError)
+    ]
+    assert len(conflicts) == 1
+    assert conflicts[0].code == "IDEMPOTENCY_CONFLICT"
+    with database.connect() as connection:
+        assert connection.scalar(text("SELECT count(*) FROM turns")) == 1
+
+
+def test_replay_returns_current_committed_turn_response(database: Engine) -> None:
+    with database.begin() as connection:
+        _seed_members_entities_and_scene(connection)
+
+    accepted = _accept_from_database(database, _player_turn())
+
+    with database.begin() as connection:
+        connection.execute(
+            text(
+                "UPDATE turns SET resolution_status='committed',route='mechanical',"
+                "committed_state_version=0,committed_at=now(),"
+                "narration_status='completed',narration='扉を開けた。' WHERE id=:turn"
+            ),
+            {"turn": accepted.turn_id},
+        )
+        connection.execute(
+            text(
+                "INSERT INTO actions("
+                "id,campaign_id,turn_id,ordinal,actor_id,kind,command,result,"
+                "result_kind,ruleset_version"
+                ") VALUES("
+                ":action,:campaign,:turn,1,:actor,'skill_check','{}',"
+                "'{\"kind\":\"not_applicable\",\"reason\":\"rule_precondition\"}',"
+                "'not_applicable','mvp_v1'"
+                ")"
+            ),
+            {
+                "action": ACTION_A,
+                "campaign": CAMPAIGN_A,
+                "turn": accepted.turn_id,
+                "actor": ACTOR_A,
+            },
+        )
+        connection.execute(
+            text(
+                "INSERT INTO turn_choices("
+                "id,campaign_id,scene_id,source_turn_id,actor_id,ordinal,label,state_version,"
+                "invalidated_at) VALUES(:choice_a,:campaign,:scene,:turn,:actor,1,'先へ進む',"
+                "0,NULL),"
+                "(:choice_b,:campaign,:scene,:turn,:actor,2,'古い選択肢',0,now())"
+            ),
+            {
+                "choice_a": CHOICE_A,
+                "choice_b": CHOICE_B,
+                "campaign": CAMPAIGN_A,
+                "scene": SCENE_A,
+                "turn": accepted.turn_id,
+                "actor": ACTOR_A,
+            },
+        )
+        connection.execute(
+            text("UPDATE scenes SET status='closed' WHERE id=:scene"),
+            {"scene": SCENE_A},
+        )
+        connection.execute(
+            text("UPDATE campaigns SET state_version=1 WHERE id=:campaign"),
+            {"campaign": CAMPAIGN_A},
+        )
+
+    replay = _accept_from_database(database, _player_turn())
+
+    assert replay.turn_id == accepted.turn_id
+    assert replay.route == "mechanical"
+    assert replay.resolution_status == "committed"
+    assert replay.narration_status == "completed"
+    assert replay.committed_state_version == 0
+    assert replay.narration == "扉を開けた。"
+    assert [(choice.id, choice.label) for choice in replay.choices] == [
+        (UUID(CHOICE_A), "先へ進む")
+    ]
+    assert len(replay.action_results) == 1
+    assert replay.action_results[0].action_id == UUID(ACTION_A)
+    assert replay.action_results[0].ordinal == 1
+    assert replay.action_results[0].result.kind == "not_applicable"
+    assert replay.action_results[0].result.reason == "rule_precondition"

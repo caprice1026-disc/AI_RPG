@@ -16,8 +16,10 @@ from ai_rpg.application.ports.repositories import (
     CanonicalSnapshot,
     ChoiceDraft,
     CommitBundle,
+    IdempotencyConflictError,
     Lease,
     NarrationRepository,
+    TurnInProgressError,
     TurnRepository,
     TurnRow,
 )
@@ -59,6 +61,20 @@ def _turn(row: RowMapping) -> TurnRow:
     )
 
 
+def _pending_response(turn: TurnRow) -> TurnResponse:
+    return TurnResponse(
+        turn_id=turn.id,
+        route=None,
+        resolution_status="pending",
+        narration_status="pending",
+        committed_state_version=None,
+        narration=None,
+        choices=[],
+        action_results=[],
+        recovery=TurnRecovery(fallback=False, reason=None),
+    )
+
+
 class PostgresTurnRepository:
     def __init__(self, session: AsyncSession) -> None:
         self._session = session
@@ -71,6 +87,10 @@ class PostgresTurnRepository:
         max_actions: int,
     ) -> TurnResponse:
         """既存Application API向けにactive Sceneへpending Turnを追加する。"""
+        existing = await self._request_row(campaign_id, principal_id, turn.request_id)
+        if existing is not None:
+            return await self._replay(existing, turn)
+
         scene_id = (
             await self._session.execute(
                 text("SELECT id FROM scenes WHERE campaign_id=:campaign_id AND status='active'"),
@@ -84,26 +104,78 @@ class PostgresTurnRepository:
             turn,
             max_actions=max_actions,
         )
-        return TurnResponse(
-            turn_id=row.id,
-            route=None,
-            resolution_status="pending",
-            narration_status="pending",
-            committed_state_version=None,
-            narration=None,
-            choices=[],
-            action_results=[],
-            recovery=TurnRecovery(fallback=False, reason=None),
+        if row is None:
+            existing = await self._request_row(campaign_id, principal_id, turn.request_id)
+            if existing is None:
+                raise TurnInProgressError("別の未解決Turnが存在します")
+            return await self._replay(existing, turn)
+        return _pending_response(row)
+
+    async def _replay(self, existing: RowMapping, turn: PlayerTurnInput) -> TurnResponse:
+        digest = request_hash(
+            int(existing["input_schema_version"]),
+            existing["campaign_id"],
+            existing["scene_id"],
+            existing["created_by"],
+            turn,
+        )
+        if existing["input_payload"] != turn.model_dump(mode="json") or bytes(
+            existing["request_hash"]
+        ) != digest:
+            raise IdempotencyConflictError("同じrequest_idに異なる入力は使用できません")
+
+        choices = (
+            await self._session.execute(
+                text(
+                    "SELECT id,label FROM turn_choices "
+                    "WHERE source_turn_id=:turn AND invalidated_at IS NULL ORDER BY ordinal"
+                ),
+                {"turn": existing["id"]},
+            )
+        ).mappings()
+        actions = (
+            await self._session.execute(
+                text("SELECT id,ordinal,result FROM actions WHERE turn_id=:turn ORDER BY ordinal"),
+                {"turn": existing["id"]},
+            )
+        ).mappings()
+        return TurnResponse.model_validate(
+            {
+                "turn_id": existing["id"],
+                "route": existing["route"],
+                "resolution_status": existing["resolution_status"],
+                "narration_status": existing["narration_status"],
+                "committed_state_version": existing["committed_state_version"],
+                "narration": existing["narration"],
+                "choices": [{"id": row["id"], "label": row["label"]} for row in choices],
+                "action_results": [
+                    {
+                        "action_id": row["id"],
+                        "ordinal": row["ordinal"],
+                        "result": row["result"],
+                    }
+                    for row in actions
+                ],
+                "recovery": {
+                    "fallback": existing["narration_status"] == "fallback",
+                    "reason": existing["recovery_reason"],
+                },
+            }
         )
 
-    async def find_by_request_id(
+    async def _request_row(
         self, campaign_id: UUID, principal_id: UUID, request_id: UUID
-    ) -> TurnRow | None:
+    ) -> RowMapping | None:
         result = await self._session.execute(
             text("SELECT * FROM turns WHERE campaign_id=:c AND created_by=:p AND request_id=:r"),
             {"c": campaign_id, "p": principal_id, "r": request_id},
         )
-        row = result.mappings().one_or_none()
+        return result.mappings().one_or_none()
+
+    async def find_by_request_id(
+        self, campaign_id: UUID, principal_id: UUID, request_id: UUID
+    ) -> TurnRow | None:
+        row = await self._request_row(campaign_id, principal_id, request_id)
         return None if row is None else _turn(row)
 
     async def accept_pending(
@@ -114,7 +186,7 @@ class PostgresTurnRepository:
         turn: PlayerTurnInput,
         *,
         max_actions: int,
-    ) -> TurnRow:
+    ) -> TurnRow | None:
         # 全Canonical更新経路と同じくCampaignを最初にロックする。
         await self._session.execute(
             text("SELECT id FROM campaigns WHERE id=:c FOR UPDATE"), {"c": campaign_id}
@@ -168,12 +240,14 @@ class PostgresTurnRepository:
                     :version,
                     :max_actions
                 )
+                ON CONFLICT DO NOTHING
                 RETURNING *
                 """
             ),
             params,
         )
-        return _turn(result.mappings().one())
+        row = result.mappings().one_or_none()
+        return None if row is None else _turn(row)
 
     async def acquire_lease(self, turn_id: UUID, *, lease_seconds: int) -> Lease | None:
         result = await self._session.execute(
