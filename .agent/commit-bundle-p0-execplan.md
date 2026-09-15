@@ -33,7 +33,7 @@ Mechanical Turnの確定前にCommand／Result／Event／narration inputを既�
 - [x] Event INSERT失敗時に上記すべてがrollbackされる実PostgreSQLテストを追加する。
 - [x] stale epoch、期限切れlease、古いstate version、committed再実行の既存挙動を実DBで固定する。
 - [x] 全pytest、Ruff、mypy、lock同期、build、mutation確認を実行する。
-- [ ] 独立レビューでCritical／Importantを解消し、main統合後に全検証を再実行する。
+- [x] 実装前の独立監査と差分レビューでCritical／Importantを解消し、main統合後に全検証を再実行する。
 
 ## 完了条件
 
