@@ -244,7 +244,7 @@ async def _canonical_update_projection(
     """Canonical更新を検証し、既存行をlockしたSQL parameterへ変換する。"""
 
     updates = tuple(bundle.canonical_updates)
-    if bundle.canonical_changed != bool(updates):
+    if type(bundle.canonical_changed) is not bool or bundle.canonical_changed != bool(updates):
         raise InvalidCommitBundleError("Canonical変更フラグと更新内容が一致しません")
 
     params: list[dict[str, object]] = []
@@ -708,7 +708,7 @@ class PostgresTurnRepository:
             text(
                 "UPDATE campaigns SET state_version=:v,event_sequence=event_sequence+:n WHERE id=:c"
             ),
-            {"v": version, "n": len(bundle.events), "c": bundle.campaign_id},
+            {"v": version, "n": len(event_params), "c": bundle.campaign_id},
         )
         await self._session.execute(
             text(

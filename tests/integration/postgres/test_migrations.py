@@ -1488,14 +1488,15 @@ def test_commit_resolution_rejects_inconsistent_bundle_before_writes(
 
 @pytest.mark.parametrize(
     "invalid_update",
-        [
-            "flag-mismatch",
-            "unchanged",
-            "missing-character",
-            "invalid-hp",
-            "duplicate-character",
-            "unmatched-result",
-        ],
+    [
+        "flag-mismatch",
+        "unchanged",
+        "missing-character",
+        "invalid-hp",
+        "duplicate-character",
+        "unmatched-result",
+        "non-bool-flag",
+    ],
 )
 def test_commit_resolution_rejects_invalid_canonical_update(
     database: Engine,
@@ -1528,6 +1529,8 @@ def test_commit_resolution_rejects_invalid_canonical_update(
             bundle,
             canonical_updates=((*bundle.canonical_updates, bundle.canonical_updates[0])),
         )
+    elif invalid_update == "non-bool-flag":
+        bundle = replace(bundle, canonical_changed=1)
 
     with pytest.raises(InvalidCommitBundleError):
         _commit_resolution_from_database(database, bundle)
