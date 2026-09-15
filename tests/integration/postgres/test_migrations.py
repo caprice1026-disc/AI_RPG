@@ -50,10 +50,12 @@ ACTOR_A = "00000000-0000-0000-0000-000000000031"
 ACTOR_B = "00000000-0000-0000-0000-000000000032"
 ACTOR_C = "00000000-0000-0000-0000-000000000033"
 TURN_A = "00000000-0000-0000-0000-000000000041"
+TURN_B = "00000000-0000-0000-0000-000000000042"
 ACTION_A = "00000000-0000-0000-0000-000000000051"
 EVENT_A = "00000000-0000-0000-0000-000000000061"
 REQUEST_A = "00000000-0000-0000-0000-000000000071"
 REQUEST_B = "00000000-0000-0000-0000-000000000072"
+REQUEST_C = "00000000-0000-0000-0000-000000000073"
 CHOICE_A = "00000000-0000-0000-0000-000000000081"
 CHOICE_B = "00000000-0000-0000-0000-000000000082"
 CHOICE_C = "00000000-0000-0000-0000-000000000083"
@@ -358,6 +360,56 @@ def _complete_turn_response(connection: Connection, turn_id: UUID) -> None:
             "scene": SCENE_A,
             "turn": turn_id,
             "actor": ACTOR_A,
+        },
+    )
+
+
+def _insert_choice_source(
+    connection: Connection,
+    *,
+    campaign_id: str,
+    scene_id: str,
+    principal_id: str,
+    actor_id: str,
+    narration_status: str = "completed",
+) -> None:
+    narration = "選択肢を提示した。" if narration_status == "completed" else None
+    connection.execute(
+        text(
+            "INSERT INTO turns("
+            "id,campaign_id,scene_id,request_id,created_by,actor_id,input_payload,"
+            "request_hash,input_kind,input_text,expected_state_version,"
+            "committed_state_version,route,resolution_status,committed_at,"
+            "narration_status,narration"
+            ") VALUES("
+            ":turn,:campaign,:scene,:request,:principal,:actor,'{}',"
+            "decode(repeat('00',32),'hex'),'text','調べる',0,0,'narrative','committed',"
+            "now(),:narration_status,:narration"
+            ")"
+        ),
+        {
+            "turn": TURN_B,
+            "campaign": campaign_id,
+            "scene": scene_id,
+            "request": REQUEST_C,
+            "principal": principal_id,
+            "actor": actor_id,
+            "narration_status": narration_status,
+            "narration": narration,
+        },
+    )
+    connection.execute(
+        text(
+            "INSERT INTO turn_choices("
+            "id,campaign_id,scene_id,source_turn_id,actor_id,ordinal,label,state_version"
+            ") VALUES(:choice,:campaign,:scene,:turn,:actor,1,'調べ続ける',0)"
+        ),
+        {
+            "choice": CHOICE_C,
+            "campaign": campaign_id,
+            "scene": scene_id,
+            "turn": TURN_B,
+            "actor": actor_id,
         },
     )
 
@@ -1075,6 +1127,74 @@ def test_choice_for_different_actor_is_rejected_as_unavailable(database: Engine)
     assert caught.value.code == "CHOICE_NOT_AVAILABLE"
     with database.connect() as connection:
         assert connection.scalar(text("SELECT count(*) FROM turns")) == 1
+
+
+@pytest.mark.parametrize(
+    (
+        "source_campaign",
+        "source_scene",
+        "source_principal",
+        "source_actor",
+        "narration_status",
+    ),
+    [
+        (CAMPAIGN_B, SCENE_B, PRINCIPAL_B, ACTOR_B, "completed"),
+        (CAMPAIGN_A, SCENE_B, PRINCIPAL_A, ACTOR_A, "completed"),
+        (CAMPAIGN_A, SCENE_A, PRINCIPAL_A, ACTOR_A, "pending"),
+    ],
+    ids=["different-campaign", "different-scene", "unnarrated-source"],
+)
+def test_choice_scope_and_narration_are_required(
+    database: Engine,
+    source_campaign: str,
+    source_scene: str,
+    source_principal: str,
+    source_actor: str,
+    narration_status: str,
+) -> None:
+    with database.begin() as connection:
+        _seed_members_entities_and_scene(connection)
+        if source_scene == SCENE_B:
+            connection.execute(
+                text(
+                    "INSERT INTO scenes(id,campaign_id,sequence,status) "
+                    "VALUES(:scene,:campaign,:sequence,:status)"
+                ),
+                {
+                    "scene": source_scene,
+                    "campaign": source_campaign,
+                    "sequence": 1 if source_campaign == CAMPAIGN_B else 2,
+                    "status": "active" if source_campaign == CAMPAIGN_B else "closed",
+                },
+            )
+        _insert_choice_source(
+            connection,
+            campaign_id=source_campaign,
+            scene_id=source_scene,
+            principal_id=source_principal,
+            actor_id=source_actor,
+            narration_status=narration_status,
+        )
+
+    with pytest.raises(ChoiceNotAvailableError) as caught:
+        _accept_from_database(
+            database,
+            _player_turn(choice_id=CHOICE_C),
+        )
+
+    assert caught.value.code == "CHOICE_NOT_AVAILABLE"
+    with database.connect() as connection:
+        assert connection.scalar(
+            text(
+                "SELECT count(*) FROM turns "
+                "WHERE campaign_id=:campaign AND request_id=:request"
+            ),
+            {"campaign": CAMPAIGN_A, "request": REQUEST_A},
+        ) == 0
+        assert connection.scalar(
+            text("SELECT invalidated_at FROM turn_choices WHERE id=:choice"),
+            {"choice": CHOICE_C},
+        ) is None
 
 
 def test_late_narration_does_not_add_choices_after_later_turn(database: Engine) -> None:

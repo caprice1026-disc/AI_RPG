@@ -6,7 +6,7 @@ from uuid import uuid4
 import pytest
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from ai_rpg.application import AuthorizationError
+from ai_rpg.application import AuthorizationError, AuthorizationPolicy
 from ai_rpg.application.turns import RuntimePolicy, TurnService
 from ai_rpg.contracts import PlayerTurnInput
 from ai_rpg.infrastructure.postgres.repositories import PostgresUnitOfWork
@@ -62,7 +62,7 @@ async def test_accept_preserves_policy_and_returns_valid_pending_response(max_ac
         MagicMock(),
         insert_result,
     ]
-    authorization = AsyncMock()
+    authorization = AsyncMock(spec=AuthorizationPolicy)
     authorization.can_access_campaign.return_value = True
     session_factory = MagicMock(return_value=session)
     service = TurnService(
@@ -99,7 +99,7 @@ async def test_campaign_access_is_checked_before_opening_unit_of_work() -> None:
             "content": {"kind": "text", "text": "進む"},
         }
     )
-    authorization = AsyncMock()
+    authorization = AsyncMock(spec=AuthorizationPolicy)
     authorization.can_access_campaign.return_value = False
     unit_of_work_factory = MagicMock()
     service = TurnService(

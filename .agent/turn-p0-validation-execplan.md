@@ -30,6 +30,15 @@ Campaign lock配下で検証する。再送はこれらの新規受付検証よ�
 - [x] mutation確認後、全pytest、Ruff、mypy、lock同期、buildを実行する。
 - [ ] 独立レビューでCritical／Importantを解消し、main統合後に全検証を再実行してpushする。
 
+## レビュー判断
+
+- 未解決Turnがある場合の`TURN_IN_PROGRESS`優先は既存テストで固定済みであり、
+  同時に不正な新規入力がある場合のエラー優先順位を契約は定めていないため維持する。
+- 旧`AuthorizationPolicy.can_control`は再送前のCampaign参照権確認を表現できない。
+  concrete adapterがまだ存在しないため互換shimは追加せず、Protocol準拠mockで境界を検証する。
+- ChoiceのCampaign、Scene、提示元narration状態の拒否テストを追加し、失敗時に
+  Turnを追加せずChoiceも失効しないことを確認する。
+
 ## 完了条件
 
 - 無権限、古いversion、不正ChoiceではTurnもChoice失効もcommitされない。
