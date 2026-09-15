@@ -7,6 +7,7 @@ import sys
 from collections.abc import AsyncIterator, Callable, Generator, Iterator
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
+from dataclasses import replace
 from pathlib import Path
 from threading import Event
 from typing import Any
@@ -23,10 +24,11 @@ from ai_rpg.application import (
     AuthorizationError,
     ChoiceNotAvailableError,
     IdempotencyConflictError,
+    InvalidCommitBundleError,
     StateVersionConflictError,
     TurnInProgressError,
 )
-from ai_rpg.application.ports import ChoiceDraft
+from ai_rpg.application.ports import ActionRecord, ChoiceDraft, CommitBundle, EventRecord, Lease
 from ai_rpg.contracts import PlayerTurnInput, TurnResponse
 from ai_rpg.infrastructure.postgres.repositories import (
     PostgresNarrationRepository,
@@ -412,6 +414,227 @@ def _insert_choice_source(
             "actor": actor_id,
         },
     )
+
+
+def _seed_resolution_state(connection: Connection) -> None:
+    _seed_members_entities_and_scene(connection)
+    connection.execute(
+        text(
+            "INSERT INTO entities(id,campaign_id,kind) "
+            "VALUES(:actor,:campaign,'npc')"
+        ),
+        {"actor": ACTOR_C, "campaign": CAMPAIGN_A},
+    )
+    connection.execute(
+        text(
+            "INSERT INTO mvp_characters("
+            "campaign_id,entity_id,current_hp,max_hp,defense,attack_bonus"
+            ") VALUES(:campaign,:actor,10,10,12,2),(:campaign,:target,10,10,11,1)"
+        ),
+        {"campaign": CAMPAIGN_A, "actor": ACTOR_A, "target": ACTOR_C},
+    )
+
+
+def _resolution_action(turn_id: UUID, ordinal: int) -> ActionRecord:
+    action_id = UUID(int=1000 + ordinal)
+    roll = {
+        "expression": "1d20+2",
+        "rolls": [10],
+        "modifier": 2,
+        "total": 12,
+    }
+    result = {
+        "kind": "applied",
+        "outcome": "success",
+        "facts": ["技能判定はsuccess(合計12)"],
+        "dice": [roll],
+        "damage": [],
+    }
+    return ActionRecord(
+        id=action_id,
+        ordinal=ordinal,
+        actor_id=UUID(ACTOR_A),
+        kind="skill_check",
+        command={
+            "action_id": action_id,
+            "campaign_id": UUID(CAMPAIGN_A),
+            "turn_id": turn_id,
+            "actor_id": UUID(ACTOR_A),
+            "ordinal": ordinal,
+            "kind": "skill_check",
+            "skill_ref": "perception",
+            "objective": "扉を調べる",
+            "target_id": None,
+        },
+        result=result,
+        result_kind="applied",
+    )
+
+
+def _attack_action(turn_id: UUID) -> ActionRecord:
+    action_id = UUID(int=1101)
+    result = {
+        "kind": "applied",
+        "outcome": "success",
+        "facts": ["攻撃が命中し3ダメージを与えた"],
+        "dice": [
+            {"expression": "1d20+2", "rolls": [12], "modifier": 2, "total": 14},
+            {"expression": "1d6", "rolls": [3], "modifier": 0, "total": 3},
+        ],
+        "damage": [
+            {
+                "target_id": UUID(ACTOR_C),
+                "amount": 3,
+                "hp_before": 10,
+                "hp_after": 7,
+            }
+        ],
+    }
+    return ActionRecord(
+        id=action_id,
+        ordinal=1,
+        actor_id=UUID(ACTOR_A),
+        kind="attack",
+        command={
+            "action_id": action_id,
+            "campaign_id": UUID(CAMPAIGN_A),
+            "turn_id": turn_id,
+            "actor_id": UUID(ACTOR_A),
+            "ordinal": 1,
+            "kind": "attack",
+            "target_id": UUID(ACTOR_C),
+            "weapon_id": None,
+        },
+        result=result,
+        result_kind="applied",
+        target_id=UUID(ACTOR_C),
+    )
+
+
+def _resolution_events(action: ActionRecord) -> tuple[EventRecord, ...]:
+    rolls = action.result["dice"]
+    damage = action.result["damage"]
+    assert isinstance(rolls, list)
+    assert isinstance(damage, list)
+    event_id = 2000 + action.ordinal * 100
+    events = [
+        EventRecord(
+            id=UUID(int=event_id + index),
+            event_type="DiceRolled",
+            action_id=action.id,
+            payload={
+                "roll": roll,
+                "rng": {
+                    "source": "seeded_test",
+                    "implementation_version": "mvp_v1",
+                    "draw_index": index,
+                },
+            },
+        )
+        for index, roll in enumerate(rolls)
+    ]
+    events.extend(
+        EventRecord(
+            id=UUID(int=event_id + len(rolls) + index),
+            event_type="DamageApplied",
+            action_id=action.id,
+            payload=damage_fact,
+        )
+        for index, damage_fact in enumerate(damage)
+    )
+    events.append(
+        EventRecord(
+            id=UUID(int=event_id + len(rolls) + len(damage)),
+            event_type="ActionResolved",
+            action_id=action.id,
+            payload={"result": action.result},
+        )
+    )
+    return tuple(events)
+
+
+def _resolution_bundle(
+    turn_id: UUID,
+    *,
+    first_ordinal: int = 1,
+    action_count: int = 1,
+    scene_id: str = SCENE_A,
+    narration_version: int = 0,
+    include_narration_results: bool = True,
+    invalid_event_type: bool = False,
+    canonical_updates: tuple[tuple[UUID, int, int], ...] = (),
+    attack: bool = False,
+) -> CommitBundle:
+    actions = (
+        (_attack_action(turn_id),)
+        if attack
+        else tuple(
+            _resolution_action(turn_id, ordinal)
+            for ordinal in range(first_ordinal, first_ordinal + action_count)
+        )
+    )
+    events = tuple(event for action in actions for event in _resolution_events(action))
+    if invalid_event_type:
+        events = (replace(events[0], event_type="UnregisteredEvent"), *events[1:])
+    resolved_actions = [
+        {
+            "action_id": action.id,
+            "ordinal": action.ordinal,
+            "result": action.result,
+        }
+        for action in actions
+    ]
+    return CommitBundle(
+        campaign_id=UUID(CAMPAIGN_A),
+        scene_id=UUID(scene_id),
+        turn_id=turn_id,
+        worker_epoch=1,
+        base_state_version=0,
+        canonical_changed=bool(canonical_updates),
+        canonical_updates=canonical_updates,
+        actions=actions,
+        events=events,
+        narration_input={
+            "player_text": "扉を調べる",
+            "committed_state_version": narration_version,
+            "resolved_actions": resolved_actions if include_narration_results else [],
+            "public_state_after": [],
+            "allowed_entity_refs": [],
+            "output_limits": {"max_actions": 3, "max_choices": 5},
+        },
+    )
+
+
+def _acquire_lease_from_database(database: Engine, turn_id: UUID) -> Lease:
+    async def acquire() -> Lease:
+        url = database.url.render_as_string(hide_password=False)
+        async with _postgres_sessions(url) as factory, factory() as session:
+            lease = await PostgresTurnRepository(session).acquire_lease(
+                turn_id,
+                lease_seconds=60,
+            )
+            await session.commit()
+            assert lease is not None
+            return lease
+
+    with asyncio.Runner(loop_factory=asyncio.SelectorEventLoop) as runner:
+        return runner.run(acquire())
+
+
+def _commit_resolution_from_database(database: Engine, bundle: CommitBundle) -> int:
+    async def commit() -> int:
+        url = database.url.render_as_string(hide_password=False)
+        async with _postgres_sessions(url) as factory, factory() as session:
+            try:
+                version = await PostgresTurnRepository(session).commit_resolution(bundle)
+                await session.commit()
+                return version
+            except BaseException:
+                await session.rollback()
+                raise
+
+    with asyncio.Runner(loop_factory=asyncio.SelectorEventLoop) as runner:
+        return runner.run(commit())
 
 
 def _guard_empty_database(url: str) -> Generator[str, None, None]:
@@ -1195,6 +1418,351 @@ def test_choice_scope_and_narration_are_required(
             text("SELECT invalidated_at FROM turn_choices WHERE id=:choice"),
             {"choice": CHOICE_C},
         ) is None
+
+
+@pytest.mark.parametrize(
+    "invalid_bundle",
+    [
+        "ordinal-gap",
+        "too-many-actions",
+        "different-scene",
+        "narration-version",
+        "missing-narration-result",
+        "unregistered-event",
+    ],
+)
+def test_commit_resolution_rejects_inconsistent_bundle_before_writes(
+    database: Engine,
+    invalid_bundle: str,
+) -> None:
+    with database.begin() as connection:
+        _seed_resolution_state(connection)
+    accepted = _accept_from_database(database, _player_turn())
+    _acquire_lease_from_database(database, accepted.turn_id)
+
+    options: dict[str, Any] = {}
+    if invalid_bundle == "ordinal-gap":
+        options["first_ordinal"] = 2
+    elif invalid_bundle == "too-many-actions":
+        options["action_count"] = 4
+    elif invalid_bundle == "different-scene":
+        options["scene_id"] = SCENE_B
+    elif invalid_bundle == "narration-version":
+        options["narration_version"] = 1
+    elif invalid_bundle == "missing-narration-result":
+        options["include_narration_results"] = False
+    elif invalid_bundle == "unregistered-event":
+        options["invalid_event_type"] = True
+    bundle = _resolution_bundle(accepted.turn_id, **options)
+
+    with pytest.raises(InvalidCommitBundleError):
+        _commit_resolution_from_database(database, bundle)
+
+    with database.connect() as connection:
+        campaign = connection.execute(
+            text(
+                "SELECT state_version,event_sequence FROM campaigns "
+                "WHERE id=:campaign"
+            ),
+            {"campaign": CAMPAIGN_A},
+        ).one()
+        turn = connection.execute(
+            text(
+                "SELECT resolution_status,committed_state_version FROM turns "
+                "WHERE id=:turn"
+            ),
+            {"turn": accepted.turn_id},
+        ).one()
+        assert tuple(campaign) == (0, 0)
+        assert tuple(turn) == ("resolving", None)
+        assert connection.scalar(text("SELECT count(*) FROM actions")) == 0
+        assert connection.scalar(text("SELECT count(*) FROM events")) == 0
+        assert connection.scalar(
+            text(
+                "SELECT current_hp FROM mvp_characters "
+                "WHERE campaign_id=:campaign AND entity_id=:target"
+            ),
+            {"campaign": CAMPAIGN_A, "target": ACTOR_C},
+        ) == 10
+
+
+@pytest.mark.parametrize(
+    "invalid_update",
+        [
+            "flag-mismatch",
+            "unchanged",
+            "missing-character",
+            "invalid-hp",
+            "duplicate-character",
+            "unmatched-result",
+        ],
+)
+def test_commit_resolution_rejects_invalid_canonical_update(
+    database: Engine,
+    invalid_update: str,
+) -> None:
+    with database.begin() as connection:
+        _seed_resolution_state(connection)
+    accepted = _accept_from_database(database, _player_turn())
+    _acquire_lease_from_database(database, accepted.turn_id)
+
+    target_id = UUID(ACTOR_C)
+    hp = 7
+    if invalid_update == "unchanged":
+        hp = 10
+    elif invalid_update == "missing-character":
+        target_id = UUID(int=99999)
+    elif invalid_update == "invalid-hp":
+        hp = -1
+    bundle = _resolution_bundle(
+        accepted.turn_id,
+        canonical_updates=((target_id, hp, 10),),
+        narration_version=1,
+        attack=invalid_update != "unmatched-result",
+    )
+    if invalid_update == "flag-mismatch":
+        narration_input = {**bundle.narration_input, "committed_state_version": 0}
+        bundle = replace(bundle, canonical_changed=False, narration_input=narration_input)
+    elif invalid_update == "duplicate-character":
+        bundle = replace(
+            bundle,
+            canonical_updates=((*bundle.canonical_updates, bundle.canonical_updates[0])),
+        )
+
+    with pytest.raises(InvalidCommitBundleError):
+        _commit_resolution_from_database(database, bundle)
+
+    with database.connect() as connection:
+        campaign = connection.execute(
+            text(
+                "SELECT state_version,event_sequence FROM campaigns "
+                "WHERE id=:campaign"
+            ),
+            {"campaign": CAMPAIGN_A},
+        ).one()
+        assert tuple(campaign) == (0, 0)
+        assert connection.scalar(
+            text(
+                "SELECT current_hp FROM mvp_characters "
+                "WHERE campaign_id=:campaign AND entity_id=:target"
+            ),
+            {"campaign": CAMPAIGN_A, "target": ACTOR_C},
+        ) == 10
+        assert connection.scalar(text("SELECT count(*) FROM actions")) == 0
+        assert connection.scalar(text("SELECT count(*) FROM events")) == 0
+
+
+@pytest.mark.parametrize("state_changed", [False, True])
+def test_commit_resolution_atomically_persists_valid_bundle(
+    database: Engine,
+    state_changed: bool,
+) -> None:
+    with database.begin() as connection:
+        _seed_resolution_state(connection)
+    accepted = _accept_from_database(database, _player_turn())
+    _acquire_lease_from_database(database, accepted.turn_id)
+    canonical_updates = ((UUID(ACTOR_C), 7, 10),) if state_changed else ()
+    bundle = _resolution_bundle(
+        accepted.turn_id,
+        canonical_updates=canonical_updates,
+        narration_version=int(state_changed),
+        attack=state_changed,
+    )
+
+    version = _commit_resolution_from_database(database, bundle)
+
+    assert version == int(state_changed)
+    with database.connect() as connection:
+        assert tuple(
+            connection.execute(
+                text(
+                    "SELECT state_version,event_sequence FROM campaigns "
+                    "WHERE id=:campaign"
+                ),
+                {"campaign": CAMPAIGN_A},
+            ).one()
+        ) == (version, len(bundle.events))
+        turn = connection.execute(
+            text(
+                "SELECT resolution_status,route,committed_state_version,narration_input "
+                "FROM turns WHERE id=:turn"
+            ),
+            {"turn": accepted.turn_id},
+        ).mappings().one()
+        assert (turn["resolution_status"], turn["route"], turn["committed_state_version"]) == (
+            "committed",
+            "mechanical",
+            version,
+        )
+        assert turn["narration_input"]["committed_state_version"] == version
+        assert connection.scalar(text("SELECT count(*) FROM actions")) == len(bundle.actions)
+        events = connection.execute(
+            text(
+                "SELECT sequence,state_version,type FROM events "
+                "WHERE campaign_id=:campaign ORDER BY sequence"
+            ),
+            {"campaign": CAMPAIGN_A},
+        ).all()
+        assert events == [
+            (index, version, event.event_type)
+            for index, event in enumerate(bundle.events, start=1)
+        ]
+        assert connection.scalar(
+            text(
+                "SELECT current_hp FROM mvp_characters "
+                "WHERE campaign_id=:campaign AND entity_id=:target"
+            ),
+            {"campaign": CAMPAIGN_A, "target": ACTOR_C},
+        ) == (7 if state_changed else 10)
+
+
+@pytest.mark.parametrize(
+    "mismatch",
+    ["command-parent", "result-kind", "event-payload", "event-order"],
+)
+def test_commit_resolution_rejects_contract_mismatches(
+    database: Engine,
+    mismatch: str,
+) -> None:
+    with database.begin() as connection:
+        _seed_resolution_state(connection)
+    accepted = _accept_from_database(database, _player_turn())
+    _acquire_lease_from_database(database, accepted.turn_id)
+    bundle = _resolution_bundle(accepted.turn_id)
+
+    if mismatch == "command-parent":
+        action = replace(
+            bundle.actions[0],
+            command={**bundle.actions[0].command, "turn_id": UUID(int=9999)},
+        )
+        bundle = replace(bundle, actions=(action,))
+    elif mismatch == "result-kind":
+        action = replace(bundle.actions[0], result_kind="not_applicable")
+        bundle = replace(bundle, actions=(action,))
+    elif mismatch == "event-payload":
+        payload = dict(bundle.events[0].payload)
+        payload["roll"] = {**payload["roll"], "total": 11}
+        bundle = replace(bundle, events=(replace(bundle.events[0], payload=payload), *bundle.events[1:]))
+    elif mismatch == "event-order":
+        bundle = replace(bundle, events=tuple(reversed(bundle.events)))
+
+    with pytest.raises(InvalidCommitBundleError):
+        _commit_resolution_from_database(database, bundle)
+
+    with database.connect() as connection:
+        assert connection.scalar(text("SELECT count(*) FROM actions")) == 0
+        assert connection.scalar(text("SELECT count(*) FROM events")) == 0
+
+
+def test_commit_resolution_rolls_back_every_write_when_event_insert_fails(
+    database: Engine,
+) -> None:
+    with database.begin() as connection:
+        _seed_resolution_state(connection)
+    accepted = _accept_from_database(database, _player_turn())
+    _acquire_lease_from_database(database, accepted.turn_id)
+    bundle = _resolution_bundle(
+        accepted.turn_id,
+        canonical_updates=((UUID(ACTOR_C), 7, 10),),
+        narration_version=1,
+        attack=True,
+    )
+    conflicting_event_id = bundle.events[-1].id
+    with database.begin() as connection:
+        connection.execute(
+            text(
+                "INSERT INTO events("
+                "id,campaign_id,sequence,state_version,type,schema_version,payload"
+                ") VALUES(:event,:campaign,1,0,'ExistingEvent',1,'{}')"
+            ),
+            {"event": conflicting_event_id, "campaign": CAMPAIGN_B},
+        )
+
+    with pytest.raises(IntegrityError):
+        _commit_resolution_from_database(database, bundle)
+
+    with database.connect() as connection:
+        assert tuple(
+            connection.execute(
+                text(
+                    "SELECT state_version,event_sequence FROM campaigns "
+                    "WHERE id=:campaign"
+                ),
+                {"campaign": CAMPAIGN_A},
+            ).one()
+        ) == (0, 0)
+        assert tuple(
+            connection.execute(
+                text(
+                    "SELECT resolution_status,committed_state_version,narration_input "
+                    "FROM turns WHERE id=:turn"
+                ),
+                {"turn": accepted.turn_id},
+            ).one()
+        ) == ("resolving", None, None)
+        assert connection.scalar(text("SELECT count(*) FROM actions")) == 0
+        assert connection.scalar(
+            text("SELECT count(*) FROM events WHERE campaign_id=:campaign"),
+            {"campaign": CAMPAIGN_A},
+        ) == 0
+        assert connection.scalar(
+            text(
+                "SELECT current_hp FROM mvp_characters "
+                "WHERE campaign_id=:campaign AND entity_id=:target"
+            ),
+            {"campaign": CAMPAIGN_A, "target": ACTOR_C},
+        ) == 10
+
+
+@pytest.mark.parametrize("invalid_owner", ["stale-epoch", "expired-lease", "stale-version"])
+def test_commit_resolution_rejects_stale_ownership(
+    database: Engine,
+    invalid_owner: str,
+) -> None:
+    with database.begin() as connection:
+        _seed_resolution_state(connection)
+    accepted = _accept_from_database(database, _player_turn())
+    _acquire_lease_from_database(database, accepted.turn_id)
+    bundle = _resolution_bundle(accepted.turn_id)
+
+    if invalid_owner == "stale-epoch":
+        bundle = replace(bundle, worker_epoch=0)
+    elif invalid_owner == "expired-lease":
+        with database.begin() as connection:
+            connection.execute(
+                text("UPDATE turns SET lease_until=now()-interval '1 second' WHERE id=:turn"),
+                {"turn": accepted.turn_id},
+            )
+    elif invalid_owner == "stale-version":
+        with database.begin() as connection:
+            connection.execute(
+                text("UPDATE campaigns SET state_version=1 WHERE id=:campaign"),
+                {"campaign": CAMPAIGN_A},
+            )
+
+    with pytest.raises(RuntimeError, match="worker leaseまたはCanonical version"):
+        _commit_resolution_from_database(database, bundle)
+
+    with database.connect() as connection:
+        assert connection.scalar(text("SELECT count(*) FROM actions")) == 0
+        assert connection.scalar(text("SELECT count(*) FROM events")) == 0
+
+
+def test_commit_resolution_returns_existing_commit_without_duplicate_writes(
+    database: Engine,
+) -> None:
+    with database.begin() as connection:
+        _seed_resolution_state(connection)
+    accepted = _accept_from_database(database, _player_turn())
+    _acquire_lease_from_database(database, accepted.turn_id)
+    bundle = _resolution_bundle(accepted.turn_id)
+
+    assert _commit_resolution_from_database(database, bundle) == 0
+    assert _commit_resolution_from_database(database, bundle) == 0
+
+    with database.connect() as connection:
+        assert connection.scalar(text("SELECT count(*) FROM actions")) == 1
+        assert connection.scalar(text("SELECT count(*) FROM events")) == len(bundle.events)
 
 
 def test_late_narration_does_not_add_choices_after_later_turn(database: Engine) -> None:

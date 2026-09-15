@@ -28,6 +28,12 @@ class IdempotencyConflictError(Exception):
     code = "IDEMPOTENCY_CONFLICT"
 
 
+class InvalidCommitBundleError(ValueError):
+    """Mechanical確定Bundleが契約または相互整合性を満たさない。"""
+
+    code = "INVALID_COMMIT_BUNDLE"
+
+
 class TurnInProgressError(Exception):
     """Campaignに別の未解決Turnが存在する。"""
 

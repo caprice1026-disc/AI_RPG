@@ -8,6 +8,7 @@ from collections.abc import Callable, Mapping, Sequence
 from datetime import UTC, datetime
 from uuid import UUID, uuid4
 
+from pydantic import TypeAdapter, ValidationError
 from sqlalchemy import RowMapping, text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
@@ -19,6 +20,7 @@ from ai_rpg.application.ports.repositories import (
     ChoiceNotAvailableError,
     CommitBundle,
     IdempotencyConflictError,
+    InvalidCommitBundleError,
     Lease,
     NarrationRepository,
     StateVersionConflictError,
@@ -27,7 +29,21 @@ from ai_rpg.application.ports.repositories import (
     TurnRow,
 )
 from ai_rpg.contracts import PlayerTurnInput, TurnResponse
-from ai_rpg.contracts.responses import TurnRecovery
+from ai_rpg.contracts.responses import MechanicalNarrationInput, TurnRecovery
+from ai_rpg.domain.commands import AttackCommand as ContractAttackCommand
+from ai_rpg.domain.commands import Command
+from ai_rpg.domain.commands import UseItemCommand as ContractUseItemCommand
+from ai_rpg.domain.events import (
+    ActionResolvedEvent,
+    DamageAppliedEvent,
+    DiceRolledEvent,
+    DomainEventV1,
+)
+from ai_rpg.domain.results import ActionResult, AppliedResult, DamageFact, ResolvedAction
+
+_COMMAND_ADAPTER: TypeAdapter[Command] = TypeAdapter(Command)
+_RESULT_ADAPTER: TypeAdapter[ActionResult] = TypeAdapter(ActionResult)
+_EVENT_ADAPTER: TypeAdapter[DomainEventV1] = TypeAdapter(DomainEventV1)
 
 
 def _json(value: object) -> str:
@@ -76,6 +92,243 @@ def _pending_response(turn: TurnRow) -> TurnResponse:
         action_results=[],
         recovery=TurnRecovery(fallback=False, reason=None),
     )
+
+
+def _resolution_projection(
+    bundle: CommitBundle,
+    turn: RowMapping,
+    *,
+    version: int,
+    first_event_sequence: int,
+) -> tuple[
+    tuple[dict[str, object], ...],
+    tuple[dict[str, object], ...],
+    dict[str, object],
+    tuple[DamageFact, ...],
+]:
+    """Bundleを既存契約へ投影し、SQLへ渡す整合済み値だけを返す。"""
+
+    if bundle.scene_id != turn["scene_id"]:
+        raise InvalidCommitBundleError("BundleのSceneがTurnと一致しません")
+    max_actions = int(turn["max_actions"])
+    if not 1 <= len(bundle.actions) <= max_actions:
+        raise InvalidCommitBundleError("Action件数がTurnの上限外です")
+    if [action.ordinal for action in bundle.actions] != list(range(1, len(bundle.actions) + 1)):
+        raise InvalidCommitBundleError("Action ordinalは1から連続する必要があります")
+    if len({action.id for action in bundle.actions}) != len(bundle.actions):
+        raise InvalidCommitBundleError("Action IDが重複しています")
+
+    action_params: list[dict[str, object]] = []
+    resolved_actions: list[ResolvedAction] = []
+    results: list[ActionResult] = []
+    try:
+        for action in bundle.actions:
+            command = _COMMAND_ADAPTER.validate_python(action.command)
+            result = _RESULT_ADAPTER.validate_python(action.result)
+            target_id = command.target_id
+            if isinstance(command, ContractAttackCommand):
+                item_id = command.weapon_id
+            elif isinstance(command, ContractUseItemCommand):
+                item_id = command.item_id
+            else:
+                item_id = None
+            if (
+                command.action_id != action.id
+                or command.campaign_id != bundle.campaign_id
+                or command.turn_id != bundle.turn_id
+                or command.actor_id != action.actor_id
+                or command.actor_id != turn["actor_id"]
+                or command.ordinal != action.ordinal
+                or command.kind != action.kind
+                or target_id != action.target_id
+                or item_id != action.item_id
+                or result.kind != action.result_kind
+            ):
+                raise InvalidCommitBundleError("ActionRecordとCommand/Resultが一致しません")
+            action_params.append(
+                {
+                    "id": action.id,
+                    "o": action.ordinal,
+                    "actor": action.actor_id,
+                    "kind": action.kind,
+                    "target": target_id,
+                    "item": item_id,
+                    "command": command.model_dump(mode="json"),
+                    "result": result.model_dump(mode="json"),
+                    "rk": result.kind,
+                }
+            )
+            resolved_actions.append(
+                ResolvedAction(action_id=action.id, ordinal=action.ordinal, result=result)
+            )
+            results.append(result)
+
+        narration_input = MechanicalNarrationInput.model_validate(bundle.narration_input)
+        if (
+            narration_input.committed_state_version != version
+            or narration_input.output_limits.max_actions != max_actions
+            or narration_input.resolved_actions != resolved_actions
+        ):
+            raise InvalidCommitBundleError("描写入力が確定内容と一致しません")
+
+        if len({event.id for event in bundle.events}) != len(bundle.events):
+            raise InvalidCommitBundleError("Event IDが重複しています")
+        events = tuple(
+            _EVENT_ADAPTER.validate_python(
+                {
+                    "id": event.id,
+                    "campaign_id": bundle.campaign_id,
+                    "scene_id": bundle.scene_id,
+                    "turn_id": bundle.turn_id,
+                    "action_id": event.action_id,
+                    "sequence": first_event_sequence + offset,
+                    "state_version": version,
+                    "schema_version": 1,
+                    "type": event.event_type,
+                    "payload": event.payload,
+                }
+            )
+            for offset, event in enumerate(bundle.events)
+        )
+    except ValidationError as error:
+        raise InvalidCommitBundleError("Bundleが既存契約を満たしません") from error
+
+    expected_events: list[tuple[str, UUID, object]] = []
+    for action, result in zip(bundle.actions, results, strict=True):
+        if isinstance(result, AppliedResult):
+            expected_events.extend(("DiceRolled", action.id, roll) for roll in result.dice)
+            expected_events.extend(("DamageApplied", action.id, damage) for damage in result.damage)
+        expected_events.append(("ActionResolved", action.id, result))
+    if [(event.type, event.action_id) for event in events] != [
+        (event_type, action_id) for event_type, action_id, _ in expected_events
+    ]:
+        raise InvalidCommitBundleError("Event件数または順序がAction結果と一致しません")
+
+    for event, (_, _, expected_payload) in zip(events, expected_events, strict=True):
+        if isinstance(event, DiceRolledEvent):
+            valid = event.payload.roll == expected_payload
+        elif isinstance(event, DamageAppliedEvent):
+            valid = event.payload == expected_payload
+        elif isinstance(event, ActionResolvedEvent):
+            valid = event.payload.result == expected_payload
+        else:
+            valid = False
+        if not valid:
+            raise InvalidCommitBundleError("Event payloadがAction結果と一致しません")
+
+    event_params: list[dict[str, object]] = [
+        {
+            "id": event.id,
+            "a": event.action_id,
+            "seq": event.sequence,
+            "type": event.type,
+            "payload": event.payload.model_dump(mode="json"),
+        }
+        for event in events
+    ]
+    damage = tuple(
+        fact for result in results if isinstance(result, AppliedResult) for fact in result.damage
+    )
+    return (
+        tuple(action_params),
+        tuple(event_params),
+        narration_input.model_dump(mode="json"),
+        damage,
+    )
+
+
+async def _canonical_update_projection(
+    session: AsyncSession,
+    bundle: CommitBundle,
+) -> tuple[dict[str, object], ...]:
+    """Canonical更新を検証し、既存行をlockしたSQL parameterへ変換する。"""
+
+    updates = tuple(bundle.canonical_updates)
+    if bundle.canonical_changed != bool(updates):
+        raise InvalidCommitBundleError("Canonical変更フラグと更新内容が一致しません")
+
+    params: list[dict[str, object]] = []
+    entity_ids: set[UUID] = set()
+    for update in updates:
+        try:
+            entity_id, hp, max_hp = update
+        except (TypeError, ValueError) as error:
+            raise InvalidCommitBundleError("Canonical更新の形式が不正です") from error
+        if (
+            not isinstance(entity_id, UUID)
+            or type(hp) is not int
+            or type(max_hp) is not int
+            or max_hp < 1
+            or not 0 <= hp <= max_hp
+        ):
+            raise InvalidCommitBundleError("Canonical更新値が不正です")
+        if entity_id in entity_ids:
+            raise InvalidCommitBundleError("Canonical更新対象が重複しています")
+        entity_ids.add(entity_id)
+
+        current = (
+            await session.execute(
+                text(
+                    """
+                    SELECT current_hp,max_hp
+                    FROM mvp_characters
+                    WHERE campaign_id=:c AND entity_id=:e
+                    FOR UPDATE
+                    """
+                ),
+                {"c": bundle.campaign_id, "e": entity_id},
+            )
+        ).one_or_none()
+        if current is None:
+            raise InvalidCommitBundleError("Canonical更新対象が存在しません")
+        if (hp, max_hp) == (int(current.current_hp), int(current.max_hp)):
+            raise InvalidCommitBundleError("Canonical更新に実際の変更がありません")
+        params.append(
+            {
+                "hp": hp,
+                "max_hp": max_hp,
+                "c": bundle.campaign_id,
+                "e": entity_id,
+                "current_hp": int(current.current_hp),
+                "current_max_hp": int(current.max_hp),
+            }
+        )
+    return tuple(params)
+
+
+def _validate_canonical_damage(
+    canonical_params: tuple[dict[str, object], ...],
+    damage: tuple[DamageFact, ...],
+) -> None:
+    """Damage結果と一度だけ適用するHP更新の対応を確認する。"""
+
+    chains: dict[UUID, tuple[int, int]] = {}
+    for fact in damage:
+        if fact.hp_after != max(0, fact.hp_before - fact.amount):
+            raise InvalidCommitBundleError("Damage結果のHP計算が不正です")
+        chain = chains.get(fact.target_id)
+        if chain is not None and fact.hp_before != chain[1]:
+            raise InvalidCommitBundleError("Damage結果のHP遷移が連続していません")
+        chains[fact.target_id] = (
+            fact.hp_before if chain is None else chain[0],
+            fact.hp_after,
+        )
+
+    updates = {params["e"]: params for params in canonical_params}
+    changed_targets = {
+        target_id for target_id, (hp_before, hp_after) in chains.items() if hp_before != hp_after
+    }
+    if set(updates) != changed_targets:
+        raise InvalidCommitBundleError("Canonical更新がDamage結果と一致しません")
+    for target_id in changed_targets:
+        params = updates[target_id]
+        hp_before, hp_after = chains[target_id]
+        if (
+            params["current_hp"] != hp_before
+            or params["hp"] != hp_after
+            or params["max_hp"] != params["current_max_hp"]
+        ):
+            raise InvalidCommitBundleError("Canonical HP更新がDamage結果と一致しません")
 
 
 class PostgresTurnRepository:
@@ -422,18 +675,35 @@ class PostgresTurnRepository:
             or int(campaign["state_version"]) != bundle.base_state_version
         ):
             raise RuntimeError("worker leaseまたはCanonical versionが無効です")
-        version = bundle.base_state_version + int(bundle.canonical_changed)
-        for entity_id, hp, max_hp in bundle.canonical_updates:
-            await self._session.execute(
+        canonical_params = await _canonical_update_projection(self._session, bundle)
+        version = bundle.base_state_version + int(bool(canonical_params))
+        first = int(campaign["event_sequence"]) + 1
+        action_params, event_params, narration_input, damage = _resolution_projection(
+            bundle,
+            turn,
+            version=version,
+            first_event_sequence=first,
+        )
+        _validate_canonical_damage(canonical_params, damage)
+        for params in canonical_params:
+            updated = await self._session.execute(
                 text(
                     """
                     UPDATE mvp_characters
                     SET current_hp=:hp,max_hp=:max_hp
                     WHERE campaign_id=:c AND entity_id=:e
+                    RETURNING entity_id
                     """
                 ),
-                {"hp": hp, "max_hp": max_hp, "c": bundle.campaign_id, "e": entity_id},
+                {
+                    "hp": params["hp"],
+                    "max_hp": params["max_hp"],
+                    "c": params["c"],
+                    "e": params["e"],
+                },
             )
+            if updated.scalar_one_or_none() is None:
+                raise InvalidCommitBundleError("Canonical更新対象が消失しました")
         await self._session.execute(
             text(
                 "UPDATE campaigns SET state_version=:v,event_sequence=event_sequence+:n WHERE id=:c"
@@ -450,9 +720,9 @@ class PostgresTurnRepository:
                 WHERE id=:t
                 """
             ),
-            {"v": version, "ni": _json(bundle.narration_input), "t": bundle.turn_id},
+            {"v": version, "ni": _json(narration_input), "t": bundle.turn_id},
         )
-        for action in bundle.actions:
+        for action in action_params:
             await self._session.execute(
                 text(
                     """
@@ -477,22 +747,15 @@ class PostgresTurnRepository:
                     """
                 ),
                 {
-                    "id": action.id,
+                    **action,
                     "c": bundle.campaign_id,
                     "t": bundle.turn_id,
-                    "o": action.ordinal,
-                    "actor": action.actor_id,
-                    "kind": action.kind,
-                    "target": action.target_id,
-                    "item": action.item_id,
-                    "command": _json(action.command),
-                    "result": _json(action.result),
-                    "rk": action.result_kind,
+                    "command": _json(action["command"]),
+                    "result": _json(action["result"]),
                     "ruleset": campaign["ruleset_version"],
                 },
             )
-        first = int(campaign["event_sequence"]) + 1
-        for offset, event in enumerate(bundle.events):
+        for event in event_params:
             await self._session.execute(
                 text(
                     """
@@ -515,15 +778,12 @@ class PostgresTurnRepository:
                     """
                 ),
                 {
-                    "id": event.id,
+                    **event,
                     "c": bundle.campaign_id,
                     "s": bundle.scene_id,
                     "t": bundle.turn_id,
-                    "a": event.action_id,
-                    "seq": first + offset,
                     "v": version,
-                    "type": event.event_type,
-                    "payload": _json(event.payload),
+                    "payload": _json(event["payload"]),
                 },
             )
         return version
