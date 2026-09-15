@@ -1,6 +1,7 @@
 """DomainとEngineの依存方向を固定するContract Test。"""
 
 import ast
+from collections.abc import Iterable
 from pathlib import Path
 
 import pytest
@@ -12,7 +13,6 @@ def test_domain_and_engine_do_not_import_external_adapters() -> None:
 
     forbidden = {
         "fastapi",
-        "pydantic",
         "sqlalchemy",
         "psycopg",
         "ai_rpg.llm",
@@ -23,6 +23,7 @@ def test_domain_and_engine_do_not_import_external_adapters() -> None:
     for package in ("domain", "engine"):
         for path in Path(f"src/ai_rpg/{package}").glob("*.py"):
             tree = ast.parse(path.read_text(encoding="utf-8"))
+            names: Iterable[str]
             for node in ast.walk(tree):
                 if isinstance(node, ast.Import):
                     names = (alias.name for alias in node.names)

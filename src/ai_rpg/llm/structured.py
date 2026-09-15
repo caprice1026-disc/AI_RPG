@@ -1,7 +1,7 @@
 """provider固有SDKを隔離する構造化出力adapter境界。"""
 
 from dataclasses import dataclass
-from typing import Generic, Protocol, TypeVar, cast
+from typing import Generic, Protocol, TypeVar
 
 from pydantic import TypeAdapter
 
@@ -41,4 +41,4 @@ class StructuredOutputAdapter:
         raw = await self._transport.request(
             request.model_id, request.system_instruction, request.input_data
         )
-        return cast(OutputT, request.output_adapter.validate_python(raw))
+        return request.output_adapter.validate_python(raw)
