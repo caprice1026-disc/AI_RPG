@@ -72,11 +72,11 @@ def make_decision_types(max_actions: int = 3) -> tuple[TypeAdapter[Any], TypeAda
         actions=(list[ActionIntent], Field(min_length=1, max_length=max_actions)),
     )
     narrative_type = Annotated[
-        NarrativeDraft | escalation | ClarificationRequired,  # type: ignore[valid-type]
+        NarrativeDraft | escalation | ClarificationRequired,
         Field(discriminator="kind"),
     ]
     mechanical_type = Annotated[
-        plan | ClarificationRequired,  # type: ignore[valid-type]
+        plan | ClarificationRequired,
         Field(discriminator="kind"),
     ]
     return TypeAdapter(narrative_type), TypeAdapter(mechanical_type)

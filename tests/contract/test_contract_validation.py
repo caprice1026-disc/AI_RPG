@@ -63,10 +63,10 @@ def test_decision_factory_rejects_invalid_limits(max_actions: object) -> None:
 def test_turn_recovery_all_consistency_combinations(fallback: bool, reason: str | None) -> None:
     expected = fallback == (reason is not None)
     if expected:
-        TurnRecovery(fallback=fallback, reason=reason)  # type: ignore[arg-type]
+        TurnRecovery.model_validate({"fallback": fallback, "reason": reason})
     else:
         with pytest.raises(ValidationError):
-            TurnRecovery(fallback=fallback, reason=reason)  # type: ignore[arg-type]
+            TurnRecovery.model_validate({"fallback": fallback, "reason": reason})
 
 
 @pytest.mark.contract
