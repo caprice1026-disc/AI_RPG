@@ -5,7 +5,7 @@ import re
 import secrets
 from typing import Protocol
 
-from ai_rpg.domain.models import DiceResult
+from ai_rpg.domain.results import DiceResult
 
 _DICE_PATTERN = re.compile(
     r"^(?P<count>[1-9]|1[0-9]|20)d(?P<sides>[2-9]|[1-9][0-9]|100)"
@@ -57,5 +57,10 @@ class DiceEngine:
         count = int(match.group("count"))
         sides = int(match.group("sides"))
         modifier = int(match.group("modifier") or 0)
-        rolls = tuple(self._random_source.randint(1, sides) for _ in range(count))
-        return DiceResult(normalized, rolls, modifier, sum(rolls) + modifier)
+        rolls = [self._random_source.randint(1, sides) for _ in range(count)]
+        return DiceResult(
+            expression=normalized,
+            rolls=rolls,
+            modifier=modifier,
+            total=sum(rolls) + modifier,
+        )

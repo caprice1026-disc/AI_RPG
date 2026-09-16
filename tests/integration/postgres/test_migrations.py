@@ -12,7 +12,7 @@ from pathlib import Path
 from threading import Event
 from typing import Any
 from unittest.mock import MagicMock
-from uuid import UUID
+from uuid import UUID, uuid4
 
 import pytest
 from sqlalchemy import Connection, Engine, RowMapping, create_engine, event, text
@@ -28,8 +28,20 @@ from ai_rpg.application import (
     StateVersionConflictError,
     TurnInProgressError,
 )
-from ai_rpg.application.ports import ActionRecord, ChoiceDraft, CommitBundle, EventRecord, Lease
+from ai_rpg.application.ports import ActionRecord, ChoiceDraft, CommitBundle, Lease
 from ai_rpg.contracts import PlayerTurnInput, TurnResponse
+from ai_rpg.contracts.context import OutputLimits
+from ai_rpg.contracts.responses import MechanicalNarrationInput
+from ai_rpg.domain.commands import AttackCommand, SkillCheckCommand, UseItemCommand
+from ai_rpg.domain.events import RNGMetadata
+from ai_rpg.domain.results import (
+    AppliedResult,
+    DamageApplied,
+    DiceResult,
+    HealingApplied,
+    ItemConsumed,
+    ResolvedAction,
+)
 from ai_rpg.infrastructure.postgres.repositories import (
     PostgresNarrationRepository,
     PostgresTurnRepository,
@@ -61,6 +73,7 @@ REQUEST_C = "00000000-0000-0000-0000-000000000073"
 CHOICE_A = "00000000-0000-0000-0000-000000000081"
 CHOICE_B = "00000000-0000-0000-0000-000000000082"
 CHOICE_C = "00000000-0000-0000-0000-000000000083"
+ITEM_A = "00000000-0000-0000-0000-000000000091"
 
 
 def _run_alembic(url: str, *arguments: str) -> None:
@@ -421,9 +434,9 @@ def _seed_resolution_state(connection: Connection) -> None:
     connection.execute(
         text(
             "INSERT INTO entities(id,campaign_id,kind) "
-            "VALUES(:actor,:campaign,'npc')"
+            "VALUES(:actor,:campaign,'npc'),(:item,:campaign,'item')"
         ),
-        {"actor": ACTOR_C, "campaign": CAMPAIGN_A},
+        {"actor": ACTOR_C, "item": ITEM_A, "campaign": CAMPAIGN_A},
     )
     connection.execute(
         text(
@@ -433,124 +446,141 @@ def _seed_resolution_state(connection: Connection) -> None:
         ),
         {"campaign": CAMPAIGN_A, "actor": ACTOR_A, "target": ACTOR_C},
     )
+    connection.execute(
+        text(
+            "INSERT INTO mvp_inventory(campaign_id,owner_id,item_id,quantity,equipped) "
+            "VALUES(:campaign,:owner,:item,2,false)"
+        ),
+        {"campaign": CAMPAIGN_A, "owner": ACTOR_A, "item": ITEM_A},
+    )
 
 
 def _resolution_action(turn_id: UUID, ordinal: int) -> ActionRecord:
     action_id = UUID(int=1000 + ordinal)
-    roll = {
-        "expression": "1d20+2",
-        "rolls": [10],
-        "modifier": 2,
-        "total": 12,
-    }
-    result = {
-        "kind": "applied",
-        "outcome": "success",
-        "facts": ["技能判定はsuccess(合計12)"],
-        "dice": [roll],
-        "damage": [],
-    }
+    roll = DiceResult(expression="1d20+2", rolls=[10], modifier=2, total=12)
+    result = AppliedResult(
+        kind="applied",
+        outcome="success",
+        facts=["技能判定はsuccess(合計12)"],
+        dice=[roll],
+        state_changes=[],
+    )
     return ActionRecord(
-        id=action_id,
-        ordinal=ordinal,
-        actor_id=UUID(ACTOR_A),
-        kind="skill_check",
-        command={
-            "action_id": action_id,
-            "campaign_id": UUID(CAMPAIGN_A),
-            "turn_id": turn_id,
-            "actor_id": UUID(ACTOR_A),
-            "ordinal": ordinal,
-            "kind": "skill_check",
-            "skill_ref": "perception",
-            "objective": "扉を調べる",
-            "target_id": None,
-        },
+        command=SkillCheckCommand(
+            action_id=action_id,
+            campaign_id=UUID(CAMPAIGN_A),
+            turn_id=turn_id,
+            actor_id=UUID(ACTOR_A),
+            ordinal=ordinal,
+            kind="skill_check",
+            skill_ref="perception",
+            objective="扉を調べる",
+            target_id=None,
+            modifier=2,
+            difficulty_class=8,
+        ),
         result=result,
-        result_kind="applied",
+        rng=(
+            RNGMetadata(
+                source="seeded_test",
+                implementation_version="mvp_v1",
+                draw_index=0,
+            ),
+        ),
     )
 
 
 def _attack_action(turn_id: UUID) -> ActionRecord:
     action_id = UUID(int=1101)
-    result = {
-        "kind": "applied",
-        "outcome": "success",
-        "facts": ["攻撃が命中し3ダメージを与えた"],
-        "dice": [
-            {"expression": "1d20+2", "rolls": [12], "modifier": 2, "total": 14},
-            {"expression": "1d6", "rolls": [3], "modifier": 0, "total": 3},
+    result = AppliedResult(
+        kind="applied",
+        outcome="success",
+        facts=["攻撃が命中し3ダメージを与えた"],
+        dice=[
+            DiceResult(expression="1d20+2", rolls=[12], modifier=2, total=14),
+            DiceResult(expression="1d6", rolls=[3], modifier=0, total=3),
         ],
-        "damage": [
-            {
-                "target_id": UUID(ACTOR_C),
-                "amount": 3,
-                "hp_before": 10,
-                "hp_after": 7,
-            }
+        state_changes=[
+            DamageApplied(
+                kind="damage_applied",
+                target_id=UUID(ACTOR_C),
+                amount=3,
+                hp_before=10,
+                hp_after=7,
+            )
         ],
-    }
+    )
     return ActionRecord(
-        id=action_id,
-        ordinal=1,
-        actor_id=UUID(ACTOR_A),
-        kind="attack",
-        command={
-            "action_id": action_id,
-            "campaign_id": UUID(CAMPAIGN_A),
-            "turn_id": turn_id,
-            "actor_id": UUID(ACTOR_A),
-            "ordinal": 1,
-            "kind": "attack",
-            "target_id": UUID(ACTOR_C),
-            "weapon_id": None,
-        },
+        command=AttackCommand(
+            action_id=action_id,
+            campaign_id=UUID(CAMPAIGN_A),
+            turn_id=turn_id,
+            actor_id=UUID(ACTOR_A),
+            ordinal=1,
+            kind="attack",
+            target_id=UUID(ACTOR_C),
+            weapon_id=None,
+            attack_bonus=2,
+            damage_expression="1d6",
+            damage_bonus=0,
+        ),
         result=result,
-        result_kind="applied",
-        target_id=UUID(ACTOR_C),
+        rng=tuple(
+            RNGMetadata(
+                source="seeded_test",
+                implementation_version="mvp_v1",
+                draw_index=index,
+            )
+            for index in range(2)
+        ),
     )
 
 
-def _resolution_events(action: ActionRecord) -> tuple[EventRecord, ...]:
-    rolls = action.result["dice"]
-    damage = action.result["damage"]
-    assert isinstance(rolls, list)
-    assert isinstance(damage, list)
-    event_id = 2000 + action.ordinal * 100
-    events = [
-        EventRecord(
-            id=UUID(int=event_id + index),
-            event_type="DiceRolled",
-            action_id=action.id,
-            payload={
-                "roll": roll,
-                "rng": {
-                    "source": "seeded_test",
-                    "implementation_version": "mvp_v1",
-                    "draw_index": index,
-                },
-            },
-        )
-        for index, roll in enumerate(rolls)
-    ]
-    events.extend(
-        EventRecord(
-            id=UUID(int=event_id + len(rolls) + index),
-            event_type="DamageApplied",
-            action_id=action.id,
-            payload=damage_fact,
-        )
-        for index, damage_fact in enumerate(damage)
+def _healing_action(turn_id: UUID) -> ActionRecord:
+    action_id = UUID(int=1201)
+    return ActionRecord(
+        command=UseItemCommand(
+            action_id=action_id,
+            campaign_id=UUID(CAMPAIGN_A),
+            turn_id=turn_id,
+            actor_id=UUID(ACTOR_A),
+            ordinal=1,
+            kind="use_item",
+            item_id=UUID(ITEM_A),
+            target_id=UUID(ACTOR_A),
+            effect_ref="healing_potion",
+        ),
+        result=AppliedResult(
+            kind="applied",
+            outcome="success",
+            facts=["回復ポーションで4回復した"],
+            dice=[DiceResult(expression="1d6+2", rolls=[2], modifier=2, total=4)],
+            state_changes=[
+                HealingApplied(
+                    kind="healing_applied",
+                    target_id=UUID(ACTOR_A),
+                    amount=4,
+                    hp_before=5,
+                    hp_after=9,
+                    max_hp=10,
+                ),
+                ItemConsumed(
+                    kind="item_consumed",
+                    owner_id=UUID(ACTOR_A),
+                    item_id=UUID(ITEM_A),
+                    quantity_before=2,
+                    quantity_after=1,
+                ),
+            ],
+        ),
+        rng=(
+            RNGMetadata(
+                source="seeded_test",
+                implementation_version="mvp_v1",
+                draw_index=0,
+            ),
+        ),
     )
-    events.append(
-        EventRecord(
-            id=UUID(int=event_id + len(rolls) + len(damage)),
-            event_type="ActionResolved",
-            action_id=action.id,
-            payload={"result": action.result},
-        )
-    )
-    return tuple(events)
 
 
 def _resolution_bundle(
@@ -561,27 +591,28 @@ def _resolution_bundle(
     scene_id: str = SCENE_A,
     narration_version: int = 0,
     include_narration_results: bool = True,
-    invalid_event_type: bool = False,
-    canonical_updates: tuple[tuple[UUID, int, int], ...] = (),
     attack: bool = False,
+    healing: bool = False,
+    action: ActionRecord | None = None,
 ) -> CommitBundle:
     actions = (
-        (_attack_action(turn_id),)
+        (action,)
+        if action is not None
+        else (_healing_action(turn_id),)
+        if healing
+        else (_attack_action(turn_id),)
         if attack
         else tuple(
             _resolution_action(turn_id, ordinal)
             for ordinal in range(first_ordinal, first_ordinal + action_count)
         )
     )
-    events = tuple(event for action in actions for event in _resolution_events(action))
-    if invalid_event_type:
-        events = (replace(events[0], event_type="UnregisteredEvent"), *events[1:])
     resolved_actions = [
-        {
-            "action_id": action.id,
-            "ordinal": action.ordinal,
-            "result": action.result,
-        }
+        ResolvedAction(
+            action_id=action.command.action_id,
+            ordinal=action.command.ordinal,
+            result=action.result,
+        )
         for action in actions
     ]
     return CommitBundle(
@@ -590,19 +621,33 @@ def _resolution_bundle(
         turn_id=turn_id,
         worker_epoch=1,
         base_state_version=0,
-        canonical_changed=bool(canonical_updates),
-        canonical_updates=canonical_updates,
         actions=actions,
-        events=events,
-        narration_input={
-            "player_text": "扉を調べる",
-            "committed_state_version": narration_version,
-            "resolved_actions": resolved_actions if include_narration_results else [],
-            "public_state_after": [],
-            "allowed_entity_refs": [],
-            "output_limits": {"max_actions": 3, "max_choices": 5},
-        },
+        narration_input=MechanicalNarrationInput(
+            player_text="扉を調べる",
+            committed_state_version=narration_version,
+            resolved_actions=resolved_actions if include_narration_results else [],
+            public_state_after=[],
+            allowed_entity_refs=[],
+            output_limits=OutputLimits(max_actions=3, max_choices=5),
+        ),
     )
+
+
+def _event_types(bundle: CommitBundle) -> list[str]:
+    event_types: list[str] = []
+    for action in bundle.actions:
+        if isinstance(action.result, AppliedResult):
+            event_types.extend("DiceRolled" for _ in action.result.dice)
+            event_types.extend(
+                {
+                    "damage_applied": "DamageApplied",
+                    "healing_applied": "HealingApplied",
+                    "item_consumed": "ItemConsumed",
+                }[change.kind]
+                for change in action.result.state_changes
+            )
+        event_types.append("ActionResolved")
+    return event_types
 
 
 def _acquire_lease_from_database(database: Engine, turn_id: UUID) -> Lease:
@@ -621,12 +666,21 @@ def _acquire_lease_from_database(database: Engine, turn_id: UUID) -> Lease:
         return runner.run(acquire())
 
 
-def _commit_resolution_from_database(database: Engine, bundle: CommitBundle) -> int:
+def _commit_resolution_from_database(
+    database: Engine,
+    bundle: CommitBundle,
+    *,
+    event_ids: Iterator[UUID] | None = None,
+) -> int:
     async def commit() -> int:
         url = database.url.render_as_string(hide_password=False)
         async with _postgres_sessions(url) as factory, factory() as session:
             try:
-                version = await PostgresTurnRepository(session).commit_resolution(bundle)
+                event_id_factory = uuid4 if event_ids is None else lambda: next(event_ids)
+                version = await PostgresTurnRepository(
+                    session,
+                    event_id_factory=event_id_factory,
+                ).commit_resolution(bundle)
                 await session.commit()
                 return version
             except BaseException:
@@ -1428,7 +1482,6 @@ def test_choice_scope_and_narration_are_required(
         "different-scene",
         "narration-version",
         "missing-narration-result",
-        "unregistered-event",
     ],
 )
 def test_commit_resolution_rejects_inconsistent_bundle_before_writes(
@@ -1451,8 +1504,6 @@ def test_commit_resolution_rejects_inconsistent_bundle_before_writes(
         options["narration_version"] = 1
     elif invalid_bundle == "missing-narration-result":
         options["include_narration_results"] = False
-    elif invalid_bundle == "unregistered-event":
-        options["invalid_event_type"] = True
     bundle = _resolution_bundle(accepted.turn_id, **options)
 
     with pytest.raises(InvalidCommitBundleError):
@@ -1489,13 +1540,10 @@ def test_commit_resolution_rejects_inconsistent_bundle_before_writes(
 @pytest.mark.parametrize(
     "invalid_update",
     [
-        "flag-mismatch",
-        "unchanged",
         "missing-character",
-        "invalid-hp",
-        "duplicate-character",
-        "unmatched-result",
-        "non-bool-flag",
+        "hp-before-mismatch",
+        "max-hp-mismatch",
+        "inventory-before-mismatch",
     ],
 )
 def test_commit_resolution_rejects_invalid_canonical_update(
@@ -1507,30 +1555,74 @@ def test_commit_resolution_rejects_invalid_canonical_update(
     accepted = _accept_from_database(database, _player_turn())
     _acquire_lease_from_database(database, accepted.turn_id)
 
-    target_id = UUID(ACTOR_C)
-    hp = 7
-    if invalid_update == "unchanged":
-        hp = 10
-    elif invalid_update == "missing-character":
-        target_id = UUID(int=99999)
-    elif invalid_update == "invalid-hp":
-        hp = -1
-    bundle = _resolution_bundle(
-        accepted.turn_id,
-        canonical_updates=((target_id, hp, 10),),
-        narration_version=1,
-        attack=invalid_update != "unmatched-result",
-    )
-    if invalid_update == "flag-mismatch":
-        narration_input = {**bundle.narration_input, "committed_state_version": 0}
-        bundle = replace(bundle, canonical_changed=False, narration_input=narration_input)
-    elif invalid_update == "duplicate-character":
-        bundle = replace(
-            bundle,
-            canonical_updates=((*bundle.canonical_updates, bundle.canonical_updates[0])),
+    if invalid_update in {"missing-character", "hp-before-mismatch"}:
+        target_id = UUID(int=99999) if invalid_update == "missing-character" else UUID(ACTOR_C)
+        hp_before = 10 if invalid_update == "missing-character" else 9
+        action = _attack_action(accepted.turn_id)
+        result = action.result
+        assert isinstance(result, AppliedResult)
+        result = result.model_copy(
+            update={
+                "state_changes": [
+                    DamageApplied(
+                        kind="damage_applied",
+                        target_id=target_id,
+                        amount=3,
+                        hp_before=hp_before,
+                        hp_after=hp_before - 3,
+                    )
+                ]
+            }
         )
-    elif invalid_update == "non-bool-flag":
-        bundle = replace(bundle, canonical_changed=1)
+        action = ActionRecord(command=action.command, result=result)
+        bundle = _resolution_bundle(
+            accepted.turn_id,
+            narration_version=1,
+            action=action,
+        )
+    else:
+        with database.begin() as connection:
+            if invalid_update == "max-hp-mismatch":
+                connection.execute(
+                    text(
+                        "UPDATE mvp_characters SET current_hp=5 "
+                        "WHERE campaign_id=:campaign AND entity_id=:actor"
+                    ),
+                    {"campaign": CAMPAIGN_A, "actor": ACTOR_A},
+                )
+            else:
+                connection.execute(
+                    text(
+                        "UPDATE mvp_inventory SET quantity=1 "
+                        "WHERE campaign_id=:campaign AND owner_id=:actor AND item_id=:item"
+                    ),
+                    {"campaign": CAMPAIGN_A, "actor": ACTOR_A, "item": ITEM_A},
+                )
+        action = _healing_action(accepted.turn_id)
+        if invalid_update == "max-hp-mismatch":
+            result = action.result
+            assert isinstance(result, AppliedResult)
+            result = result.model_copy(
+                update={
+                    "state_changes": [
+                        HealingApplied(
+                            kind="healing_applied",
+                            target_id=UUID(ACTOR_A),
+                            amount=4,
+                            hp_before=5,
+                            hp_after=9,
+                            max_hp=11,
+                        ),
+                        result.state_changes[1],
+                    ]
+                }
+            )
+            action = ActionRecord(command=action.command, result=result)
+        bundle = _resolution_bundle(
+            accepted.turn_id,
+            narration_version=1,
+            action=action,
+        )
 
     with pytest.raises(InvalidCommitBundleError):
         _commit_resolution_from_database(database, bundle)
@@ -1564,10 +1656,8 @@ def test_commit_resolution_atomically_persists_valid_bundle(
         _seed_resolution_state(connection)
     accepted = _accept_from_database(database, _player_turn())
     _acquire_lease_from_database(database, accepted.turn_id)
-    canonical_updates = ((UUID(ACTOR_C), 7, 10),) if state_changed else ()
     bundle = _resolution_bundle(
         accepted.turn_id,
-        canonical_updates=canonical_updates,
         narration_version=int(state_changed),
         attack=state_changed,
     )
@@ -1584,7 +1674,7 @@ def test_commit_resolution_atomically_persists_valid_bundle(
                 ),
                 {"campaign": CAMPAIGN_A},
             ).one()
-        ) == (version, len(bundle.events))
+        ) == (version, len(_event_types(bundle)))
         turn = connection.execute(
             text(
                 "SELECT resolution_status,route,committed_state_version,narration_input "
@@ -1607,8 +1697,8 @@ def test_commit_resolution_atomically_persists_valid_bundle(
             {"campaign": CAMPAIGN_A},
         ).all()
         assert events == [
-            (index, version, event.event_type)
-            for index, event in enumerate(bundle.events, start=1)
+            (index, version, event_type)
+            for index, event_type in enumerate(_event_types(bundle), start=1)
         ]
         assert connection.scalar(
             text(
@@ -1619,9 +1709,59 @@ def test_commit_resolution_atomically_persists_valid_bundle(
         ) == (7 if state_changed else 10)
 
 
+def test_commit_resolution_persists_healing_and_item_consumption_together(
+    database: Engine,
+) -> None:
+    with database.begin() as connection:
+        _seed_resolution_state(connection)
+        connection.execute(
+            text(
+                "UPDATE mvp_characters SET current_hp=5 "
+                "WHERE campaign_id=:campaign AND entity_id=:actor"
+            ),
+            {"campaign": CAMPAIGN_A, "actor": ACTOR_A},
+        )
+    accepted = _accept_from_database(database, _player_turn())
+    _acquire_lease_from_database(database, accepted.turn_id)
+    bundle = _resolution_bundle(
+        accepted.turn_id,
+        narration_version=1,
+        healing=True,
+    )
+
+    assert _commit_resolution_from_database(database, bundle) == 1
+
+    with database.connect() as connection:
+        assert connection.scalar(
+            text(
+                "SELECT current_hp FROM mvp_characters "
+                "WHERE campaign_id=:campaign AND entity_id=:actor"
+            ),
+            {"campaign": CAMPAIGN_A, "actor": ACTOR_A},
+        ) == 9
+        assert connection.scalar(
+            text(
+                "SELECT quantity FROM mvp_inventory "
+                "WHERE campaign_id=:campaign AND owner_id=:actor AND item_id=:item"
+            ),
+            {"campaign": CAMPAIGN_A, "actor": ACTOR_A, "item": ITEM_A},
+        ) == 1
+        assert connection.execute(
+            text(
+                "SELECT type FROM events WHERE campaign_id=:campaign ORDER BY sequence"
+            ),
+            {"campaign": CAMPAIGN_A},
+        ).scalars().all() == [
+            "DiceRolled",
+            "HealingApplied",
+            "ItemConsumed",
+            "ActionResolved",
+        ]
+
+
 @pytest.mark.parametrize(
     "mismatch",
-    ["command-parent", "result-kind", "event-payload", "event-order"],
+    ["command-parent", "rng-count"],
 )
 def test_commit_resolution_rejects_contract_mismatches(
     database: Engine,
@@ -1634,20 +1774,16 @@ def test_commit_resolution_rejects_contract_mismatches(
     bundle = _resolution_bundle(accepted.turn_id)
 
     if mismatch == "command-parent":
-        action = replace(
-            bundle.actions[0],
-            command={**bundle.actions[0].command, "turn_id": UUID(int=9999)},
+        action = ActionRecord(
+            command=bundle.actions[0].command.model_copy(
+                update={"turn_id": UUID(int=9999)}
+            ),
+            result=bundle.actions[0].result,
         )
         bundle = replace(bundle, actions=(action,))
-    elif mismatch == "result-kind":
-        action = replace(bundle.actions[0], result_kind="not_applicable")
+    elif mismatch == "rng-count":
+        action = replace(bundle.actions[0], rng=())
         bundle = replace(bundle, actions=(action,))
-    elif mismatch == "event-payload":
-        payload = dict(bundle.events[0].payload)
-        payload["roll"] = {**payload["roll"], "total": 11}
-        bundle = replace(bundle, events=(replace(bundle.events[0], payload=payload), *bundle.events[1:]))
-    elif mismatch == "event-order":
-        bundle = replace(bundle, events=tuple(reversed(bundle.events)))
 
     with pytest.raises(InvalidCommitBundleError):
         _commit_resolution_from_database(database, bundle)
@@ -1662,15 +1798,22 @@ def test_commit_resolution_rolls_back_every_write_when_event_insert_fails(
 ) -> None:
     with database.begin() as connection:
         _seed_resolution_state(connection)
+        connection.execute(
+            text(
+                "UPDATE mvp_characters SET current_hp=5 "
+                "WHERE campaign_id=:campaign AND entity_id=:actor"
+            ),
+            {"campaign": CAMPAIGN_A, "actor": ACTOR_A},
+        )
     accepted = _accept_from_database(database, _player_turn())
     _acquire_lease_from_database(database, accepted.turn_id)
     bundle = _resolution_bundle(
         accepted.turn_id,
-        canonical_updates=((UUID(ACTOR_C), 7, 10),),
         narration_version=1,
-        attack=True,
+        healing=True,
     )
-    conflicting_event_id = bundle.events[-1].id
+    event_ids = tuple(UUID(int=9000 + index) for index in range(len(_event_types(bundle))))
+    conflicting_event_id = event_ids[0]
     with database.begin() as connection:
         connection.execute(
             text(
@@ -1682,7 +1825,7 @@ def test_commit_resolution_rolls_back_every_write_when_event_insert_fails(
         )
 
     with pytest.raises(IntegrityError):
-        _commit_resolution_from_database(database, bundle)
+        _commit_resolution_from_database(database, bundle, event_ids=iter(event_ids))
 
     with database.connect() as connection:
         assert tuple(
@@ -1713,8 +1856,15 @@ def test_commit_resolution_rolls_back_every_write_when_event_insert_fails(
                 "SELECT current_hp FROM mvp_characters "
                 "WHERE campaign_id=:campaign AND entity_id=:target"
             ),
-            {"campaign": CAMPAIGN_A, "target": ACTOR_C},
-        ) == 10
+            {"campaign": CAMPAIGN_A, "target": ACTOR_A},
+        ) == 5
+        assert connection.scalar(
+            text(
+                "SELECT quantity FROM mvp_inventory "
+                "WHERE campaign_id=:campaign AND owner_id=:actor AND item_id=:item"
+            ),
+            {"campaign": CAMPAIGN_A, "actor": ACTOR_A, "item": ITEM_A},
+        ) == 2
 
 
 @pytest.mark.parametrize("invalid_owner", ["stale-epoch", "expired-lease", "stale-version"])
@@ -1765,7 +1915,9 @@ def test_commit_resolution_returns_existing_commit_without_duplicate_writes(
 
     with database.connect() as connection:
         assert connection.scalar(text("SELECT count(*) FROM actions")) == 1
-        assert connection.scalar(text("SELECT count(*) FROM events")) == len(bundle.events)
+        assert connection.scalar(text("SELECT count(*) FROM events")) == len(
+            _event_types(bundle)
+        )
 
 
 def test_late_narration_does_not_add_choices_after_later_turn(database: Engine) -> None:

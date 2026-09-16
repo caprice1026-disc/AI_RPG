@@ -1,9 +1,9 @@
-"""Engineだけが生成する確定結果の契約。"""
+"""Engineだけが生成する確定結果と状態変更の契約。"""
 
-from typing import Annotated, Literal, TypeAlias
+from typing import Annotated, Literal, Self, TypeAlias
 from uuid import UUID
 
-from pydantic import Field
+from pydantic import Field, model_validator
 
 from ai_rpg.contracts.common import (
     Contract,
@@ -21,11 +21,55 @@ class DiceResult(Contract):
     total: SignedInt
 
 
-class DamageFact(Contract):
+class DamageApplied(Contract):
+    kind: Literal["damage_applied"]
     target_id: UUID
     amount: NonNegativeInt
-    hp_before: SignedInt
-    hp_after: SignedInt
+    hp_before: NonNegativeInt
+    hp_after: NonNegativeInt
+
+    @model_validator(mode="after")
+    def valid_transition(self) -> Self:
+        if self.hp_after != max(0, self.hp_before - self.amount):
+            raise ValueError("damageとHP遷移が一致しません")
+        return self
+
+
+class HealingApplied(Contract):
+    kind: Literal["healing_applied"]
+    target_id: UUID
+    amount: NonNegativeInt
+    hp_before: NonNegativeInt
+    hp_after: NonNegativeInt
+    max_hp: PositiveInt
+
+    @model_validator(mode="after")
+    def valid_transition(self) -> Self:
+        if self.hp_before > self.max_hp:
+            raise ValueError("回復前HPがmax_hpを超えています")
+        if self.hp_after != min(self.max_hp, self.hp_before + self.amount):
+            raise ValueError("healingとHP遷移が一致しません")
+        return self
+
+
+class ItemConsumed(Contract):
+    kind: Literal["item_consumed"]
+    owner_id: UUID
+    item_id: UUID
+    quantity_before: PositiveInt
+    quantity_after: NonNegativeInt
+
+    @model_validator(mode="after")
+    def valid_transition(self) -> Self:
+        if self.quantity_after != self.quantity_before - 1:
+            raise ValueError("MVPの消耗品は1個だけ消費します")
+        return self
+
+
+StateChange: TypeAlias = Annotated[
+    DamageApplied | HealingApplied | ItemConsumed,
+    Field(discriminator="kind"),
+]
 
 
 class AppliedResult(Contract):
@@ -33,7 +77,7 @@ class AppliedResult(Contract):
     outcome: Literal["success", "failure", "neutral"]
     facts: list[ShortText]
     dice: list[DiceResult]
-    damage: list[DamageFact]
+    state_changes: list[StateChange]
 
 
 class NotApplicableResult(Contract):

@@ -188,6 +188,9 @@ class AttackCommand(CommandBase):
     kind: Literal["attack"]
     target_id: UUID
     weapon_id: UUID | None
+    attack_bonus: SignedInt
+    damage_expression: ShortText
+    damage_bonus: SignedInt
 
 
 class SkillCheckCommand(CommandBase):
@@ -195,12 +198,15 @@ class SkillCheckCommand(CommandBase):
     skill_ref: Ref
     objective: ShortText
     target_id: UUID | None
+    modifier: SignedInt
+    difficulty_class: PositiveInt
 
 
 class UseItemCommand(CommandBase):
     kind: Literal["use_item"]
     item_id: UUID
     target_id: UUID | None
+    effect_ref: Ref
 
 
 Command = Annotated[
@@ -217,12 +223,35 @@ class DiceResult(Contract):
     # 個々の出目の範囲・式との整合性は対応rulesetのDiceEngineが検証する
 
 
-class DamageFact(Contract):
+class DamageApplied(Contract):
+    kind: Literal["damage_applied"]
     target_id: UUID
     amount: NonNegativeInt
-    hp_before: SignedInt
-    hp_after: SignedInt
-    # HPの下限や軽減後amountの意味はADR-0007のrulesetで定義する
+    hp_before: NonNegativeInt
+    hp_after: NonNegativeInt
+
+
+class HealingApplied(Contract):
+    kind: Literal["healing_applied"]
+    target_id: UUID
+    amount: NonNegativeInt
+    hp_before: NonNegativeInt
+    hp_after: NonNegativeInt
+    max_hp: PositiveInt
+
+
+class ItemConsumed(Contract):
+    kind: Literal["item_consumed"]
+    owner_id: UUID
+    item_id: UUID
+    quantity_before: PositiveInt
+    quantity_after: NonNegativeInt
+
+
+StateChange = Annotated[
+    DamageApplied | HealingApplied | ItemConsumed,
+    Field(discriminator="kind"),
+]
 
 
 class AppliedResult(Contract):
@@ -230,7 +259,7 @@ class AppliedResult(Contract):
     outcome: Literal["success", "failure", "neutral"]
     facts: list[ShortText]  # Engineがテンプレートから作る公開可能な確定事実
     dice: list[DiceResult]
-    damage: list[DamageFact]  # Engineが生成した数値。公開可否は別途判定
+    state_changes: list[StateChange]  # Engineが確定した閉じた状態変更
 
 
 class NotApplicableResult(Contract):
@@ -369,7 +398,17 @@ class DiceRolledEvent(ActionEventBase):
 
 class DamageAppliedEvent(ActionEventBase):
     type: Literal["DamageApplied"]
-    payload: DamageFact
+    payload: DamageApplied
+
+
+class HealingAppliedEvent(ActionEventBase):
+    type: Literal["HealingApplied"]
+    payload: HealingApplied
+
+
+class ItemConsumedEvent(ActionEventBase):
+    type: Literal["ItemConsumed"]
+    payload: ItemConsumed
 
 
 class ActionResolvedEvent(ActionEventBase):
@@ -386,16 +425,17 @@ class NarrationGeneratedEvent(EventBase):
 
 
 DomainEventV1 = Annotated[
-    DiceRolledEvent | DamageAppliedEvent | ActionResolvedEvent | NarrationGeneratedEvent,
+    DiceRolledEvent | DamageAppliedEvent | HealingAppliedEvent |
+    ItemConsumedEvent | ActionResolvedEvent | NarrationGeneratedEvent,
     Field(discriminator="type"),
 ]
 ```
 
 Provider情報はすべてデータであり、ContextFragmentのcontentをsystem指示として結合しない。access_scopeは公開範囲、trust_levelは出所の信頼区分であり、互いに独立する。MVPでもApplicationは許可していないFragmentをLLMへ渡さない。
 
-ActionResultのfactsは演出用の公開事実であり、HP更新命令ではない。正確なダメージや状態変化はEngineのDomain Eventsに記録する。ルール固有のイベントpayloadは(type, schema_version)ごとの型レジストリで検証する。HPの上下限、技能一覧、攻撃・アイテム・ダイス規則は [ADR-0007](adr/0007-mvp-ruleset.md) の `mvp_v1` に属し、本書の共通契約へ埋め込まない。
+ActionResultのfactsは演出用の公開事実であり、Canonical更新命令ではない。正確なダメージ、回復、在庫消費はEngineの型付きStateChangeに記録する。ApplicationはStateChangeをCanonical mutationとEventへ一度だけ投影し、Infrastructureは保存前値をlock下で照合してSQLへ変換する。ルール固有のイベントpayloadは(type, schema_version)ごとの型レジストリで検証する。HPの上下限、技能一覧、攻撃・アイテム・ダイス規則は [ADR-0007](adr/0007-mvp-ruleset.md) の `mvp_v1` に属する。
 
-DomainEventV1は今回具体化した4種の初期型。ActionResolvedは各Actionの最終結果を表し、DamageAppliedやDiceRolledは個別の出来事を表す。両方のpayloadに含まれるダメージを二重適用しない。MVPではEngineの結果を一度だけCanonicalへ適用し、イベントは記録と表示に使う。PlayerMessageAdded、SceneChanged、WorldFactChanged等は各機能実装時に専用型を追加する。Actionに属さない将来イベントはEventBaseから定義できる。
+DomainEventV1は今回具体化した6種の初期型。ActionResolvedは各Actionの最終結果を表し、DiceRolled、DamageApplied、HealingApplied、ItemConsumedは個別の出来事を表す。ActionResolved内のStateChangeと個別Eventを二重適用しない。MVPではEngineの結果を一度だけCanonicalへ適用し、イベントは記録と表示に使う。PlayerMessageAdded、SceneChanged、WorldFactChanged等は各機能実装時に専用型を追加する。Actionに属さない将来イベントはEventBaseから定義できる。
 
 ## 3 DBの関連と制約
 

@@ -30,7 +30,19 @@ def test_ruleset_resolves_skill_check_without_llm() -> None:
 
     actor_id = uuid4()
     actor = CharacterState(actor_id, current_hp=10, max_hp=10, defense=12)
-    command = SkillCheckCommand(uuid4(), actor_id, "perception", modifier=2, difficulty_class=8)
+    command = SkillCheckCommand(
+        action_id=uuid4(),
+        campaign_id=uuid4(),
+        turn_id=uuid4(),
+        actor_id=actor_id,
+        ordinal=1,
+        kind="skill_check",
+        skill_ref="perception",
+        objective="扉を調べる",
+        target_id=None,
+        modifier=2,
+        difficulty_class=8,
+    )
     result = MvpV1Ruleset(DiceEngine(SeededRandomSource(7))).resolve_skill_check(command, actor)
     assert result.outcome in {"success", "failure"}
     assert len(result.dice) == 1

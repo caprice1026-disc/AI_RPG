@@ -6,7 +6,7 @@ build-backend = "hatchling.build"
 name = "ai-rpg"
 version = "0.1.0"
 description = "LLMと決定的なゲームエンジンを分離したAI TRPG基盤"
-readme = "docs/ai-trpg-architecture-v0.1.md"
+readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
   "alembic>=1.14,<2",

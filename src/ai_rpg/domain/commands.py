@@ -5,7 +5,7 @@ from uuid import UUID
 
 from pydantic import Field
 
-from ai_rpg.contracts.common import Contract, PositiveInt, Ref, ShortText
+from ai_rpg.contracts.common import Contract, PositiveInt, Ref, ShortText, SignedInt
 
 
 class CommandBase(Contract):
@@ -20,6 +20,9 @@ class AttackCommand(CommandBase):
     kind: Literal["attack"]
     target_id: UUID
     weapon_id: UUID | None
+    attack_bonus: SignedInt
+    damage_expression: ShortText
+    damage_bonus: SignedInt
 
 
 class SkillCheckCommand(CommandBase):
@@ -27,12 +30,15 @@ class SkillCheckCommand(CommandBase):
     skill_ref: Ref
     objective: ShortText
     target_id: UUID | None
+    modifier: SignedInt
+    difficulty_class: PositiveInt
 
 
 class UseItemCommand(CommandBase):
     kind: Literal["use_item"]
     item_id: UUID
     target_id: UUID | None
+    effect_ref: Ref
 
 
 Command: TypeAlias = Annotated[

@@ -6,7 +6,13 @@ from uuid import UUID
 from pydantic import Field, StrictBool, model_validator
 
 from ai_rpg.contracts.common import Contract, NarrationText, NonNegativeInt, PositiveInt, ShortText
-from ai_rpg.domain.results import ActionResult, DamageFact, DiceResult
+from ai_rpg.domain.results import (
+    ActionResult,
+    DamageApplied,
+    DiceResult,
+    HealingApplied,
+    ItemConsumed,
+)
 
 
 class RNGMetadata(Contract):
@@ -61,7 +67,17 @@ class DiceRolledEvent(ActionEventBase):
 
 class DamageAppliedEvent(ActionEventBase):
     type: Literal["DamageApplied"]
-    payload: DamageFact
+    payload: DamageApplied
+
+
+class HealingAppliedEvent(ActionEventBase):
+    type: Literal["HealingApplied"]
+    payload: HealingApplied
+
+
+class ItemConsumedEvent(ActionEventBase):
+    type: Literal["ItemConsumed"]
+    payload: ItemConsumed
 
 
 class ActionResolvedEvent(ActionEventBase):
@@ -78,6 +94,11 @@ class NarrationGeneratedEvent(EventBase):
 
 
 DomainEventV1: TypeAlias = Annotated[
-    DiceRolledEvent | DamageAppliedEvent | ActionResolvedEvent | NarrationGeneratedEvent,
+    DiceRolledEvent
+    | DamageAppliedEvent
+    | HealingAppliedEvent
+    | ItemConsumedEvent
+    | ActionResolvedEvent
+    | NarrationGeneratedEvent,
     Field(discriminator="type"),
 ]
