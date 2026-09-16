@@ -1,19 +1,23 @@
-"""外部ライブラリに依存しないゲーム領域の値と結果。"""
+"""ゲーム内部で正本となるCommand、状態、結果。"""
 
-from ai_rpg.domain.models import (
+from ai_rpg.domain.commands import AttackCommand, SkillCheckCommand, UseItemCommand
+from ai_rpg.domain.models import CharacterState
+from ai_rpg.domain.results import (
     ActionResult,
-    AttackCommand,
-    CharacterState,
+    DamageApplied,
     DiceResult,
-    DomainEvent,
-    SkillCheckCommand,
+    HealingApplied,
+    ItemConsumed,
 )
 
 __all__ = [
     "ActionResult",
     "AttackCommand",
     "CharacterState",
+    "DamageApplied",
     "DiceResult",
-    "DomainEvent",
+    "HealingApplied",
+    "ItemConsumed",
     "SkillCheckCommand",
+    "UseItemCommand",
 ]

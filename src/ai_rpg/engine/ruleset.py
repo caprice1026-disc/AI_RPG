@@ -3,7 +3,9 @@
 from dataclasses import dataclass
 from typing import Literal
 
-from ai_rpg.domain.models import ActionResult, CharacterState, SkillCheckCommand
+from ai_rpg.domain.commands import SkillCheckCommand
+from ai_rpg.domain.models import CharacterState
+from ai_rpg.domain.results import AppliedResult
 from ai_rpg.engine.dice import DiceEngine
 
 
@@ -18,7 +20,7 @@ class MvpV1Ruleset:
 
     def resolve_skill_check(
         self, command: SkillCheckCommand, actor: CharacterState
-    ) -> ActionResult:
+    ) -> AppliedResult:
         """技能とactorを検証してd20判定を解決する。"""
 
         if actor.current_hp == 0:
@@ -31,4 +33,10 @@ class MvpV1Ruleset:
             "success" if roll.total >= command.difficulty_class else "failure"
         )
         fact = f"技能判定は{outcome}(合計{roll.total})"
-        return ActionResult(command.action_id, outcome, (fact,), (roll,))
+        return AppliedResult(
+            kind="applied",
+            outcome=outcome,
+            facts=[fact],
+            dice=[roll],
+            state_changes=[],
+        )

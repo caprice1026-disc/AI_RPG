@@ -4,10 +4,14 @@ from collections.abc import Callable, Mapping, Sequence
 from contextlib import AbstractAsyncContextManager
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Literal, Protocol
+from typing import Protocol
 from uuid import UUID
 
 from ai_rpg.contracts import PlayerTurnInput, TurnResponse
+from ai_rpg.contracts.responses import MechanicalNarrationInput
+from ai_rpg.domain.commands import Command
+from ai_rpg.domain.events import RNGMetadata
+from ai_rpg.domain.results import ActionResult
 
 
 class AuthorizationError(Exception):
@@ -75,23 +79,9 @@ class CanonicalSnapshot:
 
 @dataclass(frozen=True, slots=True)
 class ActionRecord:
-    id: UUID
-    ordinal: int
-    actor_id: UUID
-    kind: Literal["attack", "skill_check", "use_item"]
-    command: Mapping[str, object]
-    result: Mapping[str, object]
-    result_kind: Literal["applied", "not_applicable"]
-    target_id: UUID | None = None
-    item_id: UUID | None = None
-
-
-@dataclass(frozen=True, slots=True)
-class EventRecord:
-    id: UUID
-    event_type: str
-    payload: Mapping[str, object]
-    action_id: UUID | None = None
+    command: Command
+    result: ActionResult
+    rng: tuple[RNGMetadata, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -101,11 +91,8 @@ class CommitBundle:
     turn_id: UUID
     worker_epoch: int
     base_state_version: int
-    canonical_changed: bool
-    canonical_updates: Sequence[tuple[UUID, int, int]]
-    actions: Sequence[ActionRecord]
-    events: Sequence[EventRecord]
-    narration_input: Mapping[str, object]
+    actions: tuple[ActionRecord, ...]
+    narration_input: MechanicalNarrationInput
 
 
 @dataclass(frozen=True, slots=True)
