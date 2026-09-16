@@ -8,8 +8,11 @@ from collections.abc import Callable, Mapping, Sequence
 from datetime import UTC, datetime
 from uuid import UUID, uuid4
 
-from sqlalchemy import RowMapping, text
+from sqlalchemy import RowMapping, exists, or_, select, text
+from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+from sqlalchemy.sql import update as sql_update
+from sqlalchemy.sql.selectable import FromClause
 
 from ai_rpg.application.ports.repositories import (
     AuthorizationError,
@@ -21,6 +24,9 @@ from ai_rpg.application.ports.repositories import (
     IdempotencyConflictError,
     InvalidCommitBundleError,
     Lease,
+    LLMCallRepository,
+    LLMPhase,
+    NarrationLease,
     NarrationRepository,
     StateVersionConflictError,
     TurnInProgressError,
@@ -36,6 +42,19 @@ from ai_rpg.application.resolution import (
 from ai_rpg.contracts import PlayerTurnInput, TurnResponse
 from ai_rpg.contracts.responses import TurnRecovery
 from ai_rpg.domain.commands import AttackCommand, UseItemCommand
+from ai_rpg.domain.events import NarrationGeneratedPayload
+from ai_rpg.infrastructure.postgres.models import (
+    CampaignMemberModel,
+    CampaignModel,
+    EntityModel,
+    MvpCharacterModel,
+    MvpInventoryModel,
+    MvpSkillModifierModel,
+    MvpWeaponModel,
+    SceneModel,
+    TurnChoiceModel,
+    TurnModel,
+)
 
 
 def _json(value: object) -> str:
@@ -158,6 +177,7 @@ class PostgresTurnRepository:
         principal_id: UUID,
         turn: PlayerTurnInput,
         max_actions: int,
+        llm_call_budget: int = 3,
     ) -> TurnResponse:
         """既存Application API向けにactive Sceneへpending Turnを追加する。"""
         if not await self._can_access_campaign(campaign_id, principal_id):
@@ -171,6 +191,7 @@ class PostgresTurnRepository:
             principal_id,
             turn,
             max_actions=max_actions,
+            llm_call_budget=llm_call_budget,
         )
         if row is None:
             existing = await self._request_row(campaign_id, principal_id, turn.request_id)
@@ -181,11 +202,13 @@ class PostgresTurnRepository:
 
     async def _can_access_campaign(self, campaign_id: UUID, principal_id: UUID) -> bool:
         result = await self._session.execute(
-            text(
-                "SELECT EXISTS(SELECT 1 FROM campaign_members "
-                "WHERE campaign_id=:c AND principal_id=:p AND active)"
+            select(
+                exists().where(
+                    CampaignMemberModel.campaign_id == campaign_id,
+                    CampaignMemberModel.principal_id == principal_id,
+                    CampaignMemberModel.active.is_(True),
+                )
             ),
-            {"c": campaign_id, "p": principal_id},
         )
         return bool(result.scalar_one())
 
@@ -262,8 +285,11 @@ class PostgresTurnRepository:
         self, campaign_id: UUID, principal_id: UUID, request_id: UUID
     ) -> RowMapping | None:
         result = await self._session.execute(
-            text("SELECT * FROM turns WHERE campaign_id=:c AND created_by=:p AND request_id=:r"),
-            {"c": campaign_id, "p": principal_id, "r": request_id},
+            select(TurnModel.__table__).where(
+                TurnModel.campaign_id == campaign_id,
+                TurnModel.created_by == principal_id,
+                TurnModel.request_id == request_id,
+            )
         )
         return result.mappings().one_or_none()
 
@@ -280,12 +306,14 @@ class PostgresTurnRepository:
         turn: PlayerTurnInput,
         *,
         max_actions: int,
+        llm_call_budget: int = 3,
     ) -> TurnRow | None:
         # 全Canonical更新経路と同じくCampaignを最初にロックする。
         campaign = (
             await self._session.execute(
-                text("SELECT state_version,status FROM campaigns WHERE id=:c FOR UPDATE"),
-                {"c": campaign_id},
+                select(CampaignModel.state_version, CampaignModel.status)
+                .where(CampaignModel.id == campaign_id)
+                .with_for_update()
             )
         ).mappings().one()
         if not await self._can_access_campaign(campaign_id, principal_id):
@@ -295,39 +323,38 @@ class PostgresTurnRepository:
         if campaign["status"] != "active":
             raise AuthorizationError("停止中のCampaignへTurnは追加できません")
         actor_allowed = await self._session.execute(
-            text(
-                """
-                SELECT EXISTS(
-                    SELECT 1
-                    FROM entities AS e
-                    JOIN campaign_members AS m
-                      ON m.campaign_id=e.campaign_id AND m.principal_id=:p
-                    WHERE e.campaign_id=:c
-                      AND e.id=:a
-                      AND e.kind IN ('pc','npc')
-                      AND e.controller_id=:p
-                      AND e.archived_at IS NULL
-                      AND m.active
+            select(
+                exists().where(
+                    EntityModel.campaign_id == campaign_id,
+                    EntityModel.id == turn.actor_id,
+                    EntityModel.kind.in_(("pc", "npc")),
+                    EntityModel.controller_id == principal_id,
+                    EntityModel.archived_at.is_(None),
+                    CampaignMemberModel.campaign_id == EntityModel.campaign_id,
+                    CampaignMemberModel.principal_id == principal_id,
+                    CampaignMemberModel.active.is_(True),
                 )
-                """
-            ),
-            {"c": campaign_id, "p": principal_id, "a": turn.actor_id},
+            )
         )
         if not actor_allowed.scalar_one():
             raise AuthorizationError("actorを操作する権限がありません")
-        unresolved_turn = await self._session.execute(
-            text(
-                "SELECT id FROM turns "
-                "WHERE campaign_id=:c AND resolution_status IN ('pending','resolving')"
-            ),
-            {"c": campaign_id},
+        open_turn = await self._session.execute(
+            select(TurnModel.id).where(
+                TurnModel.campaign_id == campaign_id,
+                or_(
+                    TurnModel.resolution_status.in_(("pending", "resolving")),
+                    TurnModel.narration_status.in_(("pending", "generating")),
+                ),
+            )
         )
-        if unresolved_turn.scalar_one_or_none() is not None:
+        if open_turn.scalar_one_or_none() is not None:
             return None
         scene_id = (
             await self._session.execute(
-                text("SELECT id FROM scenes WHERE campaign_id=:c AND status='active'"),
-                {"c": campaign_id},
+                select(SceneModel.id).where(
+                    SceneModel.campaign_id == campaign_id,
+                    SceneModel.status == "active",
+                )
             )
         ).scalar_one()
         current_version = int(campaign["state_version"])
@@ -367,89 +394,83 @@ class PostgresTurnRepository:
             if not available_choice.scalar_one():
                 raise ChoiceNotAvailableError("指定Choiceは現在利用できません")
         await self._session.execute(
-            text(
-                "UPDATE turn_choices SET invalidated_at=now() "
-                "WHERE campaign_id=:c AND actor_id=:a AND invalidated_at IS NULL"
-            ),
-            {"c": campaign_id, "a": turn.actor_id},
+            sql_update(TurnChoiceModel)
+            .where(
+                TurnChoiceModel.campaign_id == campaign_id,
+                TurnChoiceModel.actor_id == turn.actor_id,
+                TurnChoiceModel.invalidated_at.is_(None),
+            )
+            .values(invalidated_at=text("now()"))
         )
         params = {
             "id": uuid4(),
-            "c": campaign_id,
-            "s": scene_id,
-            "p": principal_id,
-            "r": turn.request_id,
-            "a": turn.actor_id,
-            "payload": _json(turn.model_dump(mode="json")),
-            "hash": request_hash(1, campaign_id, scene_id, principal_id, turn),
-            "kind": content["kind"],
+            "campaign_id": campaign_id,
+            "scene_id": scene_id,
+            "created_by": principal_id,
+            "request_id": turn.request_id,
+            "actor_id": turn.actor_id,
+            "input_payload": turn.model_dump(mode="json"),
+            "request_hash": request_hash(1, campaign_id, scene_id, principal_id, turn),
+            "input_kind": content["kind"],
             "input_text": content.get("text"),
-            "choice": content.get("choice_id"),
-            "version": turn.expected_state_version,
+            "selected_choice_id": content.get("choice_id"),
+            "expected_state_version": turn.expected_state_version,
             "max_actions": max_actions,
+            "llm_call_budget": llm_call_budget,
         }
         result = await self._session.execute(
-            text(
-                """
-                INSERT INTO turns(
-                    id,
-                    campaign_id,
-                    scene_id,
-                    request_id,
-                    created_by,
-                    actor_id,
-                    input_payload,
-                    request_hash,
-                    input_kind,
-                    input_text,
-                    selected_choice_id,
-                    expected_state_version,
-                    max_actions
-                )
-                VALUES(
-                    :id,
-                    :c,
-                    :s,
-                    :r,
-                    :p,
-                    :a,
-                    CAST(:payload AS jsonb),
-                    :hash,
-                    :kind,
-                    :input_text,
-                    :choice,
-                    :version,
-                    :max_actions
-                )
-                ON CONFLICT DO NOTHING
-                RETURNING *
-                """
-            ),
+            insert(TurnModel)
+            .on_conflict_do_nothing()
+            .returning(*TurnModel.__table__.c),
             params,
         )
         row = result.mappings().one_or_none()
         return None if row is None else _turn(row)
 
-    async def acquire_lease(self, turn_id: UUID, *, lease_seconds: int) -> Lease | None:
+    async def acquire_lease(
+        self,
+        turn_id: UUID,
+        *,
+        lease_seconds: int,
+        max_attempts: int,
+        deadline_seconds: int,
+    ) -> Lease | None:
         result = await self._session.execute(
             text(
                 """
                 UPDATE turns
                 SET resolution_status='resolving',
                     worker_epoch=worker_epoch+1,
-                    lease_until=now()+make_interval(secs=>:seconds)
+                    lease_until=now()+make_interval(secs=>:lease_seconds),
+                    resolution_attempt_count=resolution_attempt_count+1,
+                    resolution_started_at=COALESCE(resolution_started_at,now()),
+                    resolution_deadline=COALESCE(
+                        resolution_deadline,
+                        now()+make_interval(secs=>:deadline_seconds)
+                    )
                 WHERE id=(
                     SELECT id
                     FROM turns
                     WHERE id=:id
                       AND resolution_status IN ('pending','resolving')
                       AND (resolution_status='pending' OR lease_until<now())
+                      AND resolution_attempt_count<:max_attempts
+                      AND (resolution_deadline IS NULL OR resolution_deadline>now())
+                      AND (
+                          resolution_next_attempt_at IS NULL
+                          OR resolution_next_attempt_at<=now()
+                      )
                     FOR UPDATE SKIP LOCKED
                 )
                 RETURNING *
                 """
             ),
-            {"id": turn_id, "seconds": lease_seconds},
+            {
+                "id": turn_id,
+                "lease_seconds": lease_seconds,
+                "max_attempts": max_attempts,
+                "deadline_seconds": deadline_seconds,
+            },
         )
         row = result.mappings().one_or_none()
         return None if row is None else Lease(_turn(row), row["lease_until"])
@@ -656,25 +677,28 @@ class PostgresCanonicalRepository:
         self._session = session
 
     async def snapshot(self, campaign_id: UUID) -> CanonicalSnapshot:
+        # 呼出側はこの短い読取transactionを終了してからLLMへ進む。
         campaign = (
             await self._session.execute(
-                text("SELECT state_version FROM campaigns WHERE id=:c"), {"c": campaign_id}
+                select(CampaignModel.state_version)
+                .where(CampaignModel.id == campaign_id)
+                .with_for_update()
             )
         ).one()
 
-        async def rows(table: str) -> tuple[Mapping[str, object], ...]:
+        async def rows(table: FromClause) -> tuple[Mapping[str, object], ...]:
             result = await self._session.execute(
-                text(f"SELECT * FROM {table} WHERE campaign_id=:c"), {"c": campaign_id}
+                select(table).where(table.c.campaign_id == campaign_id)
             )
             return tuple(dict(row) for row in result.mappings())
 
         return CanonicalSnapshot(
             campaign_id,
             int(campaign[0]),
-            await rows("mvp_characters"),
-            await rows("mvp_skill_modifiers"),
-            await rows("mvp_weapons"),
-            await rows("mvp_inventory"),
+            await rows(MvpCharacterModel.__table__),
+            await rows(MvpSkillModifierModel.__table__),
+            await rows(MvpWeaponModel.__table__),
+            await rows(MvpInventoryModel.__table__),
         )
 
     async def update_with_campaign_lock(
@@ -682,8 +706,9 @@ class PostgresCanonicalRepository:
     ) -> int:
         row = (
             await self._session.execute(
-                text("SELECT state_version FROM campaigns WHERE id=:c FOR UPDATE"),
-                {"c": campaign_id},
+                select(CampaignModel.state_version)
+                .where(CampaignModel.id == campaign_id)
+                .with_for_update()
             )
         ).one()
         value = update()
@@ -691,15 +716,122 @@ class PostgresCanonicalRepository:
             await value
         version = int(row[0]) + 1
         await self._session.execute(
-            text("UPDATE campaigns SET state_version=:v WHERE id=:c"),
-            {"v": version, "c": campaign_id},
+            sql_update(CampaignModel)
+            .where(CampaignModel.id == campaign_id)
+            .values(state_version=version)
         )
         return version
 
 
-class PostgresNarrationRepository:
+class PostgresLLMCallRepository:
+    """provider呼出し直前のTurn共有予算をDBで予約する。"""
+
     def __init__(self, session: AsyncSession) -> None:
         self._session = session
+
+    async def reserve(
+        self,
+        turn_id: UUID,
+        *,
+        phase: LLMPhase,
+        worker_epoch: int,
+    ) -> bool:
+        ownership = {
+            "resolution": (
+                "resolution_status='resolving' "
+                "AND worker_epoch=:epoch AND lease_until>now()"
+            ),
+            "narration": (
+                "narration_status='generating' "
+                "AND narration_worker_epoch=:epoch AND narration_lease_until>now()"
+            ),
+        }.get(phase)
+        if ownership is None:
+            raise ValueError(f"未対応のLLM phaseです: {phase}")
+        result = await self._session.execute(
+            text(
+                f"""
+                UPDATE turns
+                SET llm_call_count=llm_call_count+1
+                WHERE id=:turn
+                  AND {ownership}
+                  AND llm_call_count<llm_call_budget
+                  AND (route IS DISTINCT FROM 'narrative' OR llm_call_count<1)
+                RETURNING llm_call_count
+                """
+            ),
+            {"turn": turn_id, "epoch": worker_epoch},
+        )
+        return result.scalar_one_or_none() is not None
+
+
+class PostgresNarrationRepository:
+    def __init__(
+        self,
+        session: AsyncSession,
+        event_id_factory: Callable[[], UUID] = uuid4,
+    ) -> None:
+        self._session = session
+        self._event_id_factory = event_id_factory
+
+    async def acquire_lease(
+        self,
+        turn_id: UUID,
+        *,
+        lease_seconds: int,
+        max_attempts: int,
+        deadline_seconds: int,
+    ) -> NarrationLease | None:
+        result = await self._session.execute(
+            text(
+                """
+                UPDATE turns
+                SET narration_status='generating',
+                    narration_worker_epoch=narration_worker_epoch+1,
+                    narration_lease_until=now()+make_interval(secs=>:lease_seconds),
+                    narration_attempt_count=narration_attempt_count+1,
+                    narration_started_at=COALESCE(narration_started_at,now()),
+                    narration_deadline=COALESCE(
+                        narration_deadline,
+                        now()+make_interval(secs=>:deadline_seconds)
+                    )
+                WHERE id=(
+                    SELECT id
+                    FROM turns
+                    WHERE id=:id
+                      AND resolution_status IN ('committed','not_applied','failed')
+                      AND narration_status IN ('pending','generating')
+                      AND (
+                          narration_status='pending'
+                          OR narration_lease_until<now()
+                      )
+                      AND narration_attempt_count<:max_attempts
+                      AND (narration_deadline IS NULL OR narration_deadline>now())
+                      AND (
+                          narration_next_attempt_at IS NULL
+                          OR narration_next_attempt_at<=now()
+                      )
+                    FOR UPDATE SKIP LOCKED
+                )
+                RETURNING id,campaign_id,narration_worker_epoch,narration_lease_until
+                """
+            ),
+            {
+                "id": turn_id,
+                "lease_seconds": lease_seconds,
+                "max_attempts": max_attempts,
+                "deadline_seconds": deadline_seconds,
+            },
+        )
+        row = result.mappings().one_or_none()
+        if row is None:
+            return None
+        return NarrationLease(
+            turn_id=row["id"],
+            campaign_id=row["campaign_id"],
+            worker_epoch=int(row["narration_worker_epoch"]),
+            lease_until=row["narration_lease_until"],
+        )
 
     async def save_conditionally(
         self,
@@ -712,21 +844,29 @@ class PostgresNarrationRepository:
         fallback_reason: str | None = None,
     ) -> bool:
         # Campaign→Turnのロック順を確定処理と統一する。
-        await self._session.execute(
-            text("SELECT id FROM campaigns WHERE id=:c FOR UPDATE"), {"c": campaign_id}
-        )
+        campaign = (
+            await self._session.execute(
+                text(
+                    "SELECT state_version,event_sequence FROM campaigns "
+                    "WHERE id=:c FOR UPDATE"
+                ),
+                {"c": campaign_id},
+            )
+        ).mappings().one()
         result = await self._session.execute(
             text(
                 """
                 UPDATE turns
                 SET narration_status=:status,
                     narration=:n,
-                    recovery_reason=:reason
+                    recovery_reason=:reason,
+                    narration_lease_until=NULL
                 WHERE id=:t
                   AND campaign_id=:c
-                  AND worker_epoch=:epoch
-                  AND narration_status IN ('pending','generating')
-                RETURNING scene_id,actor_id,committed_state_version,created_at
+                  AND narration_worker_epoch=:epoch
+                  AND narration_status='generating'
+                  AND narration_lease_until>now()
+                RETURNING scene_id,actor_id,committed_state_version
                 """
             ),
             {
@@ -741,27 +881,11 @@ class PostgresNarrationRepository:
         row = result.mappings().one_or_none()
         if row is None:
             return False
-        if choices:
-            later_turn = await self._session.execute(
-                text(
-                    """
-                    SELECT EXISTS(
-                        SELECT 1 FROM turns
-                        WHERE campaign_id=:c
-                          AND actor_id=:a
-                          AND (created_at,id) > (:created_at,:t)
-                    )
-                    """
-                ),
-                {
-                    "c": campaign_id,
-                    "a": row["actor_id"],
-                    "created_at": row["created_at"],
-                    "t": turn_id,
-                },
-            )
-            if later_turn.scalar_one():
-                return True
+        state_version = (
+            int(campaign["state_version"])
+            if row["committed_state_version"] is None
+            else int(row["committed_state_version"])
+        )
         for choice in choices:
             await self._session.execute(
                 text(
@@ -789,9 +913,43 @@ class PostgresNarrationRepository:
                     "a": row["actor_id"],
                     "o": choice.ordinal,
                     "label": choice.label,
-                    "v": row["committed_state_version"],
+                    "v": state_version,
                 },
             )
+        sequence = int(campaign["event_sequence"]) + 1
+        payload = NarrationGeneratedPayload(
+            narration=narration,
+            fallback=fallback_reason is not None,
+        )
+        await self._session.execute(
+            text(
+                "UPDATE campaigns SET event_sequence=:sequence WHERE id=:campaign"
+            ),
+            {"sequence": sequence, "campaign": campaign_id},
+        )
+        await self._session.execute(
+            text(
+                """
+                INSERT INTO events(
+                    id,campaign_id,scene_id,turn_id,action_id,
+                    sequence,state_version,type,schema_version,payload
+                )
+                VALUES(
+                    :id,:campaign,:scene,:turn,NULL,
+                    :sequence,:version,'GMNarrationGenerated',1,CAST(:payload AS jsonb)
+                )
+                """
+            ),
+            {
+                "id": self._event_id_factory(),
+                "campaign": campaign_id,
+                "scene": row["scene_id"],
+                "turn": turn_id,
+                "sequence": sequence,
+                "version": state_version,
+                "payload": _json(payload.model_dump(mode="json")),
+            },
+        )
         return True
 
 
@@ -801,6 +959,7 @@ class PostgresUnitOfWork:
     turns: TurnRepository
     canonical: CanonicalRepository
     narration: NarrationRepository
+    llm_calls: LLMCallRepository
 
     def __init__(self, factory: async_sessionmaker[AsyncSession]) -> None:
         self._factory = factory
@@ -811,6 +970,7 @@ class PostgresUnitOfWork:
         self.turns = PostgresTurnRepository(self._session)
         self.canonical = PostgresCanonicalRepository(self._session)
         self.narration = PostgresNarrationRepository(self._session)
+        self.llm_calls = PostgresLLMCallRepository(self._session)
         return self
 
     async def __aexit__(self, exc_type: object, exc: object, tb: object) -> None:

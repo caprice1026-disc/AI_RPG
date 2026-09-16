@@ -83,6 +83,7 @@ async def test_accept_preserves_policy_and_returns_valid_pending_response(max_ac
     assert not response.recovery.fallback
     assert response.recovery.reason is None
     assert session.execute.call_args_list[-1].args[1]["max_actions"] == max_actions
+    assert session.execute.call_args_list[-1].args[1]["llm_call_budget"] == 3
     session.commit.assert_awaited_once()
     session.rollback.assert_not_awaited()
     session.close.assert_awaited_once()

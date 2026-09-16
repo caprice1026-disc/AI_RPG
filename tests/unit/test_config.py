@@ -19,3 +19,22 @@ def test_invalid_action_limit_fails_fast(monkeypatch: pytest.MonkeyPatch) -> Non
     monkeypatch.setenv("AIRPG_MAX_ACTIONS_PER_TURN", "11")
     with pytest.raises(ValidationError):
         Settings()
+
+
+def test_worker_retry_defaults_are_bounded() -> None:
+    settings = Settings()
+
+    assert settings.resolution_max_attempts == 3
+    assert settings.narration_max_attempts == 3
+    assert settings.resolution_deadline_seconds == 120
+    assert settings.narration_deadline_seconds == 120
+
+
+def test_provider_timeout_must_fit_inside_worker_lease(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("AIRPG_WORKER_LEASE_SECONDS", "60")
+    monkeypatch.setenv("AIRPG_LLM_TIMEOUT_SECONDS", "60")
+
+    with pytest.raises(ValidationError):
+        Settings()

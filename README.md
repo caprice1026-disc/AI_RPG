@@ -10,10 +10,14 @@ LLMが物語上の意図と描写を担当し、ゲーム上の判定・状態�
 - 型付きのPlayer／LLM／Command／Result／Event契約
 - 再現可能なダイスと`mvp_v1`技能判定
 - PostgreSQL migration、Turnの冪等受付、lease、atomicなAction／Event確定
+- Infrastructure限定のSQLAlchemy型付きmodelと通常CRUD／snapshotの型付きクエリ
+- Turn単位のDB永続LLM予算、phase別attempt／固定deadline
+- 解決とは独立した描写lease／epochと、描写・Choice・GMイベントのatomic保存
+- 描写がcompleted／fallbackになるまで次Turnを閉じるCampaign単位制約
 - damage、healing、item consumptionの型付きStateChangeと保存projection
 - 並行受付、stale worker、二重確定、transaction rollbackの実PostgreSQLテスト
 
-実装の次段階は、Infrastructure専用SQLAlchemy ORM modelへの通常CRUD移行、DB永続のLLM予算、描写専用lease／event、Fake LLMによる一往復E2Eです。
+実装の次段階は、AcceptTurn／GetTurn API、一貫したContext生成、Fake LLMを使う解決・描写worker、一往復E2Eです。実モデル接続はまだ行いません。
 
 ## 責務の境界
 
@@ -38,6 +42,7 @@ Python 3.11以上とPostgreSQLを使用します。Windowsでは既存の`.venv`
 ```
 
 PostgreSQL統合テストには、名前が`ai_rpg_test`で始まる専用の空DBを指定します。fixtureは既存テーブルがあるDBを拒否します。
+Alembicは空DBだけでなく、直前revision `0002_mvp_v1_canonical` からheadへの更新もテストします。
 
 ```powershell
 $env:AIRPG_TEST_DATABASE_URL = "postgresql+psycopg://USER:PASSWORD@HOST:PORT/ai_rpg_test_local"

@@ -53,6 +53,7 @@ class TurnService:
                 principal_id,
                 turn,
                 self._policy.max_actions_per_turn,
+                self._policy.mechanical_call_budget,
             )
             await unit_of_work.commit()
         return response

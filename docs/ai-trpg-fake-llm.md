@@ -1,7 +1,7 @@
 # Fake LLMによる技能判定の一往復を完成させる実装方針
 
 作成日: 2026-09-15  
-状態: 合意済み方針に基づく実装計画  
+状態: 合意済み方針に基づき実装中
 対象: caprice1026-disc/AI_RPG
 
 ## 1 目的と完成条件
@@ -13,6 +13,14 @@
 正常系だけでなく、通信再送、描写timeout、worker再起動でも、確定結果の二重適用や処理の取りこぼしが起きないことを確認する。描写完了またはfallbackまで次の入力を待つため、障害時に処理を終端化して入力を再開できることも完成条件に含む。
 
 本書は実装を依頼するときの計画であり、コード変更やテストの完了報告ではない。既存コードについての基準は、直前のレビュー対象コミット[77a0193](https://github.com/caprice1026-disc/AI_RPG/commit/77a0193f1baf1c1160de812a597dec38cbbe10e5)とする。実装開始時には最新差分と既存計画を確認し、すでに修正済みの作業を重複実装しない。
+
+### 実装進捗（2026-09-16）
+
+- Step 1: Domain Command／Result／StateChangeの正本化、Application projection、回復・在庫消費の型付き保存を完了。
+- Step 2: Infrastructure限定ORM mapping、描写終端までの受付制約、DB永続LLM予算、phase別attempt／deadline、独立した描写lease／epoch、GMNarrationGeneratedのatomic保存を完了。
+- Step 3以降: API、Context生成、Fake transport、worker、障害復旧、一往復E2Eは未完了。
+
+この進捗欄を現在地の正本とし、以下の計画本文は完成条件として維持する。
 
 ## 2 合意済みの前提
 

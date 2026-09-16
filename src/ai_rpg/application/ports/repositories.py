@@ -4,7 +4,7 @@ from collections.abc import Callable, Mapping, Sequence
 from contextlib import AbstractAsyncContextManager
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Protocol
+from typing import Literal, Protocol, TypeAlias
 from uuid import UUID
 
 from ai_rpg.contracts import PlayerTurnInput, TurnResponse
@@ -68,6 +68,17 @@ class Lease:
 
 
 @dataclass(frozen=True, slots=True)
+class NarrationLease:
+    turn_id: UUID
+    campaign_id: UUID
+    worker_epoch: int
+    lease_until: datetime
+
+
+LLMPhase: TypeAlias = Literal["resolution", "narration"]
+
+
+@dataclass(frozen=True, slots=True)
 class CanonicalSnapshot:
     campaign_id: UUID
     state_version: int
@@ -109,6 +120,7 @@ class TurnRepository(Protocol):
         principal_id: UUID,
         turn: PlayerTurnInput,
         max_actions: int,
+        llm_call_budget: int = 3,
     ) -> TurnResponse: ...
 
     async def find_by_request_id(
@@ -122,9 +134,17 @@ class TurnRepository(Protocol):
         turn: PlayerTurnInput,
         *,
         max_actions: int,
+        llm_call_budget: int = 3,
     ) -> TurnRow | None: ...
 
-    async def acquire_lease(self, turn_id: UUID, *, lease_seconds: int) -> Lease | None: ...
+    async def acquire_lease(
+        self,
+        turn_id: UUID,
+        *,
+        lease_seconds: int,
+        max_attempts: int,
+        deadline_seconds: int,
+    ) -> Lease | None: ...
 
     async def commit_resolution(self, bundle: CommitBundle) -> int: ...
 
@@ -138,6 +158,15 @@ class CanonicalRepository(Protocol):
 
 
 class NarrationRepository(Protocol):
+    async def acquire_lease(
+        self,
+        turn_id: UUID,
+        *,
+        lease_seconds: int,
+        max_attempts: int,
+        deadline_seconds: int,
+    ) -> NarrationLease | None: ...
+
     async def save_conditionally(
         self,
         campaign_id: UUID,
@@ -150,10 +179,21 @@ class NarrationRepository(Protocol):
     ) -> bool: ...
 
 
+class LLMCallRepository(Protocol):
+    async def reserve(
+        self,
+        turn_id: UUID,
+        *,
+        phase: LLMPhase,
+        worker_epoch: int,
+    ) -> bool: ...
+
+
 class RepositorySet(Protocol):
     turns: TurnRepository
     canonical: CanonicalRepository
     narration: NarrationRepository
+    llm_calls: LLMCallRepository
 
 
 class UnitOfWork(RepositorySet, AbstractAsyncContextManager["UnitOfWork"], Protocol):

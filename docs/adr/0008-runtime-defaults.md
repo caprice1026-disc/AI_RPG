@@ -15,10 +15,16 @@
 | LLM 1リクエストtimeout | `AIRPG_LLM_TIMEOUT_SECONDS` | 30秒 | 5〜120秒。接続から応答完了までのwall-clock deadline |
 | Narrative呼び出し上限 | `AIRPG_NARRATIVE_CALL_BUDGET` | 1回/Turn | MVPでは1固定 |
 | Mechanical呼び出し上限 | `AIRPG_MECHANICAL_CALL_BUDGET` | 3回/Turn | MVPでは3固定 |
+| 解決phase試行上限 | `AIRPG_RESOLUTION_MAX_ATTEMPTS` | 3回 | 1〜10。lease再取得を含む |
+| 描写phase試行上限 | `AIRPG_NARRATION_MAX_ATTEMPTS` | 3回 | 1〜10。lease再取得を含む |
+| 解決phase deadline | `AIRPG_RESOLUTION_DEADLINE_SECONDS` | 120秒 | 60〜900秒。初回取得時にDBへ固定 |
+| 描写phase deadline | `AIRPG_NARRATION_DEADLINE_SECONDS` | 120秒 | 60〜900秒。初回取得時にDBへ固定 |
 
 呼び出し回数はproviderへの**各物理requestを送信する直前**に永続的に1予約する。timeout、拒否、schema不正、provider切替、repairも消費し、SDK自動retryは無効にする。Mechanicalの通常内訳はIntent抽出1、確定結果の描写1、必要時のrepairまたは描写再試行1である。Narrativeが `ResolutionRequired` へ昇格した場合、そのNarrative requestをMechanicalのIntent抽出済み1回として数え、Turn全体の上限は3回とする。Directorは別job予算であり、このTurn予算を流用しない。
 
 Action上限と呼び出し予算はTurn受付時にeffective値を保存し、deploy途中や再取得で変えない。lease、recent message件数、timeoutはprocess設定だが、実行logへeffective値を記録する。LLM timeout時は同じlease内で無制限に待たず、残予算とlease所有権を検査する。
+
+phaseのattempt_count、初回開始時刻、deadline、next_attempt_at、内部failure_codeはTurnへ保存する。lease再取得でattempt_countは増えるがdeadlineは延長しない。LLM timeoutはworker leaseより短く、phase deadlineはworker lease以上でなければ設定検証で起動を止める。
 
 ## 採用理由
 

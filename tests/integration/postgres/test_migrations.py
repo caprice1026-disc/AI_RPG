@@ -28,7 +28,13 @@ from ai_rpg.application import (
     StateVersionConflictError,
     TurnInProgressError,
 )
-from ai_rpg.application.ports import ActionRecord, ChoiceDraft, CommitBundle, Lease
+from ai_rpg.application.ports import (
+    ActionRecord,
+    ChoiceDraft,
+    CommitBundle,
+    Lease,
+    NarrationLease,
+)
 from ai_rpg.contracts import PlayerTurnInput, TurnResponse
 from ai_rpg.contracts.context import OutputLimits
 from ai_rpg.contracts.responses import MechanicalNarrationInput
@@ -43,6 +49,8 @@ from ai_rpg.domain.results import (
     ResolvedAction,
 )
 from ai_rpg.infrastructure.postgres.repositories import (
+    PostgresCanonicalRepository,
+    PostgresLLMCallRepository,
     PostgresNarrationRepository,
     PostgresTurnRepository,
 )
@@ -292,18 +300,48 @@ def _accept_from_database(
         return runner.run(accept())
 
 
+def _acquire_narration_lease_from_database(
+    database: Engine,
+    turn_id: UUID,
+) -> NarrationLease:
+    async def acquire() -> NarrationLease:
+        url = database.url.render_as_string(hide_password=False)
+        async with _postgres_sessions(url) as factory, factory() as session:
+            lease = await PostgresNarrationRepository(session).acquire_lease(
+                turn_id,
+                lease_seconds=60,
+                max_attempts=3,
+                deadline_seconds=120,
+            )
+            await session.commit()
+            assert lease is not None
+            return lease
+
+    with asyncio.Runner(loop_factory=asyncio.SelectorEventLoop) as runner:
+        return runner.run(acquire())
+
+
 def _save_narration_from_database(
     database: Engine,
     turn_id: UUID,
     choices: tuple[ChoiceDraft, ...],
+    *,
+    worker_epoch: int | None = None,
+    event_id: UUID | None = None,
 ) -> bool:
+    if worker_epoch is None:
+        worker_epoch = _acquire_narration_lease_from_database(database, turn_id).worker_epoch
+
     async def save() -> bool:
         url = database.url.render_as_string(hide_password=False)
         async with _postgres_sessions(url) as factory, factory() as session:
-            saved = await PostgresNarrationRepository(session).save_conditionally(
+            saved = await PostgresNarrationRepository(
+                session,
+                event_id_factory=(lambda: event_id) if event_id is not None else uuid4,
+            ).save_conditionally(
                 UUID(CAMPAIGN_A),
                 turn_id,
-                0,
+                worker_epoch,
                 "遅れて届いた描写",
                 choices,
             )
@@ -657,6 +695,8 @@ def _acquire_lease_from_database(database: Engine, turn_id: UUID) -> Lease:
             lease = await PostgresTurnRepository(session).acquire_lease(
                 turn_id,
                 lease_seconds=60,
+                max_attempts=3,
+                deadline_seconds=120,
             )
             await session.commit()
             assert lease is not None
@@ -775,6 +815,63 @@ def test_empty_database_upgrades_and_downgrades(empty_database_url: str) -> None
     try:
         assert _public_tables(engine) == {"alembic_version"}
         assert _public_functions(engine) == set()
+    finally:
+        engine.dispose()
+
+
+def test_existing_revision_upgrades_with_worker_control_defaults(
+    empty_database_url: str,
+) -> None:
+    _run_alembic(empty_database_url, "upgrade", "0002_mvp_v1_canonical")
+    engine = create_engine(empty_database_url)
+    try:
+        with engine.begin() as connection:
+            _seed_members_entities_and_scene(connection)
+            connection.execute(
+                text(
+                    "INSERT INTO turns("
+                    "id,campaign_id,scene_id,request_id,created_by,actor_id,input_payload,"
+                    "request_hash,input_kind,input_text,expected_state_version"
+                    ") VALUES("
+                    ":turn,:campaign,:scene,:request,:principal,:actor,'{}',"
+                    "decode(repeat('00',32),'hex'),'text','行動する',0"
+                    ")"
+                ),
+                {
+                    "turn": TURN_A,
+                    "campaign": CAMPAIGN_A,
+                    "scene": SCENE_A,
+                    "request": REQUEST_A,
+                    "principal": PRINCIPAL_A,
+                    "actor": ACTOR_A,
+                },
+            )
+    finally:
+        engine.dispose()
+
+    _run_alembic(empty_database_url, "upgrade", "head")
+    engine = create_engine(empty_database_url)
+    try:
+        with engine.connect() as connection:
+            row = connection.execute(
+                text(
+                    "SELECT llm_call_budget,resolution_attempt_count,"
+                    "narration_worker_epoch,narration_attempt_count "
+                    "FROM turns WHERE id=:turn"
+                ),
+                {"turn": TURN_A},
+            ).one()
+            indexes = set(
+                connection.execute(
+                    text(
+                        "SELECT indexname FROM pg_indexes "
+                        "WHERE schemaname='public' AND tablename='turns'"
+                    )
+                ).scalars()
+            )
+        assert row == (3, 0, 0, 0)
+        assert "one_open_turn" in indexes
+        assert "one_unresolved_turn" not in indexes
     finally:
         engine.dispose()
 
@@ -948,6 +1045,170 @@ def test_different_request_while_turn_is_unresolved_is_turn_in_progress(
     assert caught.value.code == "TURN_IN_PROGRESS"
     with database.connect() as connection:
         assert connection.scalar(text("SELECT count(*) FROM turns")) == 1
+
+
+def test_different_request_while_narration_is_pending_is_turn_in_progress(
+    database: Engine,
+) -> None:
+    with database.begin() as connection:
+        _seed_members_entities_and_scene(connection)
+
+    accepted = _accept_from_database(database, _player_turn())
+    with database.begin() as connection:
+        connection.execute(
+            text(
+                "UPDATE turns SET resolution_status='committed',route='mechanical',"
+                "committed_state_version=0,committed_at=now() WHERE id=:turn"
+            ),
+            {"turn": accepted.turn_id},
+        )
+
+    with pytest.raises(TurnInProgressError):
+        _accept_from_database(database, _player_turn(request_id=REQUEST_B))
+
+    with database.begin() as connection:
+        connection.execute(
+            text(
+                "UPDATE turns SET narration_status='completed',narration='完了した。' "
+                "WHERE id=:turn"
+            ),
+            {"turn": accepted.turn_id},
+        )
+    second = _accept_from_database(database, _player_turn(request_id=REQUEST_B))
+    assert second.turn_id != accepted.turn_id
+
+
+def test_llm_call_reservation_is_atomic_persistent_and_owned(database: Engine) -> None:
+    with database.begin() as connection:
+        _seed_members_entities_and_scene(connection)
+    accepted = _accept_from_database(database, _player_turn())
+    lease = _acquire_lease_from_database(database, accepted.turn_id)
+    with database.begin() as connection:
+        connection.execute(
+            text("UPDATE turns SET llm_call_budget=1 WHERE id=:turn"),
+            {"turn": accepted.turn_id},
+        )
+
+    async def reserve(epoch: int) -> bool:
+        url = database.url.render_as_string(hide_password=False)
+        async with _postgres_sessions(url) as factory, factory() as session:
+            reserved = await PostgresLLMCallRepository(session).reserve(
+                accepted.turn_id,
+                phase="resolution",
+                worker_epoch=epoch,
+            )
+            await session.commit()
+            return reserved
+
+    async def reserve_twice(epoch: int) -> list[bool]:
+        return list(await asyncio.gather(reserve(epoch), reserve(epoch)))
+
+    with asyncio.Runner(loop_factory=asyncio.SelectorEventLoop) as runner:
+        assert not runner.run(reserve(lease.turn.worker_epoch - 1))
+        reservations = runner.run(reserve_twice(lease.turn.worker_epoch))
+        assert sorted(reservations) == [False, True]
+        assert not runner.run(reserve(lease.turn.worker_epoch))
+
+    with database.connect() as connection:
+        assert connection.scalar(
+            text("SELECT llm_call_count FROM turns WHERE id=:turn"),
+            {"turn": accepted.turn_id},
+        ) == 1
+
+
+def test_resolution_lease_attempts_share_a_fixed_deadline(database: Engine) -> None:
+    with database.begin() as connection:
+        _seed_members_entities_and_scene(connection)
+    accepted = _accept_from_database(database, _player_turn())
+
+    first = _acquire_lease_from_database(database, accepted.turn_id)
+    with database.connect() as connection:
+        first_state = connection.execute(
+            text(
+                "SELECT resolution_attempt_count,resolution_started_at,"
+                "resolution_deadline FROM turns WHERE id=:turn"
+            ),
+            {"turn": accepted.turn_id},
+        ).one()
+    with database.begin() as connection:
+        connection.execute(
+            text("UPDATE turns SET lease_until=now()-interval '1 second' WHERE id=:turn"),
+            {"turn": accepted.turn_id},
+        )
+
+    async def acquire_again() -> Lease | None:
+        url = database.url.render_as_string(hide_password=False)
+        async with _postgres_sessions(url) as factory, factory() as session:
+            value = await PostgresTurnRepository(session).acquire_lease(
+                accepted.turn_id,
+                lease_seconds=60,
+                max_attempts=2,
+                deadline_seconds=120,
+            )
+            await session.commit()
+            return value
+
+    with asyncio.Runner(loop_factory=asyncio.SelectorEventLoop) as runner:
+        second = runner.run(acquire_again())
+    assert second is not None
+    assert second.turn.worker_epoch == first.turn.worker_epoch + 1
+
+    with database.connect() as connection:
+        second_state = connection.execute(
+            text(
+                "SELECT resolution_attempt_count,resolution_started_at,"
+                "resolution_deadline FROM turns WHERE id=:turn"
+            ),
+            {"turn": accepted.turn_id},
+        ).one()
+    assert second_state[0] == 2
+    assert second_state[1:] == first_state[1:]
+
+    with database.begin() as connection:
+        connection.execute(
+            text("UPDATE turns SET lease_until=now()-interval '1 second' WHERE id=:turn"),
+            {"turn": accepted.turn_id},
+        )
+    with asyncio.Runner(loop_factory=asyncio.SelectorEventLoop) as runner:
+        assert runner.run(acquire_again()) is None
+
+
+def test_canonical_snapshot_locks_campaign_before_typed_reads(database: Engine) -> None:
+    with database.begin() as connection:
+        _seed_resolution_state(connection)
+
+    async def snapshot() -> tuple[object, list[str]]:
+        url = database.url.render_as_string(hide_password=False)
+        engine = create_async_engine(url)
+        statements: list[str] = []
+
+        def record(
+            _connection: Any,
+            _cursor: Any,
+            statement: str,
+            _parameters: Any,
+            _context: Any,
+            _executemany: bool,
+        ) -> None:
+            statements.append(" ".join(statement.lower().split()))
+
+        event.listen(engine.sync_engine, "before_cursor_execute", record)
+        try:
+            factory = async_sessionmaker(engine, expire_on_commit=False)
+            async with factory() as session:
+                value = await PostgresCanonicalRepository(session).snapshot(UUID(CAMPAIGN_A))
+                await session.commit()
+                return value, statements
+        finally:
+            await engine.dispose()
+
+    with asyncio.Runner(loop_factory=asyncio.SelectorEventLoop) as runner:
+        value, statements = runner.run(snapshot())
+
+    assert value.state_version == 0
+    assert "from campaigns" in statements[0]
+    assert "for update" in statements[0]
+    assert any("from mvp_characters" in statement for statement in statements[1:])
 
 
 def test_concurrent_same_request_creates_one_turn(database: Engine) -> None:
@@ -1413,11 +1674,12 @@ def test_choice_for_different_actor_is_rejected_as_unavailable(database: Engine)
         "source_principal",
         "source_actor",
         "narration_status",
+        "expected_error",
     ),
     [
-        (CAMPAIGN_B, SCENE_B, PRINCIPAL_B, ACTOR_B, "completed"),
-        (CAMPAIGN_A, SCENE_B, PRINCIPAL_A, ACTOR_A, "completed"),
-        (CAMPAIGN_A, SCENE_A, PRINCIPAL_A, ACTOR_A, "pending"),
+        (CAMPAIGN_B, SCENE_B, PRINCIPAL_B, ACTOR_B, "completed", ChoiceNotAvailableError),
+        (CAMPAIGN_A, SCENE_B, PRINCIPAL_A, ACTOR_A, "completed", ChoiceNotAvailableError),
+        (CAMPAIGN_A, SCENE_A, PRINCIPAL_A, ACTOR_A, "pending", TurnInProgressError),
     ],
     ids=["different-campaign", "different-scene", "unnarrated-source"],
 )
@@ -1428,6 +1690,7 @@ def test_choice_scope_and_narration_are_required(
     source_principal: str,
     source_actor: str,
     narration_status: str,
+    expected_error: type[Exception],
 ) -> None:
     with database.begin() as connection:
         _seed_members_entities_and_scene(connection)
@@ -1453,13 +1716,13 @@ def test_choice_scope_and_narration_are_required(
             narration_status=narration_status,
         )
 
-    with pytest.raises(ChoiceNotAvailableError) as caught:
+    with pytest.raises(expected_error) as caught:
         _accept_from_database(
             database,
             _player_turn(choice_id=CHOICE_C),
         )
 
-    assert caught.value.code == "CHOICE_NOT_AVAILABLE"
+    assert caught.value.code in {"CHOICE_NOT_AVAILABLE", "TURN_IN_PROGRESS"}
     with database.connect() as connection:
         assert connection.scalar(
             text(
@@ -1920,7 +2183,7 @@ def test_commit_resolution_returns_existing_commit_without_duplicate_writes(
         )
 
 
-def test_late_narration_does_not_add_choices_after_later_turn(database: Engine) -> None:
+def test_narration_lease_rejects_old_owner_after_recovery(database: Engine) -> None:
     with database.begin() as connection:
         _seed_members_entities_and_scene(connection)
 
@@ -1933,21 +2196,186 @@ def test_late_narration_does_not_add_choices_after_later_turn(database: Engine) 
             ),
             {"turn": source.turn_id},
         )
-    _accept_from_database(database, _player_turn(request_id=REQUEST_B))
+    first = _acquire_narration_lease_from_database(database, source.turn_id)
+    with database.begin() as connection:
+        connection.execute(
+            text(
+                "UPDATE turns SET narration_lease_until=now()-interval '1 second' "
+                "WHERE id=:turn"
+            ),
+            {"turn": source.turn_id},
+        )
+    second = _acquire_narration_lease_from_database(database, source.turn_id)
 
+    assert second.worker_epoch == first.worker_epoch + 1
+    assert not _save_narration_from_database(
+        database,
+        source.turn_id,
+        (),
+        worker_epoch=first.worker_epoch,
+    )
+    assert _save_narration_from_database(
+        database,
+        source.turn_id,
+        (),
+        worker_epoch=second.worker_epoch,
+    )
+
+
+def test_narration_save_is_atomic_and_appends_event(database: Engine) -> None:
+    event_id = uuid4()
+    with database.begin() as connection:
+        _seed_members_entities_and_scene(connection)
+
+    source = _accept_from_database(database, _player_turn())
+    with database.begin() as connection:
+        connection.execute(
+            text(
+                "UPDATE turns SET resolution_status='committed',route='mechanical',"
+                "committed_state_version=0,committed_at=now() WHERE id=:turn"
+            ),
+            {"turn": source.turn_id},
+        )
+    lease = _acquire_narration_lease_from_database(database, source.turn_id)
     saved = _save_narration_from_database(
         database,
         source.turn_id,
-        (ChoiceDraft(UUID(CHOICE_C), 1, "遅い選択肢"),),
+        (ChoiceDraft(UUID(CHOICE_C), 1, "周囲を見回す"),),
+        worker_epoch=lease.worker_epoch,
+        event_id=event_id,
     )
 
     assert saved
     with database.connect() as connection:
-        assert connection.scalar(
-            text("SELECT narration_status FROM turns WHERE id=:turn"),
+        assert connection.execute(
+            text(
+                "SELECT narration_status,narration,narration_lease_until "
+                "FROM turns WHERE id=:turn"
+            ),
             {"turn": source.turn_id},
-        ) == "completed"
+        ).one() == ("completed", "遅れて届いた描写", None)
         assert connection.scalar(
             text("SELECT count(*) FROM turn_choices WHERE source_turn_id=:turn"),
             {"turn": source.turn_id},
+        ) == 1
+        event_row = connection.execute(
+            text(
+                "SELECT id,sequence,state_version,type,payload FROM events "
+                "WHERE turn_id=:turn"
+            ),
+            {"turn": source.turn_id},
+        ).mappings().one()
+        assert event_row["id"] == event_id
+        assert event_row["sequence"] == 1
+        assert event_row["state_version"] == 0
+        assert event_row["type"] == "GMNarrationGenerated"
+        assert event_row["payload"] == {
+            "fallback": False,
+            "narration": "遅れて届いた描写",
+        }
+        assert connection.scalar(
+            text("SELECT event_sequence FROM campaigns WHERE id=:campaign"),
+            {"campaign": CAMPAIGN_A},
+        ) == 1
+
+    assert not _save_narration_from_database(
+        database,
+        source.turn_id,
+        (),
+        worker_epoch=lease.worker_epoch,
+    )
+
+
+def test_not_applied_narration_choices_use_current_campaign_version(database: Engine) -> None:
+    with database.begin() as connection:
+        _seed_members_entities_and_scene(connection)
+
+    source = _accept_from_database(database, _player_turn())
+    with database.begin() as connection:
+        connection.execute(
+            text(
+                "UPDATE campaigns SET state_version=2 WHERE id=:campaign"
+            ),
+            {"campaign": CAMPAIGN_A},
+        )
+        connection.execute(
+            text(
+                "UPDATE turns SET resolution_status='not_applied',route='mechanical' "
+                "WHERE id=:turn"
+            ),
+            {"turn": source.turn_id},
+        )
+    lease = _acquire_narration_lease_from_database(database, source.turn_id)
+
+    assert _save_narration_from_database(
+        database,
+        source.turn_id,
+        (ChoiceDraft(UUID(CHOICE_C), 1, "言い換える"),),
+        worker_epoch=lease.worker_epoch,
+    )
+    with database.connect() as connection:
+        assert connection.scalar(
+            text("SELECT state_version FROM turn_choices WHERE id=:choice"),
+            {"choice": CHOICE_C},
+        ) == 2
+        assert connection.scalar(
+            text("SELECT state_version FROM events WHERE turn_id=:turn"),
+            {"turn": source.turn_id},
+        ) == 2
+
+
+def test_narration_save_rolls_back_status_choices_and_event(database: Engine) -> None:
+    with database.begin() as connection:
+        _seed_members_entities_and_scene(connection)
+
+    source = _accept_from_database(database, _player_turn())
+    with database.begin() as connection:
+        connection.execute(
+            text(
+                "UPDATE turns SET resolution_status='committed',route='mechanical',"
+                "committed_state_version=0,committed_at=now() WHERE id=:turn"
+            ),
+            {"turn": source.turn_id},
+        )
+    lease = _acquire_narration_lease_from_database(database, source.turn_id)
+
+    async def fail_save() -> None:
+        url = database.url.render_as_string(hide_password=False)
+        async with _postgres_sessions(url) as factory, factory() as session:
+            try:
+                await PostgresNarrationRepository(session).save_conditionally(
+                    UUID(CAMPAIGN_A),
+                    source.turn_id,
+                    lease.worker_epoch,
+                    "保存されない描写",
+                    (ChoiceDraft(UUID(CHOICE_C), 1, ""),),
+                )
+                await session.commit()
+            except BaseException:
+                await session.rollback()
+                raise
+
+    with pytest.raises(IntegrityError), asyncio.Runner(
+        loop_factory=asyncio.SelectorEventLoop
+    ) as runner:
+        runner.run(fail_save())
+
+    with database.connect() as connection:
+        assert connection.execute(
+            text(
+                "SELECT narration_status,narration FROM turns WHERE id=:turn"
+            ),
+            {"turn": source.turn_id},
+        ).one() == ("generating", None)
+        assert connection.scalar(
+            text("SELECT count(*) FROM turn_choices WHERE source_turn_id=:turn"),
+            {"turn": source.turn_id},
+        ) == 0
+        assert connection.scalar(
+            text("SELECT count(*) FROM events WHERE turn_id=:turn"),
+            {"turn": source.turn_id},
+        ) == 0
+        assert connection.scalar(
+            text("SELECT event_sequence FROM campaigns WHERE id=:campaign"),
+            {"campaign": CAMPAIGN_A},
         ) == 0
