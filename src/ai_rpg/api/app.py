@@ -1,10 +1,12 @@
 """FastAPI application factory。"""
 
 from collections.abc import Awaitable, Callable
+from pathlib import Path
 from typing import Annotated
 from uuid import UUID
 
 from fastapi import Depends, FastAPI, HTTPException, status
+from fastapi.responses import FileResponse
 
 from ai_rpg.application import (
     AuthenticatedPrincipal,
@@ -32,6 +34,7 @@ ApplicationError = (
     | TurnInProgressError
     | TurnNotFoundError
 )
+_PLAY_SCREEN = Path(__file__).with_name("static") / "index.html"
 
 
 async def _unconfigured_principal() -> AuthenticatedPrincipal:
@@ -81,6 +84,10 @@ def create_app(
             turn_query_service = TurnQueryService(authorization, unit_of_work_factory)
 
     app = FastAPI(title="AI RPG API", version="0.1.0")
+
+    @app.get("/", include_in_schema=False, response_class=FileResponse)
+    async def play_screen() -> FileResponse:
+        return FileResponse(_PLAY_SCREEN, media_type="text/html")
 
     @app.get("/health", tags=["運用"])
     async def health() -> dict[str, str]:

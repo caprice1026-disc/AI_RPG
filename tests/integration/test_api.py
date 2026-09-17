@@ -66,6 +66,23 @@ async def test_health_endpoint() -> None:
 
 @pytest.mark.integration
 @pytest.mark.asyncio
+async def test_play_screen_is_served_with_accessible_core_controls() -> None:
+    transport = ASGITransport(app=create_app())
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.get("/")
+
+    assert response.status_code == 200
+    assert response.headers["content-type"].startswith("text/html")
+    assert '<label for="campaign-id">Campaign ID</label>' in response.text
+    assert '<label for="actor-id">Actor ID</label>' in response.text
+    assert '<label for="action-text">行動を入力</label>' in response.text
+    assert 'id="send-action"' in response.text
+    assert 'role="status"' in response.text
+    assert "aria-live=\"polite\"" in response.text
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
 async def test_turn_endpoint_requires_configured_authenticator() -> None:
     transport = ASGITransport(app=create_app())
     async with AsyncClient(transport=transport, base_url="http://test") as client:

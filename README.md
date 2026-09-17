@@ -26,7 +26,7 @@ AI_RPGは、LLMにゲーム状態を直接変更させないAI TRPGバックエ�
 ```
 
 > [!IMPORTANT]
-> 現在は基盤機能を検証するMVPです。本番認証、SSE、プレイヤー向けUIはまだ接続していません。
+> 現在は基盤機能を検証するMVPです。開発用の最小プレイ画面は利用できますが、本番認証、攻撃・回復アイテムのAPI経路、SSEはまだ接続していません。
 
 ## 特徴
 
@@ -48,6 +48,7 @@ AI_RPGは、LLMにゲーム状態を直接変更させないAI TRPGバックエ�
 - Fake transportによる通常描写とMechanicalへの昇格
 - OpenAI Responses APIのStructured Outputs adapter（単発request・暗黙retryなし）
 - 完了済みTurnだけから組み立てる、公開範囲を限定した複数Turn Context
+- Campaign／Actorを指定してTurnを送信し、判定と描写を確認できる最小プレイ画面
 - PostgreSQL migrationとSQLAlchemy 2の型付きmodel／query
 - timeout、Schema不正、worker交代、予算切れ、deadline到達時の回収とfallback
 - state version競合、古いlease、二重確定、rollbackを含む実PostgreSQLテスト
@@ -86,7 +87,7 @@ flowchart LR
 .\.venv\Scripts\uv.exe build
 ```
 
-2026-09-17時点で、実PostgreSQLを指定した全スイートは`200 passed`です。
+2026-09-17時点で、実PostgreSQLを指定した全スイートは`201 passed`です。
 
 PostgreSQL統合テストには、名前が`ai_rpg_test`で始まる専用の空DBを指定します。fixtureは既存テーブルがあるDBを拒否します。
 Alembicは空DBだけでなく、既存revisionからheadへの更新もテストします。
@@ -156,6 +157,8 @@ $env:AIRPG_DATABASE_URL = "postgresql+psycopg://airpg:airpg@localhost/airpg"
 
 Turnを投入し、返された`turn_id`をGETすると進行状態と描写を確認できます。
 
+ブラウザでは`http://127.0.0.1:8000/`を開き、Campaign IDとActor IDを入力すれば同じ一往復を試せます。画面はGET pollingで終端状態まで追跡し、送信中の二重送信を防ぎます。開発用principalを指定せずAPIを起動した場合は401の案内を表示し、認証を暗黙に迂回しません。
+
 ```powershell
 $requestId = [guid]::NewGuid()
 $body = @{
@@ -198,9 +201,9 @@ API keyは実provider選択時だけ検証され、Fake実行には不要です�
 - [x] 公開範囲を限定した複数Turn Context
 - [x] OpenAI Responses API adapter
 - [ ] 本番認証adapter
-- [ ] 最小のプレイヤー向け画面
+- [x] 最小のプレイヤー向け画面
 - [ ] 攻撃・回復・アイテム使用のAPI経路
-- [ ] SSEとプレイヤー向けUI
+- [ ] SSEによるリアルタイム更新
 
 ## コントリビューション
 

@@ -59,10 +59,10 @@
 
 **作成・変更:** `src/ai_rpg/api/static/index.html`、`src/ai_rpg/api/app.py`、`tests/integration/test_api.py`、`README.md`
 
-- [ ] 単一画面でCampaign/Actor入力、Turn送信、GET polling、状態・判定・描写・再試行案内を表示するブラウザ試験をREDにする。
-- [ ] FastAPIから依存追加なしのHTML/CSS/JavaScriptを配信し、送信中の二重送信を防ぎ、終端状態までpollする。
-- [ ] label、focus、status live region、keyboard操作、狭い画面を最低限満たす。
-- [ ] 本番認証未接続時は401を表示し、dev principalの有効化は明示的な開発設定に限定する。
+- [x] 単一画面でCampaign/Actor入力、Turn送信、GET polling、状態・判定・描写・再試行案内を表示するブラウザ試験をREDにする。
+- [x] FastAPIから依存追加なしのHTML/CSS/JavaScriptを配信し、送信中の二重送信を防ぎ、終端状態までpollする。
+- [x] label、focus、status live region、keyboard操作、狭い画面を最低限満たす。
+- [x] 本番認証未接続時は401を表示し、dev principalの有効化は明示的な開発設定に限定する。
 
 ## チェックポイント6: 攻撃・回復item、その後SSE
 
@@ -91,5 +91,5 @@
 | 2 独立Fake process | 完了 | 完了 | 実process受入を含む`179 passed`（2026-09-17） |
 | 3 複数Turn Context | 完了 | 完了 | 公開履歴・確認回答を含む`184 passed`（2026-09-17） |
 | 4 OpenAI adapter | 完了 | 完了 | HTTP contract・拒否・事実逸脱を含む`200 passed`（2026-09-17） |
-| 5 最小プレイ画面 | 未着手 | 未着手 | - |
+| 5 最小プレイ画面 | 完了 | 完了 | `201 passed`、実browserで送信・終端・401・390px表示を確認（2026-09-17） |
 | 6 攻撃・回復item・SSE | 未着手 | 未着手 | - |
