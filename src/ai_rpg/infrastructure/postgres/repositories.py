@@ -5,7 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 from collections.abc import Callable, Mapping, Sequence
-from datetime import UTC, datetime
+from typing import Literal
 from uuid import UUID, uuid4
 
 from sqlalchemy import RowMapping, exists, or_, select, text
@@ -21,6 +21,7 @@ from ai_rpg.application.ports.repositories import (
     ChoiceDraft,
     ChoiceNotAvailableError,
     CommitBundle,
+    FailureDisposition,
     IdempotencyConflictError,
     InvalidCommitBundleError,
     Lease,
@@ -28,6 +29,9 @@ from ai_rpg.application.ports.repositories import (
     LLMPhase,
     NarrationLease,
     NarrationRepository,
+    NarrationWorkItem,
+    NarrativeCommit,
+    ResolutionWorkItem,
     StateVersionConflictError,
     TurnInProgressError,
     TurnRepository,
@@ -40,7 +44,11 @@ from ai_rpg.application.resolution import (
     project_resolution,
 )
 from ai_rpg.contracts import PlayerTurnInput, TurnResponse
-from ai_rpg.contracts.responses import TurnRecovery
+from ai_rpg.contracts.responses import (
+    MechanicalNarrationInput,
+    RecoveryReason,
+    TurnRecovery,
+)
 from ai_rpg.domain.commands import AttackCommand, UseItemCommand
 from ai_rpg.domain.events import NarrationGeneratedPayload
 from ai_rpg.infrastructure.postgres.models import (
@@ -49,6 +57,7 @@ from ai_rpg.infrastructure.postgres.models import (
     EntityModel,
     MvpCharacterModel,
     MvpInventoryModel,
+    MvpSceneSkillCheckModel,
     MvpSkillModifierModel,
     MvpWeaponModel,
     SceneModel,
@@ -103,6 +112,22 @@ def _pending_response(turn: TurnRow) -> TurnResponse:
         action_results=[],
         recovery=TurnRecovery(fallback=False, reason=None),
     )
+
+
+_PUBLIC_RECOVERY_REASONS: dict[str, RecoveryReason] = {
+    "MODEL_TIMEOUT": "MODEL_TIMEOUT",
+    "INVALID_OUTPUT": "INVALID_OUTPUT",
+    "MODEL_REFUSAL": "MODEL_REFUSAL",
+    "INJECTION_DETECTED": "INJECTION_DETECTED",
+    "CONTEXT_CONFLICT": "CONTEXT_CONFLICT",
+    "UNKNOWN": "UNKNOWN",
+}
+
+
+def _public_recovery_reason(value: object) -> RecoveryReason | None:
+    if value is None:
+        return None
+    return _PUBLIC_RECOVERY_REASONS.get(str(value), "UNKNOWN")
 
 
 async def _validate_canonical_mutations(
@@ -162,6 +187,73 @@ async def _validate_canonical_mutations(
                 raise InvalidCommitBundleError("Canonical在庫更新値が不正です")
 
 
+async def _lock_actor_authorization(
+    session: AsyncSession,
+    campaign_id: UUID,
+    principal_id: UUID,
+    actor_id: UUID,
+) -> bool:
+    authorized = (
+        await session.execute(
+            select(CampaignMemberModel.principal_id)
+            .join(
+                EntityModel,
+                EntityModel.campaign_id == CampaignMemberModel.campaign_id,
+            )
+            .join(
+                CampaignModel,
+                CampaignModel.id == CampaignMemberModel.campaign_id,
+            )
+            .where(
+                CampaignModel.id == campaign_id,
+                CampaignModel.status == "active",
+                CampaignMemberModel.principal_id == principal_id,
+                CampaignMemberModel.active.is_(True),
+                EntityModel.id == actor_id,
+                EntityModel.kind.in_(("pc", "npc")),
+                EntityModel.controller_id == principal_id,
+                EntityModel.archived_at.is_(None),
+            )
+            .with_for_update(of=(CampaignMemberModel, EntityModel))
+        )
+    ).one_or_none()
+    return authorized is not None
+
+
+async def _assert_turn_actor_authorized(
+    session: AsyncSession,
+    turn: RowMapping,
+) -> None:
+    if not await _lock_actor_authorization(
+        session,
+        turn["campaign_id"],
+        turn["created_by"],
+        turn["actor_id"],
+    ):
+        raise AuthorizationError("actorを操作する権限が失効しています")
+
+
+async def _assert_resolution_lease_current(
+    session: AsyncSession,
+    turn_id: UUID,
+    worker_epoch: int,
+) -> None:
+    valid = await session.scalar(
+        text(
+            """
+            SELECT lease_until>clock_timestamp()
+            FROM turns
+            WHERE id=:turn
+              AND worker_epoch=:epoch
+              AND resolution_status='resolving'
+            """
+        ),
+        {"turn": turn_id, "epoch": worker_epoch},
+    )
+    if valid is not True:
+        raise RuntimeError("worker leaseが無効です")
+
+
 class PostgresTurnRepository:
     def __init__(
         self,
@@ -213,73 +305,87 @@ class PostgresTurnRepository:
         return bool(result.scalar_one())
 
     async def _replay(self, existing: RowMapping, turn: PlayerTurnInput) -> TurnResponse:
-        existing = (
-            await self._session.execute(
-                text(
-                    """
-                    SELECT t.*,
-                           COALESCE((
-                               SELECT jsonb_agg(
-                                   jsonb_build_object('id', c.id, 'label', c.label)
-                                   ORDER BY c.ordinal
-                               )
-                               FROM turn_choices AS c
-                               WHERE c.source_turn_id=t.id AND c.invalidated_at IS NULL
-                           ), '[]'::jsonb) AS replay_choices,
-                           COALESCE((
-                               SELECT jsonb_agg(
-                                   jsonb_build_object(
-                                       'id', a.id,
-                                       'ordinal', a.ordinal,
-                                       'result', a.result
-                                   )
-                                   ORDER BY a.ordinal
-                               )
-                               FROM actions AS a
-                               WHERE a.turn_id=t.id
-                           ), '[]'::jsonb) AS replay_actions
-                    FROM turns AS t
-                    WHERE t.id=:turn
-                    """
-                ),
-                {"turn": existing["id"]},
-            )
-        ).mappings().one()
+        response_row = await self._response_row(existing["campaign_id"], existing["id"])
+        assert response_row is not None
         digest = request_hash(
-            int(existing["input_schema_version"]),
-            existing["campaign_id"],
-            existing["scene_id"],
-            existing["created_by"],
+            int(response_row["input_schema_version"]),
+            response_row["campaign_id"],
+            response_row["scene_id"],
+            response_row["created_by"],
             turn,
         )
-        if existing["input_payload"] != turn.model_dump(mode="json") or bytes(
-            existing["request_hash"]
+        if response_row["input_payload"] != turn.model_dump(mode="json") or bytes(
+            response_row["request_hash"]
         ) != digest:
             raise IdempotencyConflictError("同じrequest_idに異なる入力は使用できません")
+        return self._to_response(response_row)
 
+    @staticmethod
+    def _to_response(row: RowMapping) -> TurnResponse:
         return TurnResponse.model_validate(
             {
-                "turn_id": existing["id"],
-                "route": existing["route"],
-                "resolution_status": existing["resolution_status"],
-                "narration_status": existing["narration_status"],
-                "committed_state_version": existing["committed_state_version"],
-                "narration": existing["narration"],
-                "choices": existing["replay_choices"],
+                "turn_id": row["id"],
+                "route": row["route"],
+                "resolution_status": row["resolution_status"],
+                "narration_status": row["narration_status"],
+                "committed_state_version": row["committed_state_version"],
+                "narration": row["narration"],
+                "choices": row["replay_choices"],
                 "action_results": [
                     {
-                        "action_id": row["id"],
-                        "ordinal": row["ordinal"],
-                        "result": row["result"],
+                        "action_id": action["id"],
+                        "ordinal": action["ordinal"],
+                        "result": action["result"],
                     }
-                    for row in existing["replay_actions"]
+                    for action in row["replay_actions"]
                 ],
                 "recovery": {
-                    "fallback": existing["narration_status"] == "fallback",
-                    "reason": existing["recovery_reason"],
+                    "fallback": row["narration_status"] == "fallback",
+                    "reason": _public_recovery_reason(row["recovery_reason"]),
                 },
             }
         )
+
+    async def _response_row(
+        self, campaign_id: UUID, turn_id: UUID
+    ) -> RowMapping | None:
+        result = await self._session.execute(
+            text(
+                """
+                SELECT t.*,
+                       COALESCE((
+                           SELECT jsonb_agg(
+                               jsonb_build_object('id', c.id, 'label', c.label)
+                               ORDER BY c.ordinal
+                           )
+                           FROM turn_choices AS c
+                           WHERE c.source_turn_id=t.id AND c.invalidated_at IS NULL
+                       ), '[]'::jsonb) AS replay_choices,
+                       COALESCE((
+                           SELECT jsonb_agg(
+                               jsonb_build_object(
+                                   'id', a.id,
+                                   'ordinal', a.ordinal,
+                                   'result', a.result
+                               )
+                               ORDER BY a.ordinal
+                           )
+                           FROM actions AS a
+                           WHERE a.turn_id=t.id
+                       ), '[]'::jsonb) AS replay_actions
+                FROM turns AS t
+                WHERE t.id=:turn AND t.campaign_id=:campaign
+                """
+            ),
+            {"turn": turn_id, "campaign": campaign_id},
+        )
+        return result.mappings().one_or_none()
+
+    async def get_response(
+        self, campaign_id: UUID, turn_id: UUID
+    ) -> TurnResponse | None:
+        row = await self._response_row(campaign_id, turn_id)
+        return None if row is None else self._to_response(row)
 
     async def _request_row(
         self, campaign_id: UUID, principal_id: UUID, request_id: UUID
@@ -322,21 +428,12 @@ class PostgresTurnRepository:
             return None
         if campaign["status"] != "active":
             raise AuthorizationError("停止中のCampaignへTurnは追加できません")
-        actor_allowed = await self._session.execute(
-            select(
-                exists().where(
-                    EntityModel.campaign_id == campaign_id,
-                    EntityModel.id == turn.actor_id,
-                    EntityModel.kind.in_(("pc", "npc")),
-                    EntityModel.controller_id == principal_id,
-                    EntityModel.archived_at.is_(None),
-                    CampaignMemberModel.campaign_id == EntityModel.campaign_id,
-                    CampaignMemberModel.principal_id == principal_id,
-                    CampaignMemberModel.active.is_(True),
-                )
-            )
-        )
-        if not actor_allowed.scalar_one():
+        if not await _lock_actor_authorization(
+            self._session,
+            campaign_id,
+            principal_id,
+            turn.actor_id,
+        ):
             raise AuthorizationError("actorを操作する権限がありません")
         open_turn = await self._session.execute(
             select(TurnModel.id).where(
@@ -429,7 +526,7 @@ class PostgresTurnRepository:
 
     async def acquire_lease(
         self,
-        turn_id: UUID,
+        turn_id: UUID | None,
         *,
         lease_seconds: int,
         max_attempts: int,
@@ -438,31 +535,55 @@ class PostgresTurnRepository:
         result = await self._session.execute(
             text(
                 """
-                UPDATE turns
+                WITH candidate AS (
+                    SELECT id,
+                           resolution_started_at IS NOT NULL
+                           AND (
+                               resolution_attempt_count>=:max_attempts
+                               OR resolution_deadline<=clock_timestamp()
+                           ) AS terminal_cleanup
+                    FROM turns
+                    WHERE (CAST(:id AS uuid) IS NULL OR id=CAST(:id AS uuid))
+                      AND resolution_status IN ('pending','resolving')
+                      AND (resolution_status='pending' OR lease_until<clock_timestamp())
+                      AND (
+                          (
+                              resolution_attempt_count<:max_attempts
+                              AND (
+                                  resolution_deadline IS NULL
+                                  OR resolution_deadline>clock_timestamp()
+                              )
+                              AND (
+                                  resolution_next_attempt_at IS NULL
+                                  OR resolution_next_attempt_at<=clock_timestamp()
+                              )
+                          )
+                          OR (
+                              resolution_started_at IS NOT NULL
+                              AND (
+                                  resolution_attempt_count>=:max_attempts
+                                  OR resolution_deadline<=clock_timestamp()
+                              )
+                          )
+                      )
+                    ORDER BY created_at,id
+                    LIMIT 1
+                    FOR UPDATE SKIP LOCKED
+                )
+                UPDATE turns AS target
                 SET resolution_status='resolving',
                     worker_epoch=worker_epoch+1,
-                    lease_until=now()+make_interval(secs=>:lease_seconds),
-                    resolution_attempt_count=resolution_attempt_count+1,
+                    lease_until=clock_timestamp()+make_interval(secs=>:lease_seconds),
+                    resolution_attempt_count=resolution_attempt_count
+                        + CASE WHEN candidate.terminal_cleanup THEN 0 ELSE 1 END,
                     resolution_started_at=COALESCE(resolution_started_at,now()),
                     resolution_deadline=COALESCE(
                         resolution_deadline,
-                        now()+make_interval(secs=>:deadline_seconds)
+                        clock_timestamp()+make_interval(secs=>:deadline_seconds)
                     )
-                WHERE id=(
-                    SELECT id
-                    FROM turns
-                    WHERE id=:id
-                      AND resolution_status IN ('pending','resolving')
-                      AND (resolution_status='pending' OR lease_until<now())
-                      AND resolution_attempt_count<:max_attempts
-                      AND (resolution_deadline IS NULL OR resolution_deadline>now())
-                      AND (
-                          resolution_next_attempt_at IS NULL
-                          OR resolution_next_attempt_at<=now()
-                      )
-                    FOR UPDATE SKIP LOCKED
-                )
-                RETURNING *
+                FROM candidate
+                WHERE target.id=candidate.id
+                RETURNING target.*,candidate.terminal_cleanup
                 """
             ),
             {
@@ -473,7 +594,162 @@ class PostgresTurnRepository:
             },
         )
         row = result.mappings().one_or_none()
-        return None if row is None else Lease(_turn(row), row["lease_until"])
+        return (
+            None
+            if row is None
+            else Lease(
+                _turn(row),
+                row["lease_until"],
+                terminal_cleanup=bool(row["terminal_cleanup"]),
+            )
+        )
+
+    async def get_resolution_work(
+        self, turn_id: UUID, worker_epoch: int
+    ) -> ResolutionWorkItem | None:
+        row = (
+            await self._session.execute(
+                text(
+                    """
+                    SELECT
+                        t.id,
+                        t.campaign_id,
+                        t.scene_id,
+                        t.created_by,
+                        t.actor_id,
+                        EXISTS(
+                            SELECT 1
+                            FROM campaigns AS campaign
+                            JOIN campaign_members AS member
+                              ON member.campaign_id=t.campaign_id
+                             AND member.principal_id=t.created_by
+                            JOIN entities AS actor
+                              ON actor.campaign_id=t.campaign_id
+                             AND actor.id=t.actor_id
+                            WHERE campaign.id=t.campaign_id
+                              AND campaign.status='active'
+                              AND member.active
+                              AND actor.kind IN ('pc','npc')
+                              AND actor.controller_id=t.created_by
+                              AND actor.archived_at IS NULL
+                        ) AS actor_authorized,
+                        t.worker_epoch,
+                        t.max_actions,
+                        t.expected_state_version,
+                        t.route,
+                        COALESCE(t.input_text,c.label) AS player_text
+                    FROM turns AS t
+                    LEFT JOIN turn_choices AS c ON c.id=t.selected_choice_id
+                    WHERE t.id=:turn
+                      AND t.worker_epoch=:epoch
+                      AND t.resolution_status='resolving'
+                      AND t.lease_until>clock_timestamp()
+                    """
+                ),
+                {"turn": turn_id, "epoch": worker_epoch},
+            )
+        ).mappings().one_or_none()
+        if row is None:
+            return None
+        return ResolutionWorkItem(
+            turn_id=row["id"],
+            campaign_id=row["campaign_id"],
+            scene_id=row["scene_id"],
+            principal_id=row["created_by"],
+            actor_id=row["actor_id"],
+            actor_authorized=bool(row["actor_authorized"]),
+            worker_epoch=int(row["worker_epoch"]),
+            max_actions=int(row["max_actions"]),
+            expected_state_version=int(row["expected_state_version"]),
+            player_text=str(row["player_text"]),
+            route=row["route"],
+        )
+
+    async def record_initial_route(
+        self,
+        turn_id: UUID,
+        worker_epoch: int,
+        route: Literal["narrative", "mechanical"],
+        rule_version: str,
+        reason_codes: Sequence[str],
+    ) -> bool:
+        result = await self._session.execute(
+            text(
+                """
+                UPDATE turns
+                SET route=COALESCE(route,:route),
+                    initial_route=COALESCE(initial_route,:route),
+                    routing_rule_version=COALESCE(routing_rule_version,:version),
+                    routing_reason_codes=COALESCE(
+                        routing_reason_codes,
+                        CAST(:reasons AS jsonb)
+                    )
+                WHERE id=:turn
+                  AND worker_epoch=:epoch
+                  AND resolution_status='resolving'
+                  AND lease_until>clock_timestamp()
+                  AND (
+                      initial_route IS NULL
+                      OR (
+                          initial_route=:route
+                          AND routing_rule_version=:version
+                          AND routing_reason_codes=CAST(:reasons AS jsonb)
+                      )
+                  )
+                RETURNING id
+                """
+            ),
+            {
+                "turn": turn_id,
+                "epoch": worker_epoch,
+                "route": route,
+                "version": rule_version,
+                "reasons": _json(list(reason_codes)),
+            },
+        )
+        return result.scalar_one_or_none() is not None
+
+    async def promote_to_mechanical(self, turn_id: UUID, worker_epoch: int) -> bool:
+        result = await self._session.execute(
+            sql_update(TurnModel)
+            .where(
+                TurnModel.id == turn_id,
+                TurnModel.worker_epoch == worker_epoch,
+                TurnModel.resolution_status == "resolving",
+                TurnModel.lease_until > text("clock_timestamp()"),
+                TurnModel.route == "narrative",
+            )
+            .values(route="mechanical")
+            .returning(TurnModel.id)
+        )
+        return result.scalar_one_or_none() is not None
+
+    async def finalize_not_applied(self, turn_id: UUID, worker_epoch: int) -> bool:
+        campaign_id = await self._session.scalar(
+            select(TurnModel.campaign_id).where(TurnModel.id == turn_id)
+        )
+        if campaign_id is None:
+            return False
+        await self._session.execute(
+            select(CampaignModel.id)
+            .where(CampaignModel.id == campaign_id)
+            .with_for_update()
+        )
+        result = await self._session.execute(
+            sql_update(TurnModel)
+            .where(
+                TurnModel.id == turn_id,
+                TurnModel.worker_epoch == worker_epoch,
+                TurnModel.resolution_status == "resolving",
+                TurnModel.lease_until > text("clock_timestamp()"),
+            )
+            .values(
+                resolution_status="not_applied",
+                lease_until=None,
+            )
+            .returning(TurnModel.id)
+        )
+        return result.scalar_one_or_none() is not None
 
     async def commit_resolution(self, bundle: CommitBundle) -> int:
         # デッドロックを避ける不変順序: Campaign、Turn。
@@ -497,7 +773,10 @@ class PostgresTurnRepository:
         turn = (
             (
                 await self._session.execute(
-                    text("SELECT * FROM turns WHERE id=:t AND campaign_id=:c FOR UPDATE"),
+                    text(
+                        "SELECT * FROM turns "
+                        "WHERE id=:t AND campaign_id=:c FOR UPDATE"
+                    ),
                     {"t": bundle.turn_id, "c": bundle.campaign_id},
                 )
             )
@@ -509,10 +788,11 @@ class PostgresTurnRepository:
         if (
             turn["resolution_status"] != "resolving"
             or int(turn["worker_epoch"]) != bundle.worker_epoch
-            or turn["lease_until"] <= datetime.now(UTC)
-            or int(campaign["state_version"]) != bundle.base_state_version
         ):
-            raise RuntimeError("worker leaseまたはCanonical versionが無効です")
+            raise RuntimeError("worker leaseが無効です")
+        await _assert_turn_actor_authorized(self._session, turn)
+        if int(campaign["state_version"]) != bundle.base_state_version:
+            raise StateVersionConflictError("Canonical versionが更新されています")
         first = int(campaign["event_sequence"]) + 1
         projection = project_resolution(
             bundle,
@@ -528,6 +808,9 @@ class PostgresTurnRepository:
             self._session,
             bundle.campaign_id,
             projection.canonical_mutations,
+        )
+        await _assert_resolution_lease_current(
+            self._session, bundle.turn_id, bundle.worker_epoch
         )
         for mutation in projection.canonical_mutations:
             if isinstance(mutation, CharacterHpMutation):
@@ -671,6 +954,118 @@ class PostgresTurnRepository:
             )
         return version
 
+    async def commit_narrative(self, commit: NarrativeCommit) -> int:
+        campaign = (
+            await self._session.execute(
+                text(
+                    "SELECT state_version,event_sequence FROM campaigns "
+                    "WHERE id=:campaign FOR UPDATE"
+                ),
+                {"campaign": commit.campaign_id},
+            )
+        ).mappings().one()
+        turn = (
+            await self._session.execute(
+                text(
+                    "SELECT * FROM turns "
+                    "WHERE id=:turn AND campaign_id=:campaign FOR UPDATE"
+                ),
+                {"turn": commit.turn_id, "campaign": commit.campaign_id},
+            )
+        ).mappings().one()
+        if (
+            turn["resolution_status"] == "committed"
+            and turn["narration_status"] == "completed"
+        ):
+            return int(turn["committed_state_version"])
+        if (
+            turn["resolution_status"] != "resolving"
+            or turn["route"] != "narrative"
+            or int(turn["worker_epoch"]) != commit.worker_epoch
+        ):
+            raise RuntimeError("worker leaseが無効です")
+        await _assert_turn_actor_authorized(self._session, turn)
+        if int(campaign["state_version"]) != commit.base_state_version:
+            raise StateVersionConflictError("Canonical versionが更新されています")
+        await _assert_resolution_lease_current(
+            self._session, commit.turn_id, commit.worker_epoch
+        )
+
+        version = int(campaign["state_version"])
+        sequence = int(campaign["event_sequence"]) + 1
+        await self._session.execute(
+            text(
+                "UPDATE campaigns SET event_sequence=:sequence WHERE id=:campaign"
+            ),
+            {"sequence": sequence, "campaign": commit.campaign_id},
+        )
+        await self._session.execute(
+            text(
+                """
+                UPDATE turns
+                SET resolution_status='committed',
+                    narration_status='completed',
+                    committed_state_version=:version,
+                    committed_at=now(),
+                    narration=:narration,
+                    lease_until=NULL
+                WHERE id=:turn
+                """
+            ),
+            {
+                "version": version,
+                "narration": commit.narration,
+                "turn": commit.turn_id,
+            },
+        )
+        for choice in commit.choices:
+            await self._session.execute(
+                text(
+                    """
+                    INSERT INTO turn_choices(
+                        id,campaign_id,scene_id,source_turn_id,actor_id,
+                        ordinal,label,state_version
+                    )
+                    VALUES(:id,:campaign,:scene,:turn,:actor,:ordinal,:label,:version)
+                    """
+                ),
+                {
+                    "id": choice.id,
+                    "campaign": commit.campaign_id,
+                    "scene": commit.scene_id,
+                    "turn": commit.turn_id,
+                    "actor": turn["actor_id"],
+                    "ordinal": choice.ordinal,
+                    "label": choice.label,
+                    "version": version,
+                },
+            )
+        payload = NarrationGeneratedPayload(narration=commit.narration, fallback=False)
+        await self._session.execute(
+            text(
+                """
+                INSERT INTO events(
+                    id,campaign_id,scene_id,turn_id,action_id,
+                    sequence,state_version,type,schema_version,payload
+                )
+                VALUES(
+                    :id,:campaign,:scene,:turn,NULL,
+                    :sequence,:version,'GMNarrationGenerated',1,CAST(:payload AS jsonb)
+                )
+                """
+            ),
+            {
+                "id": self._event_id_factory(),
+                "campaign": commit.campaign_id,
+                "scene": commit.scene_id,
+                "turn": commit.turn_id,
+                "sequence": sequence,
+                "version": version,
+                "payload": _json(payload.model_dump(mode="json")),
+            },
+        )
+        return version
+
 
 class PostgresCanonicalRepository:
     def __init__(self, session: AsyncSession) -> None:
@@ -699,6 +1094,7 @@ class PostgresCanonicalRepository:
             await rows(MvpSkillModifierModel.__table__),
             await rows(MvpWeaponModel.__table__),
             await rows(MvpInventoryModel.__table__),
+            await rows(MvpSceneSkillCheckModel.__table__),
         )
 
     async def update_with_campaign_lock(
@@ -739,11 +1135,14 @@ class PostgresLLMCallRepository:
         ownership = {
             "resolution": (
                 "resolution_status='resolving' "
-                "AND worker_epoch=:epoch AND lease_until>now()"
+                "AND worker_epoch=:epoch AND lease_until>clock_timestamp() "
+                "AND resolution_deadline>clock_timestamp()"
             ),
             "narration": (
                 "narration_status='generating' "
-                "AND narration_worker_epoch=:epoch AND narration_lease_until>now()"
+                "AND narration_worker_epoch=:epoch "
+                "AND narration_lease_until>clock_timestamp() "
+                "AND narration_deadline>clock_timestamp()"
             ),
         }.get(phase)
         if ownership is None:
@@ -764,6 +1163,115 @@ class PostgresLLMCallRepository:
         )
         return result.scalar_one_or_none() is not None
 
+    async def record_failure(
+        self,
+        turn_id: UUID,
+        *,
+        phase: LLMPhase,
+        worker_epoch: int,
+        failure_code: str,
+        max_attempts: int,
+    ) -> FailureDisposition | None:
+        campaign_id = await self._session.scalar(
+            select(TurnModel.campaign_id).where(TurnModel.id == turn_id)
+        )
+        if campaign_id is None:
+            return None
+        await self._session.execute(
+            select(CampaignModel.id)
+            .where(CampaignModel.id == campaign_id)
+            .with_for_update()
+        )
+        if phase == "resolution":
+            ownership = (
+                "resolution_status='resolving' "
+                "AND worker_epoch=:epoch AND lease_until>clock_timestamp()"
+            )
+            attempts = "resolution_attempt_count"
+            deadline = "resolution_deadline"
+        elif phase == "narration":
+            ownership = (
+                "narration_status='generating' "
+                "AND narration_worker_epoch=:epoch "
+                "AND narration_lease_until>clock_timestamp()"
+            )
+            attempts = "narration_attempt_count"
+            deadline = "narration_deadline"
+        else:
+            raise ValueError(f"未対応のLLM phaseです: {phase}")
+
+        row = (
+            await self._session.execute(
+                text(
+                    f"""
+                    SELECT
+                        ({attempts}<:max_attempts
+                         AND {deadline}>clock_timestamp()
+                         AND llm_call_count<llm_call_budget
+                         AND (route IS DISTINCT FROM 'narrative' OR llm_call_count<1)
+                        ) AS retry
+                    FROM turns
+                    WHERE id=:turn AND {ownership}
+                    FOR UPDATE
+                    """
+                ),
+                {
+                    "turn": turn_id,
+                    "epoch": worker_epoch,
+                    "max_attempts": max_attempts,
+                },
+            )
+        ).mappings().one_or_none()
+        if row is None:
+            return None
+        retry = bool(row["retry"])
+        if phase == "resolution":
+            await self._session.execute(
+                text(
+                    """
+                    UPDATE turns
+                    SET resolution_status=:status,
+                        lease_until=NULL,
+                        resolution_next_attempt_at=CASE
+                            WHEN :retry THEN clock_timestamp() ELSE NULL
+                        END,
+                        resolution_failure_code=:code
+                    WHERE id=:turn AND worker_epoch=:epoch
+                    """
+                ),
+                {
+                    "status": "pending" if retry else "failed",
+                    "retry": retry,
+                    "code": failure_code,
+                    "turn": turn_id,
+                    "epoch": worker_epoch,
+                },
+            )
+        else:
+            await self._session.execute(
+                text(
+                    """
+                    UPDATE turns
+                    SET narration_status=CASE WHEN :retry THEN 'pending' ELSE 'generating' END,
+                        narration_lease_until=CASE
+                            WHEN :retry THEN NULL ELSE narration_lease_until
+                        END,
+                        narration_next_attempt_at=CASE
+                            WHEN :retry THEN clock_timestamp() ELSE NULL
+                        END,
+                        narration_failure_code=:code
+                    WHERE id=:turn AND narration_worker_epoch=:epoch
+                    """
+                ),
+                {
+                    "retry": retry,
+                    "code": failure_code,
+                    "turn": turn_id,
+                    "epoch": worker_epoch,
+                },
+            )
+        return "retry" if retry else "terminal"
+
 
 class PostgresNarrationRepository:
     def __init__(
@@ -776,7 +1284,7 @@ class PostgresNarrationRepository:
 
     async def acquire_lease(
         self,
-        turn_id: UUID,
+        turn_id: UUID | None,
         *,
         lease_seconds: int,
         max_attempts: int,
@@ -785,35 +1293,64 @@ class PostgresNarrationRepository:
         result = await self._session.execute(
             text(
                 """
-                UPDATE turns
-                SET narration_status='generating',
-                    narration_worker_epoch=narration_worker_epoch+1,
-                    narration_lease_until=now()+make_interval(secs=>:lease_seconds),
-                    narration_attempt_count=narration_attempt_count+1,
-                    narration_started_at=COALESCE(narration_started_at,now()),
-                    narration_deadline=COALESCE(
-                        narration_deadline,
-                        now()+make_interval(secs=>:deadline_seconds)
-                    )
-                WHERE id=(
-                    SELECT id
+                WITH candidate AS (
+                    SELECT id,
+                           narration_started_at IS NOT NULL
+                           AND (
+                               narration_attempt_count>=:max_attempts
+                               OR narration_deadline<=clock_timestamp()
+                           ) AS terminal_cleanup
                     FROM turns
-                    WHERE id=:id
+                    WHERE (CAST(:id AS uuid) IS NULL OR id=CAST(:id AS uuid))
                       AND resolution_status IN ('committed','not_applied','failed')
                       AND narration_status IN ('pending','generating')
                       AND (
                           narration_status='pending'
-                          OR narration_lease_until<now()
+                          OR narration_lease_until<clock_timestamp()
                       )
-                      AND narration_attempt_count<:max_attempts
-                      AND (narration_deadline IS NULL OR narration_deadline>now())
                       AND (
-                          narration_next_attempt_at IS NULL
-                          OR narration_next_attempt_at<=now()
+                          (
+                              narration_attempt_count<:max_attempts
+                              AND (
+                                  narration_deadline IS NULL
+                                  OR narration_deadline>clock_timestamp()
+                              )
+                              AND (
+                                  narration_next_attempt_at IS NULL
+                                  OR narration_next_attempt_at<=clock_timestamp()
+                              )
+                          )
+                          OR (
+                              narration_started_at IS NOT NULL
+                              AND (
+                                  narration_attempt_count>=:max_attempts
+                                  OR narration_deadline<=clock_timestamp()
+                              )
+                          )
                       )
+                    ORDER BY created_at,id
+                    LIMIT 1
                     FOR UPDATE SKIP LOCKED
                 )
-                RETURNING id,campaign_id,narration_worker_epoch,narration_lease_until
+                UPDATE turns AS target
+                SET narration_status='generating',
+                    narration_worker_epoch=narration_worker_epoch+1,
+                    narration_lease_until=clock_timestamp()+make_interval(secs=>:lease_seconds),
+                    narration_attempt_count=narration_attempt_count
+                        + CASE WHEN candidate.terminal_cleanup THEN 0 ELSE 1 END,
+                    narration_started_at=COALESCE(narration_started_at,now()),
+                    narration_deadline=COALESCE(
+                        narration_deadline,
+                        clock_timestamp()+make_interval(secs=>:deadline_seconds)
+                    )
+                FROM candidate
+                WHERE target.id=candidate.id
+                RETURNING
+                    target.id,
+                    target.campaign_id,
+                    target.narration_worker_epoch,
+                    target.narration_lease_until,
+                    candidate.terminal_cleanup
                 """
             ),
             {
@@ -831,6 +1368,38 @@ class PostgresNarrationRepository:
             campaign_id=row["campaign_id"],
             worker_epoch=int(row["narration_worker_epoch"]),
             lease_until=row["narration_lease_until"],
+            terminal_cleanup=bool(row["terminal_cleanup"]),
+        )
+
+    async def get_work(
+        self, turn_id: UUID, worker_epoch: int
+    ) -> NarrationWorkItem | None:
+        row = (
+            await self._session.execute(
+                select(
+                    TurnModel.id,
+                    TurnModel.campaign_id,
+                    TurnModel.narration_worker_epoch,
+                    TurnModel.narration_input,
+                ).where(
+                    TurnModel.id == turn_id,
+                    TurnModel.narration_worker_epoch == worker_epoch,
+                    TurnModel.narration_status == "generating",
+                    TurnModel.narration_lease_until > text("clock_timestamp()"),
+                )
+            )
+        ).mappings().one_or_none()
+        if row is None:
+            return None
+        return NarrationWorkItem(
+            turn_id=row["id"],
+            campaign_id=row["campaign_id"],
+            worker_epoch=int(row["narration_worker_epoch"]),
+            narration_input=(
+                None
+                if row["narration_input"] is None
+                else MechanicalNarrationInput.model_validate(row["narration_input"])
+            ),
         )
 
     async def save_conditionally(
@@ -865,7 +1434,7 @@ class PostgresNarrationRepository:
                   AND campaign_id=:c
                   AND narration_worker_epoch=:epoch
                   AND narration_status='generating'
-                  AND narration_lease_until>now()
+                  AND narration_lease_until>clock_timestamp()
                 RETURNING scene_id,actor_id,committed_state_version
                 """
             ),

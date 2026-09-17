@@ -133,6 +133,9 @@ class TurnModel(Base):
     expected_state_version: Mapped[int] = mapped_column(BigInteger, nullable=False)
     committed_state_version: Mapped[int | None] = mapped_column(BigInteger)
     route: Mapped[str | None] = mapped_column(Text)
+    initial_route: Mapped[str | None] = mapped_column(Text)
+    routing_rule_version: Mapped[str | None] = mapped_column(Text)
+    routing_reason_codes: Mapped[list[str] | None] = mapped_column(JSONB)
     resolution_status: Mapped[str] = mapped_column(
         Text, nullable=False, server_default=text("'pending'")
     )
@@ -210,6 +213,18 @@ class TurnModel(Base):
         CheckConstraint("expected_state_version>=0"),
         CheckConstraint("committed_state_version>=0"),
         CheckConstraint("route IN ('narrative','mechanical')"),
+        CheckConstraint("initial_route IN ('narrative','mechanical')"),
+        CheckConstraint(
+            "routing_rule_version IS NULL OR length(routing_rule_version) BETWEEN 1 AND 100"
+        ),
+        CheckConstraint(
+            "routing_reason_codes IS NULL OR jsonb_typeof(routing_reason_codes)='array'"
+        ),
+        CheckConstraint(
+            "(initial_route IS NULL)="
+            "(routing_rule_version IS NULL AND routing_reason_codes IS NULL)",
+            name="routing_metadata_complete",
+        ),
         CheckConstraint(
             "resolution_status IN ('pending','resolving','committed','not_applied','failed')"
         ),
@@ -464,4 +479,31 @@ class MvpInventoryModel(Base):
             unique=True,
             postgresql_where=text("equipped"),
         ),
+    )
+
+
+class MvpSceneSkillCheckModel(Base):
+    __tablename__ = "mvp_scene_skill_checks"
+
+    campaign_id: Mapped[UUID] = mapped_column(PG_UUID(as_uuid=True), primary_key=True)
+    scene_id: Mapped[UUID] = mapped_column(PG_UUID(as_uuid=True), primary_key=True)
+    check_ref: Mapped[str] = mapped_column(Text, primary_key=True)
+    skill_ref: Mapped[str] = mapped_column(Text, nullable=False)
+    difficulty: Mapped[str] = mapped_column(Text, nullable=False)
+    target_id: Mapped[UUID | None] = mapped_column(PG_UUID(as_uuid=True))
+    public_description: Mapped[str] = mapped_column(Text, nullable=False)
+
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["campaign_id", "scene_id"], ["scenes.campaign_id", "scenes.id"]
+        ),
+        ForeignKeyConstraint(
+            ["campaign_id", "target_id"], ["entities.campaign_id", "entities.id"]
+        ),
+        CheckConstraint("check_ref ~ '^[a-z][a-z0-9_]{0,63}$'"),
+        CheckConstraint(
+            "skill_ref IN ('athletics','acrobatics','perception','stealth','persuasion')"
+        ),
+        CheckConstraint("difficulty IN ('easy','normal','hard')"),
+        CheckConstraint("length(public_description) BETWEEN 1 AND 2000"),
     )

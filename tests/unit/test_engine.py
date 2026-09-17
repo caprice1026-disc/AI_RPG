@@ -46,3 +46,20 @@ def test_ruleset_resolves_skill_check_without_llm() -> None:
     result = MvpV1Ruleset(DiceEngine(SeededRandomSource(7))).resolve_skill_check(command, actor)
     assert result.outcome in {"success", "failure"}
     assert len(result.dice) == 1
+
+
+@pytest.mark.parametrize(
+    ("difficulty", "expected"),
+    [("easy", 8), ("normal", 12), ("hard", 16)],
+)
+def test_ruleset_owns_difficulty_classes(difficulty: str, expected: int) -> None:
+    ruleset = MvpV1Ruleset(DiceEngine(SeededRandomSource(1)))
+
+    assert ruleset.difficulty_class(difficulty) == expected
+
+
+def test_ruleset_rejects_unknown_difficulty() -> None:
+    ruleset = MvpV1Ruleset(DiceEngine(SeededRandomSource(1)))
+
+    with pytest.raises(ValueError, match="難易度"):
+        ruleset.difficulty_class("legendary")

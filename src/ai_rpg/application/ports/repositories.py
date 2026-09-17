@@ -65,6 +65,7 @@ class TurnRow:
 class Lease:
     turn: TurnRow
     lease_until: datetime
+    terminal_cleanup: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -73,9 +74,34 @@ class NarrationLease:
     campaign_id: UUID
     worker_epoch: int
     lease_until: datetime
+    terminal_cleanup: bool = False
 
 
 LLMPhase: TypeAlias = Literal["resolution", "narration"]
+FailureDisposition: TypeAlias = Literal["retry", "terminal"]
+
+
+@dataclass(frozen=True, slots=True)
+class ResolutionWorkItem:
+    turn_id: UUID
+    campaign_id: UUID
+    scene_id: UUID
+    principal_id: UUID
+    actor_id: UUID
+    actor_authorized: bool
+    worker_epoch: int
+    max_actions: int
+    expected_state_version: int
+    player_text: str
+    route: Literal["narrative", "mechanical"] | None
+
+
+@dataclass(frozen=True, slots=True)
+class NarrationWorkItem:
+    turn_id: UUID
+    campaign_id: UUID
+    worker_epoch: int
+    narration_input: MechanicalNarrationInput | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -86,6 +112,7 @@ class CanonicalSnapshot:
     skills: tuple[Mapping[str, object], ...]
     equipment: tuple[Mapping[str, object], ...]
     inventory: tuple[Mapping[str, object], ...]
+    skill_checks: tuple[Mapping[str, object], ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -113,6 +140,17 @@ class ChoiceDraft:
     label: str
 
 
+@dataclass(frozen=True, slots=True)
+class NarrativeCommit:
+    campaign_id: UUID
+    scene_id: UUID
+    turn_id: UUID
+    worker_epoch: int
+    base_state_version: int
+    narration: str
+    choices: tuple[ChoiceDraft, ...]
+
+
 class TurnRepository(Protocol):
     async def add(
         self,
@@ -127,6 +165,10 @@ class TurnRepository(Protocol):
         self, campaign_id: UUID, principal_id: UUID, request_id: UUID
     ) -> TurnRow | None: ...
 
+    async def get_response(
+        self, campaign_id: UUID, turn_id: UUID
+    ) -> TurnResponse | None: ...
+
     async def accept_pending(
         self,
         campaign_id: UUID,
@@ -139,14 +181,33 @@ class TurnRepository(Protocol):
 
     async def acquire_lease(
         self,
-        turn_id: UUID,
+        turn_id: UUID | None,
         *,
         lease_seconds: int,
         max_attempts: int,
         deadline_seconds: int,
     ) -> Lease | None: ...
 
+    async def get_resolution_work(
+        self, turn_id: UUID, worker_epoch: int
+    ) -> ResolutionWorkItem | None: ...
+
+    async def record_initial_route(
+        self,
+        turn_id: UUID,
+        worker_epoch: int,
+        route: Literal["narrative", "mechanical"],
+        rule_version: str,
+        reason_codes: Sequence[str],
+    ) -> bool: ...
+
+    async def promote_to_mechanical(self, turn_id: UUID, worker_epoch: int) -> bool: ...
+
+    async def finalize_not_applied(self, turn_id: UUID, worker_epoch: int) -> bool: ...
+
     async def commit_resolution(self, bundle: CommitBundle) -> int: ...
+
+    async def commit_narrative(self, commit: NarrativeCommit) -> int: ...
 
 
 class CanonicalRepository(Protocol):
@@ -160,12 +221,16 @@ class CanonicalRepository(Protocol):
 class NarrationRepository(Protocol):
     async def acquire_lease(
         self,
-        turn_id: UUID,
+        turn_id: UUID | None,
         *,
         lease_seconds: int,
         max_attempts: int,
         deadline_seconds: int,
     ) -> NarrationLease | None: ...
+
+    async def get_work(
+        self, turn_id: UUID, worker_epoch: int
+    ) -> NarrationWorkItem | None: ...
 
     async def save_conditionally(
         self,
@@ -187,6 +252,16 @@ class LLMCallRepository(Protocol):
         phase: LLMPhase,
         worker_epoch: int,
     ) -> bool: ...
+
+    async def record_failure(
+        self,
+        turn_id: UUID,
+        *,
+        phase: LLMPhase,
+        worker_epoch: int,
+        failure_code: str,
+        max_attempts: int,
+    ) -> FailureDisposition | None: ...
 
 
 class RepositorySet(Protocol):

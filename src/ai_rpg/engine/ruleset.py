@@ -1,7 +1,7 @@
 """バージョン固定されたゲーム規則。"""
 
 from dataclasses import dataclass
-from typing import Literal
+from typing import ClassVar, Literal
 
 from ai_rpg.domain.commands import SkillCheckCommand
 from ai_rpg.domain.models import CharacterState
@@ -17,6 +17,19 @@ class MvpV1Ruleset:
     ruleset_id: str = "mvp_v1"
 
     _skills = frozenset({"athletics", "acrobatics", "perception", "stealth", "persuasion"})
+    _difficulty_classes: ClassVar[dict[str, int]] = {
+        "easy": 8,
+        "normal": 12,
+        "hard": 16,
+    }
+
+    def difficulty_class(self, difficulty: str) -> int:
+        """保存済みの難易度名をこのrulesetのDCへ解決する。"""
+
+        try:
+            return self._difficulty_classes[difficulty]
+        except KeyError as error:
+            raise ValueError("rulesetに存在しない難易度です") from error
 
     def resolve_skill_check(
         self, command: SkillCheckCommand, actor: CharacterState

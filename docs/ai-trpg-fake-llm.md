@@ -1,7 +1,7 @@
 # Fake LLMによる技能判定の一往復を完成させる実装方針
 
 作成日: 2026-09-15  
-状態: 合意済み方針に基づき実装中
+状態: 主要実装と結合検証を完了。独立processの開発用runnerは後続
 対象: caprice1026-disc/AI_RPG
 
 ## 1 目的と完成条件
@@ -14,11 +14,14 @@
 
 本書は実装を依頼するときの計画であり、コード変更やテストの完了報告ではない。既存コードについての基準は、直前のレビュー対象コミット[77a0193](https://github.com/caprice1026-disc/AI_RPG/commit/77a0193f1baf1c1160de812a597dec38cbbe10e5)とする。実装開始時には最新差分と既存計画を確認し、すでに修正済みの作業を重複実装しない。
 
-### 実装進捗（2026-09-16）
+### 実装進捗（2026-09-17）
 
 - Step 1: Domain Command／Result／StateChangeの正本化、Application projection、回復・在庫消費の型付き保存を完了。
 - Step 2: Infrastructure限定ORM mapping、描写終端までの受付制約、DB永続LLM予算、phase別attempt／deadline、独立した描写lease／epoch、GMNarrationGeneratedのatomic保存を完了。
-- Step 3以降: API、Context生成、Fake transport、worker、障害復旧、一往復E2Eは未完了。
+- Step 3: 認証済みprincipalを受けるAcceptTurn／GetTurn API、Campaign lock下のsnapshot、公開許可リスト型Contextを実装。workerのLLM呼出前と確定transaction内でもmembership／Actor操作権を再検証し、内部failure codeは明示的な公開code mappingを通す。
+- Step 4〜5: 決定的Router、永続予約を通るFake transport、技能判定worker、独立描写worker、Narrative通常応答とMechanical昇格を実装。難易度名からDCへの変換はworkerではなく`mvp_v1` rulesetが所有し、行動不能等のルール拒否は再試行せず`not_applied`へ終端化する。技能判定成功時だけ登録済み公開事実を結果描写Contextへ追加する。
+- Step 6: stale epoch、timeout、Schema不正、予算・deadline到達、commit応答喪失、状態version競合、`not_applied`直後の停止を回収する経路とテストを実装。受付時versionをworkerまで固定し、lock待ち中に切れたleaseも`clock_timestamp()`で拒否する。
+- Step 7: API受付から次Turnまでの実PostgreSQL受入テストと、APIキー不要のpytest harness再現手順をREADMEへ追加。2026-09-17に実PostgreSQL込み全171件、Ruff、mypy、sdist／wheel buildを確認した。独立したAPI／worker processのfixture投入・停止・再起動CLIは未実装で、後続範囲として明記する。
 
 この進捗欄を現在地の正本とし、以下の計画本文は完成条件として維持する。
 
@@ -373,32 +376,32 @@ Fakeシナリオでは登録済み情報だけを描写に含める。これは�
 
 | 機能 | 合意済み | 実装済み | 結合テストで確認済み | 証跡 |
 | --- | --- | --- | --- | --- |
-| Command／Resultの正本と変換 | ✓ | 要確認 | 要確認 | 対象commit、型・変換テスト |
-| ORMとDB制約の維持 | ✓ | 要確認 | 要確認 | migration、制約テスト |
-| 描写終端までの入力制限 | ✓ | 要確認 | 要確認 | T05 |
-| 再送・認可・Choice | ✓ | 要確認 | 要確認 | T03、T04、T06 |
-| 一貫したsnapshot | ✓ | 要確認 | 要確認 | T17 |
-| 登録済みDC・補正での技能判定 | ✓ | 要確認 | 要確認 | T01、T02、T08 |
-| 永続LLM予算 | ✓ | 要確認 | 要確認 | T09、T14、T19 |
-| ゲーム結果のatomicな保存 | ✓ | 要確認 | 要確認 | T10、T15 |
-| 独立した描写所有権 | ✓ | 要確認 | 要確認 | T11〜T13、T20 |
-| retry上限と終端化 | ✓ | 要確認 | 要確認 | T16 |
-| 公開DTOとNarrative制限 | ✓ | 要確認 | 要確認 | T07、T18、Fake fixture確認 |
-| APIから次Turnまでの一往復 | ✓ | 要確認 | 要確認 | 受入テスト、再現手順 |
+| Command／Resultの正本と変換 | ✓ | ✓ | ✓ | Domain型、projection unit／PostgreSQL test |
+| ORMとDB制約の維持 | ✓ | ✓ | ✓ | `0003`〜`0005`、metadata／migration test |
+| 描写終端までの入力制限 | ✓ | ✓ | ✓ | 並行受付、描写pending／fallback後の受付test |
+| 再送・認可・Choice | ✓ | ✓ | ✓ | API／PostgreSQLの再送・権限・Choice、worker再認可test |
+| 一貫したsnapshot | ✓ | ✓ | ✓ | Campaign lockと並行更新test |
+| 登録済みDC・補正での技能判定 | ✓ | ✓ | ✓ | Fake success／failure、未登録・曖昧・行動不能test |
+| 永続LLM予算 | ✓ | ✓ | ✓ | timeout・invalid・Narrative昇格・worker交代test |
+| ゲーム結果のatomicな保存 | ✓ | ✓ | ✓ | rollback、重複確定、commit応答喪失test |
+| 独立した描写所有権 | ✓ | ✓ | ✓ | stale narration epoch、timeout、event rollback test |
+| retry上限と終端化 | ✓ | ✓ | ✓ | attempt／deadline exhausted cleanup test |
+| 公開DTOとNarrative制限 | ✓ | ✓ | ✓ | API許可リスト、failure code mapping、Fake call用途・Schema・Context test |
+| APIから次Turnまでの一往復 | ✓ | ✓ | ✓ | Fake skill-check受入test、READMEのpytest harness手順 |
 
 「実装済み」には対象commitと主要ファイルを付ける。「結合テストで確認済み」にはテスト名、実行日、対象commit、DB環境、成功／失敗／skipを記録する。既存テストの過去成功は保持するが、新しい合意内容まで確認した証拠にはしない。
 
 ## 14 マイルストーンの終了判定
 
-- [ ] Fake LLMと実PostgreSQLで、技能判定success／failureの一往復が再現できる。
-- [ ] 通常のMechanical処理は2回の呼出で完了し、最大3回を再起動後も超えない。
-- [ ] Action／Eventがatomicに保存され、同一requestで二重適用されない。
-- [ ] 描写完了またはfallbackまで新規入力を拒否し、その後は受付を再開できる。
-- [ ] 解決・描写の独立した所有権と期限切れ回収が動く。
-- [ ] 保存済み結果を再ロールせず、描写だけを復旧できる。
-- [ ] 内部retry上限と期限がDBに残り、未完了Turnを放置しない回収処理がある。
-- [ ] APIから内部Contextや秘密情報が漏れない。
-- [ ] 既存の重要テストと今回の結合テストが通り、skipを成功扱いしていない。
+- [x] Fake LLMと実PostgreSQLで、技能判定success／failureの一往復が再現できる。
+- [x] 通常のMechanical処理は2回の呼出で完了し、最大3回を再起動後も超えない。
+- [x] Action／Eventがatomicに保存され、同一requestで二重適用されない。
+- [x] 描写完了またはfallbackまで新規入力を拒否し、その後は受付を再開できる。
+- [x] 解決・描写の独立した所有権と期限切れ回収が動く。
+- [x] 保存済み結果を再ロールせず、描写だけを復旧できる。
+- [x] 内部retry上限と期限がDBに残り、未完了Turnを放置しない回収処理がある。
+- [x] APIから内部Contextや秘密情報が漏れない。
+- [x] 既存の重要テストと今回の結合テストが通り、skipを成功扱いしていない。
 - [ ] 起動・fixture・一往復・再起動の手順と、三段階の進捗証跡が残っている。
 
 完了後は同じ経路に攻撃、HealingApplied、ItemConsumedを追加する。実モデル、SSE、本格UI、Directorの拡張は、それぞれ独立した次のマイルストーンとして進める。

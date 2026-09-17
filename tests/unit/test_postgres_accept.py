@@ -1,15 +1,45 @@
 """Turn受付とPostgreSQL adapter間の契約をDB接続なしで検証する。"""
 
+from datetime import UTC, datetime
 from unittest.mock import AsyncMock, MagicMock
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import pytest
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from ai_rpg.application import AuthorizationError, AuthorizationPolicy
+from ai_rpg.application import AuthenticatedPrincipal, AuthorizationError, AuthorizationPolicy
 from ai_rpg.application.turns import RuntimePolicy, TurnService
 from ai_rpg.contracts import PlayerTurnInput
-from ai_rpg.infrastructure.postgres.repositories import PostgresUnitOfWork
+from ai_rpg.infrastructure.postgres.repositories import (
+    PostgresUnitOfWork,
+    _public_recovery_reason,
+)
+
+
+def _principal(principal_id: UUID) -> AuthenticatedPrincipal:
+    return AuthenticatedPrincipal(
+        principal_id=principal_id,
+        issuer="test",
+        subject="player",
+        authenticated_at=datetime.now(UTC),
+        auth_context=frozenset(),
+    )
+
+
+@pytest.mark.parametrize(
+    ("stored", "public"),
+    [
+        (None, None),
+        ("MODEL_TIMEOUT", "MODEL_TIMEOUT"),
+        ("INVALID_OUTPUT", "INVALID_OUTPUT"),
+        ("FUTURE_INTERNAL_DETAIL", "UNKNOWN"),
+    ],
+)
+def test_internal_recovery_reason_uses_explicit_public_mapping(
+    stored: object,
+    public: str | None,
+) -> None:
+    assert _public_recovery_reason(stored) == public
 
 
 @pytest.mark.asyncio
@@ -71,7 +101,7 @@ async def test_accept_preserves_policy_and_returns_valid_pending_response(max_ac
         RuntimePolicy(max_actions, 1, 3),
     )
 
-    response = await service.accept(principal_id, campaign_id, turn)
+    response = await service.accept(_principal(principal_id), campaign_id, turn)
 
     assert response.turn_id == turn_id
     assert response.resolution_status == "pending"
@@ -110,7 +140,7 @@ async def test_campaign_access_is_checked_before_opening_unit_of_work() -> None:
     )
 
     with pytest.raises(AuthorizationError):
-        await service.accept(principal_id, campaign_id, turn)
+        await service.accept(_principal(principal_id), campaign_id, turn)
 
     authorization.can_access_campaign.assert_awaited_once_with(principal_id, campaign_id)
     unit_of_work_factory.assert_not_called()

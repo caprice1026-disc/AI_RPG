@@ -4,10 +4,12 @@ import asyncio
 import os
 import subprocess
 import sys
+import time
 from collections.abc import AsyncIterator, Callable, Generator, Iterator
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from dataclasses import replace
+from datetime import UTC, datetime
 from pathlib import Path
 from threading import Event
 from typing import Any
@@ -15,21 +17,31 @@ from unittest.mock import MagicMock
 from uuid import UUID, uuid4
 
 import pytest
+from httpx import ASGITransport, AsyncClient
 from sqlalchemy import Connection, Engine, RowMapping, create_engine, event, text
 from sqlalchemy.engine import make_url
 from sqlalchemy.exc import DBAPIError, IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
+from ai_rpg.api import create_app
 from ai_rpg.application import (
+    AuthenticatedPrincipal,
     AuthorizationError,
     ChoiceNotAvailableError,
     IdempotencyConflictError,
     InvalidCommitBundleError,
+    NarrationWorker,
+    RuntimePolicy,
+    SkillCheckResolutionWorker,
     StateVersionConflictError,
     TurnInProgressError,
+    TurnQueryService,
+    TurnService,
+    WorkerPhasePolicy,
 )
 from ai_rpg.application.ports import (
     ActionRecord,
+    CanonicalSnapshot,
     ChoiceDraft,
     CommitBundle,
     Lease,
@@ -48,12 +60,15 @@ from ai_rpg.domain.results import (
     ItemConsumed,
     ResolvedAction,
 )
+from ai_rpg.engine import DiceEngine, MvpV1Ruleset
+from ai_rpg.infrastructure.postgres import PostgresAuthorizationPolicy, PostgresUnitOfWork
 from ai_rpg.infrastructure.postgres.repositories import (
     PostgresCanonicalRepository,
     PostgresLLMCallRepository,
     PostgresNarrationRepository,
     PostgresTurnRepository,
 )
+from ai_rpg.llm import ScriptedFakeTransport
 
 URL = os.getenv("AIRPG_TEST_DATABASE_URL")
 ROOT = Path(__file__).parents[3]
@@ -806,7 +821,12 @@ def test_empty_database_upgrades_and_downgrades(empty_database_url: str) -> None
     _run_alembic(empty_database_url, "upgrade", "head")
     engine = create_engine(empty_database_url)
     try:
-        assert {"campaigns", "events", "mvp_inventory"} <= _public_tables(engine)
+        assert {
+            "campaigns",
+            "events",
+            "mvp_inventory",
+            "mvp_scene_skill_checks",
+        } <= _public_tables(engine)
     finally:
         engine.dispose()
 
@@ -991,6 +1011,26 @@ def test_same_request_and_input_returns_existing_turn(database: Engine) -> None:
         assert connection.scalar(text("SELECT count(*) FROM turns")) == 1
 
 
+def test_get_response_is_scoped_to_requested_campaign(database: Engine) -> None:
+    with database.begin() as connection:
+        _seed_members_entities_and_scene(connection)
+    accepted = _accept_from_database(database, _player_turn())
+
+    async def get(campaign_id: UUID) -> TurnResponse | None:
+        url = database.url.render_as_string(hide_password=False)
+        async with _postgres_sessions(url) as factory, factory() as session:
+            return await PostgresTurnRepository(session).get_response(
+                campaign_id, accepted.turn_id
+            )
+
+    with asyncio.Runner(loop_factory=asyncio.SelectorEventLoop) as runner:
+        found = runner.run(get(UUID(CAMPAIGN_A)))
+        missing = runner.run(get(UUID(CAMPAIGN_B)))
+
+    assert found == accepted
+    assert missing is None
+
+
 def test_same_request_with_different_input_is_idempotency_conflict(database: Engine) -> None:
     with database.begin() as connection:
         _seed_members_entities_and_scene(connection)
@@ -1116,6 +1156,41 @@ def test_llm_call_reservation_is_atomic_persistent_and_owned(database: Engine) -
         ) == 1
 
 
+def test_llm_call_reservation_rejects_expired_phase_deadline(database: Engine) -> None:
+    with database.begin() as connection:
+        _seed_members_entities_and_scene(connection)
+    accepted = _accept_from_database(database, _player_turn())
+    lease = _acquire_lease_from_database(database, accepted.turn_id)
+    with database.begin() as connection:
+        connection.execute(
+            text(
+                "UPDATE turns SET resolution_deadline=now()-interval '1 second' "
+                "WHERE id=:turn"
+            ),
+            {"turn": accepted.turn_id},
+        )
+
+    async def reserve() -> bool:
+        url = database.url.render_as_string(hide_password=False)
+        async with _postgres_sessions(url) as factory, factory() as session:
+            reserved = await PostgresLLMCallRepository(session).reserve(
+                accepted.turn_id,
+                phase="resolution",
+                worker_epoch=lease.turn.worker_epoch,
+            )
+            await session.commit()
+            return reserved
+
+    with asyncio.Runner(loop_factory=asyncio.SelectorEventLoop) as runner:
+        assert not runner.run(reserve())
+
+    with database.connect() as connection:
+        assert connection.scalar(
+            text("SELECT llm_call_count FROM turns WHERE id=:turn"),
+            {"turn": accepted.turn_id},
+        ) == 0
+
+
 def test_resolution_lease_attempts_share_a_fixed_deadline(database: Engine) -> None:
     with database.begin() as connection:
         _seed_members_entities_and_scene(connection)
@@ -1170,12 +1245,29 @@ def test_resolution_lease_attempts_share_a_fixed_deadline(database: Engine) -> N
             {"turn": accepted.turn_id},
         )
     with asyncio.Runner(loop_factory=asyncio.SelectorEventLoop) as runner:
-        assert runner.run(acquire_again()) is None
+        cleanup = runner.run(acquire_again())
+    assert cleanup is not None
+    assert cleanup.terminal_cleanup
+    with database.connect() as connection:
+        assert connection.scalar(
+            text("SELECT resolution_attempt_count FROM turns WHERE id=:turn"),
+            {"turn": accepted.turn_id},
+        ) == 2
 
 
 def test_canonical_snapshot_locks_campaign_before_typed_reads(database: Engine) -> None:
     with database.begin() as connection:
         _seed_resolution_state(connection)
+        connection.execute(
+            text(
+                "INSERT INTO mvp_scene_skill_checks("
+                "campaign_id,scene_id,check_ref,skill_ref,difficulty,public_description"
+                ") VALUES("
+                ":campaign,:scene,'observe_room','perception','normal','出口の痕跡が見える。'"
+                ")"
+            ),
+            {"campaign": CAMPAIGN_A, "scene": SCENE_A},
+        )
 
     async def snapshot() -> tuple[object, list[str]]:
         url = database.url.render_as_string(hide_password=False)
@@ -1206,9 +1298,95 @@ def test_canonical_snapshot_locks_campaign_before_typed_reads(database: Engine) 
         value, statements = runner.run(snapshot())
 
     assert value.state_version == 0
+    assert value.skill_checks == (
+        {
+            "campaign_id": UUID(CAMPAIGN_A),
+            "scene_id": UUID(SCENE_A),
+            "check_ref": "observe_room",
+            "skill_ref": "perception",
+            "difficulty": "normal",
+            "target_id": None,
+            "public_description": "出口の痕跡が見える。",
+        },
+    )
     assert "from campaigns" in statements[0]
     assert "for update" in statements[0]
     assert any("from mvp_characters" in statement for statement in statements[1:])
+
+
+def test_canonical_snapshot_waits_for_campaign_update_and_reads_one_version(
+    database: Engine,
+) -> None:
+    with database.begin() as connection:
+        _seed_resolution_state(connection)
+
+    snapshot_attempted = Event()
+
+    def read_snapshot() -> CanonicalSnapshot:
+        async def read() -> CanonicalSnapshot:
+            url = database.url.render_as_string(hide_password=False)
+            engine = create_async_engine(url)
+
+            def record(
+                _connection: Any,
+                _cursor: Any,
+                statement: str,
+                _parameters: Any,
+                _context: Any,
+                _executemany: bool,
+            ) -> None:
+                normalized = " ".join(statement.lower().split())
+                if "from campaigns" in normalized and "for update" in normalized:
+                    snapshot_attempted.set()
+
+            event.listen(engine.sync_engine, "before_cursor_execute", record)
+            try:
+                factory = async_sessionmaker(engine, expire_on_commit=False)
+                async with factory() as session:
+                    value = await PostgresCanonicalRepository(session).snapshot(
+                        UUID(CAMPAIGN_A)
+                    )
+                    await session.commit()
+                    return value
+            finally:
+                await engine.dispose()
+
+        with asyncio.Runner(loop_factory=asyncio.SelectorEventLoop) as runner:
+            return runner.run(read())
+
+    connection = database.connect()
+    transaction = connection.begin()
+    pool = ThreadPoolExecutor(max_workers=1)
+    future = None
+    try:
+        connection.execute(
+            text("SELECT id FROM campaigns WHERE id=:campaign FOR UPDATE"),
+            {"campaign": CAMPAIGN_A},
+        )
+        future = pool.submit(read_snapshot)
+        assert snapshot_attempted.wait(10)
+        connection.execute(
+            text(
+                "UPDATE mvp_characters SET current_hp=7 "
+                "WHERE campaign_id=:campaign AND entity_id=:actor"
+            ),
+            {"campaign": CAMPAIGN_A, "actor": ACTOR_A},
+        )
+        connection.execute(
+            text("UPDATE campaigns SET state_version=1 WHERE id=:campaign"),
+            {"campaign": CAMPAIGN_A},
+        )
+        transaction.commit()
+        snapshot = future.result(timeout=10)
+    finally:
+        if transaction.is_active:
+            transaction.rollback()
+        connection.close()
+        pool.shutdown(wait=True)
+
+    assert snapshot.state_version == 1
+    actor = next(row for row in snapshot.characters if row["entity_id"] == UUID(ACTOR_A))
+    assert actor["current_hp"] == 7
 
 
 def test_concurrent_same_request_creates_one_turn(database: Engine) -> None:
@@ -2156,8 +2334,138 @@ def test_commit_resolution_rejects_stale_ownership(
                 {"campaign": CAMPAIGN_A},
             )
 
-    with pytest.raises(RuntimeError, match="worker leaseまたはCanonical version"):
+    error = StateVersionConflictError if invalid_owner == "stale-version" else RuntimeError
+    with pytest.raises(error):
         _commit_resolution_from_database(database, bundle)
+
+    with database.connect() as connection:
+        assert connection.scalar(text("SELECT count(*) FROM actions")) == 0
+        assert connection.scalar(text("SELECT count(*) FROM events")) == 0
+
+
+def test_commit_resolution_rejects_lease_that_expires_while_waiting_for_lock(
+    database: Engine,
+) -> None:
+    with database.begin() as connection:
+        _seed_resolution_state(connection)
+    accepted = _accept_from_database(database, _player_turn())
+    with database.begin() as connection:
+        connection.execute(
+            text(
+                "UPDATE turns SET resolution_status='resolving',route='mechanical',"
+                "worker_epoch=1,lease_until=clock_timestamp()+interval '2 seconds' "
+                "WHERE id=:turn"
+            ),
+            {"turn": accepted.turn_id},
+        )
+
+    blocker = database.connect()
+    transaction = blocker.begin()
+    blocker.execute(
+        text("SELECT id FROM campaigns WHERE id=:campaign FOR UPDATE"),
+        {"campaign": CAMPAIGN_A},
+    )
+    try:
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            future = pool.submit(
+                _commit_resolution_from_database,
+                database,
+                _resolution_bundle(accepted.turn_id),
+            )
+            waiting = False
+            for _ in range(100):
+                with database.connect() as observer:
+                    waiting = bool(
+                        observer.scalar(
+                            text(
+                                "SELECT EXISTS("
+                                "SELECT 1 FROM pg_stat_activity "
+                                "WHERE datname=current_database() "
+                                "AND pid<>pg_backend_pid() "
+                                "AND wait_event_type='Lock' "
+                                "AND query LIKE '%FROM campaigns%FOR UPDATE%'"
+                                ")"
+                            )
+                        )
+                    )
+                if waiting:
+                    break
+                time.sleep(0.02)
+            assert waiting, "commit transaction did not reach the campaign lock"
+            time.sleep(2.1)
+            transaction.commit()
+            with pytest.raises(RuntimeError, match="lease"):
+                future.result(timeout=10)
+    finally:
+        if transaction.is_active:
+            transaction.rollback()
+        blocker.close()
+
+    with database.connect() as connection:
+        assert connection.scalar(text("SELECT count(*) FROM actions")) == 0
+        assert connection.scalar(text("SELECT count(*) FROM events")) == 0
+
+
+def test_commit_resolution_rechecks_lease_after_authorization_lock_wait(
+    database: Engine,
+) -> None:
+    with database.begin() as connection:
+        _seed_resolution_state(connection)
+    accepted = _accept_from_database(database, _player_turn())
+    with database.begin() as connection:
+        connection.execute(
+            text(
+                "UPDATE turns SET resolution_status='resolving',route='mechanical',"
+                "worker_epoch=1,lease_until=clock_timestamp()+interval '2 seconds' "
+                "WHERE id=:turn"
+            ),
+            {"turn": accepted.turn_id},
+        )
+
+    blocker = database.connect()
+    transaction = blocker.begin()
+    blocker.execute(
+        text(
+            "SELECT principal_id FROM campaign_members "
+            "WHERE campaign_id=:campaign AND principal_id=:principal FOR UPDATE"
+        ),
+        {"campaign": CAMPAIGN_A, "principal": PRINCIPAL_A},
+    )
+    try:
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            future = pool.submit(
+                _commit_resolution_from_database,
+                database,
+                _resolution_bundle(accepted.turn_id),
+            )
+            waiting = False
+            for _ in range(100):
+                with database.connect() as observer:
+                    waiting = bool(
+                        observer.scalar(
+                            text(
+                                "SELECT EXISTS("
+                                "SELECT 1 FROM pg_stat_activity "
+                                "WHERE datname=current_database() "
+                                "AND pid<>pg_backend_pid() "
+                                "AND wait_event_type='Lock' "
+                                "AND query LIKE '%campaign_members%'"
+                                ")"
+                            )
+                        )
+                    )
+                if waiting:
+                    break
+                time.sleep(0.02)
+            assert waiting, "commit transaction did not reach the authorization lock"
+            time.sleep(2.1)
+            transaction.commit()
+            with pytest.raises(RuntimeError, match="lease"):
+                future.result(timeout=10)
+    finally:
+        if transaction.is_active:
+            transaction.rollback()
+        blocker.close()
 
     with database.connect() as connection:
         assert connection.scalar(text("SELECT count(*) FROM actions")) == 0
@@ -2379,3 +2687,1530 @@ def test_narration_save_rolls_back_status_choices_and_event(database: Engine) ->
             text("SELECT event_sequence FROM campaigns WHERE id=:campaign"),
             {"campaign": CAMPAIGN_A},
         ) == 0
+
+
+@pytest.mark.parametrize(
+    ("roll", "outcome", "total", "narration_text", "choice_label"),
+    [
+        (
+            10,
+            "success",
+            12,
+            "注意深く見回すと、床に新しい足跡が見つかった。",
+            "足跡を追う",
+        ),
+        (
+            1,
+            "failure",
+            3,
+            "注意深く見回したが、新しい痕跡は見つからなかった。",
+            "別の場所を調べる",
+        ),
+    ],
+)
+def test_fake_llm_skill_check_round_trip_reopens_turn_acceptance(
+    database: Engine,
+    roll: int,
+    outcome: str,
+    total: int,
+    narration_text: str,
+    choice_label: str,
+) -> None:
+    with database.begin() as connection:
+        _seed_resolution_state(connection)
+        connection.execute(
+            text(
+                "INSERT INTO mvp_skill_modifiers("
+                "campaign_id,character_id,skill_ref,modifier"
+                ") VALUES(:campaign,:actor,'perception',2)"
+            ),
+            {"campaign": CAMPAIGN_A, "actor": ACTOR_A},
+        )
+        connection.execute(
+            text(
+                "INSERT INTO mvp_scene_skill_checks("
+                "campaign_id,scene_id,check_ref,skill_ref,difficulty,public_description"
+                ") VALUES("
+                ":campaign,:scene,'observe_room','perception','normal',"
+                "'床に新しい足跡が残っている。'"
+                ")"
+            ),
+            {"campaign": CAMPAIGN_A, "scene": SCENE_A},
+        )
+
+    class FixedRandom:
+        def randint(self, lower: int, upper: int) -> int:
+            assert lower <= roll <= upper
+            return roll
+
+    async def round_trip() -> tuple[
+        dict[str, Any], int, dict[str, Any], tuple[str, str]
+    ]:
+        url = database.url.render_as_string(hide_password=False)
+        async with _postgres_sessions(url) as factory:
+            authorization = PostgresAuthorizationPolicy(factory)
+
+            def unit_of_work_factory() -> PostgresUnitOfWork:
+                return PostgresUnitOfWork(factory)
+
+            turn_service = TurnService(
+                authorization,
+                unit_of_work_factory,
+                RuntimePolicy(3, 1, 3),
+            )
+            query_service = TurnQueryService(authorization, unit_of_work_factory)
+            principal = AuthenticatedPrincipal(
+                principal_id=UUID(PRINCIPAL_A),
+                issuer="integration-test",
+                subject="player-a",
+                authenticated_at=datetime.now(UTC),
+                auth_context=frozenset(),
+            )
+
+            async def authenticate() -> AuthenticatedPrincipal:
+                return principal
+
+            app = create_app(
+                turn_service=turn_service,
+                turn_query_service=query_service,
+                principal_provider=authenticate,
+            )
+            intent_transport = ScriptedFakeTransport(
+                [
+                    {
+                        "kind": "action_plan",
+                        "actions": [
+                            {
+                                "kind": "skill_check",
+                                "skill_ref": "perception",
+                                "objective": "周囲の痕跡を見つける",
+                                "target_ref": None,
+                            }
+                        ],
+                    }
+                ]
+            )
+            narration_transport = ScriptedFakeTransport(
+                [
+                    {
+                        "narration": narration_text,
+                        "choices": [{"label": choice_label}],
+                    }
+                ]
+            )
+            resolution_worker = SkillCheckResolutionWorker(
+                unit_of_work_factory,
+                intent_transport,
+                MvpV1Ruleset(DiceEngine(FixedRandom())),
+                WorkerPhasePolicy(60, 3, 120, "fake-intent"),
+                action_id_factory=lambda: UUID(ACTION_A),
+                rng_source="seeded_test",
+            )
+            narration_worker = NarrationWorker(
+                unit_of_work_factory,
+                narration_transport,
+                WorkerPhasePolicy(60, 3, 120, "fake-narration"),
+                choice_id_factory=lambda: UUID(CHOICE_A),
+            )
+
+            transport = ASGITransport(app=app)
+            async with AsyncClient(transport=transport, base_url="http://test") as client:
+                accepted = await client.post(
+                    f"/campaigns/{CAMPAIGN_A}/turns",
+                    json={
+                        "request_id": REQUEST_A,
+                        "expected_state_version": 0,
+                        "actor_id": ACTOR_A,
+                        "content": {
+                            "kind": "text",
+                            "text": "周囲を注意深く観察する",
+                        },
+                    },
+                )
+                assert accepted.status_code == 202
+                turn_id = UUID(accepted.json()["turn_id"])
+
+                assert await resolution_worker.run_once()
+                assert not await resolution_worker.run_once()
+                assert await narration_worker.run_once()
+                assert not await narration_worker.run_once()
+
+                completed = await client.get(
+                    f"/campaigns/{CAMPAIGN_A}/turns/{turn_id}"
+                )
+                replay = await client.post(
+                    f"/campaigns/{CAMPAIGN_A}/turns",
+                    json={
+                        "request_id": REQUEST_A,
+                        "expected_state_version": 0,
+                        "actor_id": ACTOR_A,
+                        "content": {
+                            "kind": "text",
+                            "text": "周囲を注意深く観察する",
+                        },
+                    },
+                )
+                next_turn = await client.post(
+                    f"/campaigns/{CAMPAIGN_A}/turns",
+                    json={
+                        "request_id": REQUEST_B,
+                        "expected_state_version": 0,
+                        "actor_id": ACTOR_A,
+                        "content": {"kind": "choice", "choice_id": CHOICE_A},
+                    },
+                )
+            assert completed.status_code == 200
+            assert replay.status_code == 202
+            assert replay.json() == completed.json()
+            assert intent_transport.calls[0].purpose == "intent"
+            assert narration_transport.calls[0].purpose == "result_narration"
+            assert "discriminator" in intent_transport.calls[0].output_schema
+            return (
+                completed.json(),
+                next_turn.status_code,
+                next_turn.json(),
+                (
+                    intent_transport.calls[0].input_data,
+                    narration_transport.calls[0].input_data,
+                ),
+            )
+
+    with asyncio.Runner(loop_factory=asyncio.SelectorEventLoop) as runner:
+        completed, next_status, next_body, llm_inputs = runner.run(round_trip())
+
+    assert completed["resolution_status"] == "committed"
+    assert completed["narration_status"] == "completed"
+    assert completed["narration"] == narration_text
+    assert completed["choices"] == [{"id": CHOICE_A, "label": choice_label}]
+    result = completed["action_results"][0]["result"]
+    assert result["outcome"] == outcome
+    assert result["dice"][0]["total"] == total
+    assert next_status == 202
+    assert next_body["resolution_status"] == "pending"
+    assert CAMPAIGN_A not in llm_inputs[0]
+    assert SCENE_A not in llm_inputs[0]
+    assert ACTOR_A not in llm_inputs[0]
+    clue = "床に新しい足跡が残っている。"
+    assert (clue in llm_inputs[1]) is (outcome == "success")
+
+    with database.connect() as connection:
+        assert connection.scalar(
+            text("SELECT llm_call_count FROM turns WHERE request_id=:request"),
+            {"request": REQUEST_A},
+        ) == 2
+        assert list(
+            connection.execute(
+                text(
+                    "SELECT type FROM events WHERE turn_id=("
+                    "SELECT id FROM turns WHERE request_id=:request"
+                    ") ORDER BY sequence"
+                ),
+                {"request": REQUEST_A},
+            ).scalars()
+        ) == ["DiceRolled", "ActionResolved", "GMNarrationGenerated"]
+
+
+def test_incapacitated_actor_is_not_retried(database: Engine) -> None:
+    with database.begin() as connection:
+        _seed_resolution_state(connection)
+        connection.execute(
+            text(
+                "UPDATE mvp_characters SET current_hp=0 "
+                "WHERE campaign_id=:campaign AND entity_id=:actor"
+            ),
+            {"campaign": CAMPAIGN_A, "actor": ACTOR_A},
+        )
+        connection.execute(
+            text(
+                "INSERT INTO mvp_skill_modifiers("
+                "campaign_id,character_id,skill_ref,modifier"
+                ") VALUES(:campaign,:actor,'perception',2)"
+            ),
+            {"campaign": CAMPAIGN_A, "actor": ACTOR_A},
+        )
+        connection.execute(
+            text(
+                "INSERT INTO mvp_scene_skill_checks("
+                "campaign_id,scene_id,check_ref,skill_ref,difficulty,public_description"
+                ") VALUES("
+                ":campaign,:scene,'observe_room','perception','normal','足跡がある。'"
+                ")"
+            ),
+            {"campaign": CAMPAIGN_A, "scene": SCENE_A},
+        )
+
+    class UnusedRandom:
+        def randint(self, lower: int, upper: int) -> int:
+            raise AssertionError(f"dice must not be used: {lower}-{upper}")
+
+    async def resolve() -> int:
+        url = database.url.render_as_string(hide_password=False)
+        async with _postgres_sessions(url) as factory:
+
+            def unit_of_work_factory() -> PostgresUnitOfWork:
+                return PostgresUnitOfWork(factory)
+
+            accepted = await _accept_turn(
+                factory, _player_turn("周囲を注意深く観察する")
+            )
+            transport = ScriptedFakeTransport(
+                [
+                    {
+                        "kind": "action_plan",
+                        "actions": [
+                            {
+                                "kind": "skill_check",
+                                "skill_ref": "perception",
+                                "objective": "足跡を見つける",
+                                "target_ref": None,
+                            }
+                        ],
+                    }
+                ]
+            )
+            worker = SkillCheckResolutionWorker(
+                unit_of_work_factory,
+                transport,
+                MvpV1Ruleset(DiceEngine(UnusedRandom())),
+                WorkerPhasePolicy(60, 3, 120, "fake-turn"),
+            )
+            assert await worker.run_once(accepted.turn_id)
+            return transport.request_count
+
+    with asyncio.Runner(loop_factory=asyncio.SelectorEventLoop) as runner:
+        request_count = runner.run(resolve())
+
+    assert request_count == 1
+    with database.connect() as connection:
+        assert connection.execute(
+            text(
+                "SELECT resolution_status,narration_status,llm_call_count,"
+                "resolution_attempt_count FROM turns WHERE request_id=:request"
+            ),
+            {"request": REQUEST_A},
+        ).one() == ("not_applied", "completed", 1, 1)
+        assert connection.scalar(text("SELECT count(*) FROM actions")) == 0
+
+
+def test_unregistered_skill_check_is_not_retried(database: Engine) -> None:
+    with database.begin() as connection:
+        _seed_resolution_state(connection)
+
+    class UnusedRandom:
+        def randint(self, lower: int, upper: int) -> int:
+            raise AssertionError(f"dice must not be used: {lower}-{upper}")
+
+    async def resolve() -> int:
+        url = database.url.render_as_string(hide_password=False)
+        async with _postgres_sessions(url) as factory:
+
+            def unit_of_work_factory() -> PostgresUnitOfWork:
+                return PostgresUnitOfWork(factory)
+
+            accepted = await _accept_turn(
+                factory, _player_turn("周囲を注意深く観察する")
+            )
+            transport = ScriptedFakeTransport(
+                [
+                    {
+                        "kind": "action_plan",
+                        "actions": [
+                            {
+                                "kind": "skill_check",
+                                "skill_ref": "perception",
+                                "objective": "足跡を見つける",
+                                "target_ref": None,
+                            }
+                        ],
+                    }
+                ]
+            )
+            worker = SkillCheckResolutionWorker(
+                unit_of_work_factory,
+                transport,
+                MvpV1Ruleset(DiceEngine(UnusedRandom())),
+                WorkerPhasePolicy(60, 3, 120, "fake-turn"),
+            )
+            assert await worker.run_once(accepted.turn_id)
+            return transport.request_count
+
+    with asyncio.Runner(loop_factory=asyncio.SelectorEventLoop) as runner:
+        request_count = runner.run(resolve())
+
+    assert request_count == 1
+    with database.connect() as connection:
+        assert connection.execute(
+            text(
+                "SELECT resolution_status,narration_status,llm_call_count,"
+                "resolution_attempt_count FROM turns WHERE request_id=:request"
+            ),
+            {"request": REQUEST_A},
+        ).one() == ("not_applied", "completed", 1, 1)
+        assert connection.scalar(text("SELECT count(*) FROM actions")) == 0
+
+
+def test_narration_worker_recovers_crash_after_not_applied(database: Engine) -> None:
+    with database.begin() as connection:
+        _seed_resolution_state(connection)
+    accepted = _accept_from_database(
+        database, _player_turn("周囲を注意深く観察する")
+    )
+    lease = _acquire_lease_from_database(database, accepted.turn_id)
+
+    async def recover() -> tuple[int, str]:
+        url = database.url.render_as_string(hide_password=False)
+        async with _postgres_sessions(url) as factory:
+            async with factory() as session:
+                finalized = await PostgresTurnRepository(session).finalize_not_applied(
+                    accepted.turn_id, lease.turn.worker_epoch
+                )
+                assert finalized
+                await session.commit()
+
+            def unit_of_work_factory() -> PostgresUnitOfWork:
+                return PostgresUnitOfWork(factory)
+
+            transport = ScriptedFakeTransport([])
+            worker = NarrationWorker(
+                unit_of_work_factory,
+                transport,
+                WorkerPhasePolicy(60, 3, 120, "fake-narration"),
+            )
+            assert await worker.run_once(accepted.turn_id)
+            next_turn = await _accept_turn(
+                factory,
+                _player_turn(
+                    "今日は静かだね",
+                    request_id=REQUEST_B,
+                ),
+            )
+            return transport.request_count, next_turn.resolution_status
+
+    with asyncio.Runner(loop_factory=asyncio.SelectorEventLoop) as runner:
+        request_count, next_status = runner.run(recover())
+
+    assert request_count == 0
+    assert next_status == "pending"
+    with database.connect() as connection:
+        assert connection.execute(
+            text(
+                "SELECT resolution_status,narration_status,recovery_reason,narration "
+                "FROM turns WHERE id=:turn"
+            ),
+            {"turn": accepted.turn_id},
+        ).one() == (
+            "not_applied",
+            "fallback",
+            "UNKNOWN",
+            "行動を確定できませんでした。入力を言い換えてください。",
+        )
+        assert connection.scalar(
+            text(
+                "SELECT count(*) FROM events "
+                "WHERE turn_id=:turn AND type='GMNarrationGenerated'"
+            ),
+            {"turn": accepted.turn_id},
+        ) == 1
+
+
+def test_narration_timeout_survives_worker_replacement_and_falls_back(
+    database: Engine,
+) -> None:
+    with database.begin() as connection:
+        _seed_resolution_state(connection)
+        connection.execute(
+            text(
+                "INSERT INTO mvp_skill_modifiers("
+                "campaign_id,character_id,skill_ref,modifier"
+                ") VALUES(:campaign,:actor,'perception',2)"
+            ),
+            {"campaign": CAMPAIGN_A, "actor": ACTOR_A},
+        )
+        connection.execute(
+            text(
+                "INSERT INTO mvp_scene_skill_checks("
+                "campaign_id,scene_id,check_ref,skill_ref,difficulty,public_description"
+                ") VALUES("
+                ":campaign,:scene,'observe_room','perception','normal',"
+                "'床に新しい足跡が残っている。'"
+                ")"
+            ),
+            {"campaign": CAMPAIGN_A, "scene": SCENE_A},
+        )
+
+    class FixedRandom:
+        def randint(self, lower: int, upper: int) -> int:
+            assert lower <= 10 <= upper
+            return 10
+
+    async def run_workers() -> tuple[object, object]:
+        url = database.url.render_as_string(hide_password=False)
+        async with _postgres_sessions(url) as factory:
+
+            def unit_of_work_factory() -> PostgresUnitOfWork:
+                return PostgresUnitOfWork(factory)
+
+            accepted = await _accept_turn(
+                factory, _player_turn("周囲を注意深く観察する")
+            )
+            resolution = SkillCheckResolutionWorker(
+                unit_of_work_factory,
+                ScriptedFakeTransport(
+                    [
+                        {
+                            "kind": "action_plan",
+                            "actions": [
+                                {
+                                    "kind": "skill_check",
+                                    "skill_ref": "perception",
+                                    "objective": "周囲の痕跡を見つける",
+                                    "target_ref": None,
+                                }
+                            ],
+                        }
+                    ]
+                ),
+                MvpV1Ruleset(DiceEngine(FixedRandom())),
+                WorkerPhasePolicy(60, 3, 120, "fake-intent"),
+                action_id_factory=lambda: UUID(ACTION_A),
+                rng_source="seeded_test",
+            )
+            assert await resolution.run_once(accepted.turn_id)
+
+            first_worker = NarrationWorker(
+                unit_of_work_factory,
+                ScriptedFakeTransport([TimeoutError("first worker stopped")]),
+                WorkerPhasePolicy(60, 3, 120, "fake-narration"),
+            )
+            assert await first_worker.run_once(accepted.turn_id)
+            async with factory() as session:
+                first_deadline = await session.scalar(
+                    text("SELECT narration_deadline FROM turns WHERE id=:turn"),
+                    {"turn": accepted.turn_id},
+                )
+
+            replacement_worker = NarrationWorker(
+                unit_of_work_factory,
+                ScriptedFakeTransport([TimeoutError("replacement also stopped")]),
+                WorkerPhasePolicy(60, 3, 120, "fake-narration"),
+            )
+            assert await replacement_worker.run_once(accepted.turn_id)
+            async with factory() as session:
+                final_deadline = await session.scalar(
+                    text("SELECT narration_deadline FROM turns WHERE id=:turn"),
+                    {"turn": accepted.turn_id},
+                )
+            return first_deadline, final_deadline
+
+    with asyncio.Runner(loop_factory=asyncio.SelectorEventLoop) as runner:
+        first_deadline, final_deadline = runner.run(run_workers())
+
+    assert final_deadline == first_deadline
+    with database.connect() as connection:
+        turn = connection.execute(
+            text(
+                "SELECT resolution_status,narration_status,recovery_reason,"
+                "llm_call_count,narration_attempt_count,narration "
+                "FROM turns WHERE request_id=:request"
+            ),
+            {"request": REQUEST_A},
+        ).one()
+        assert turn == (
+            "committed",
+            "fallback",
+            "MODEL_TIMEOUT",
+            3,
+            2,
+            "判定結果は保存されましたが、描写を生成できませんでした。",
+        )
+        assert connection.scalar(text("SELECT count(*) FROM actions")) == 1
+        assert list(
+            connection.execute(
+                text("SELECT type FROM events ORDER BY sequence")
+            ).scalars()
+        ) == ["DiceRolled", "ActionResolved", "GMNarrationGenerated"]
+
+    reopened = _accept_from_database(database, _player_turn(request_id=REQUEST_B))
+    assert reopened.resolution_status == "pending"
+
+
+def test_fake_clarification_finishes_not_applied_without_game_writes(
+    database: Engine,
+) -> None:
+    with database.begin() as connection:
+        _seed_resolution_state(connection)
+
+    class UnusedRandom:
+        def randint(self, lower: int, upper: int) -> int:
+            raise AssertionError(f"dice must not be used: {lower}-{upper}")
+
+    async def resolve() -> None:
+        url = database.url.render_as_string(hide_password=False)
+        async with _postgres_sessions(url) as factory:
+
+            def unit_of_work_factory() -> PostgresUnitOfWork:
+                return PostgresUnitOfWork(factory)
+
+            accepted = await _accept_turn(factory, _player_turn("調べる"))
+            worker = SkillCheckResolutionWorker(
+                unit_of_work_factory,
+                ScriptedFakeTransport(
+                    [
+                        {
+                            "kind": "clarification_required",
+                            "question": "何を注意深く調べますか?",
+                        }
+                    ]
+                ),
+                MvpV1Ruleset(DiceEngine(UnusedRandom())),
+                WorkerPhasePolicy(60, 3, 120, "fake-intent"),
+                rng_source="seeded_test",
+            )
+            assert await worker.run_once(accepted.turn_id)
+
+    with asyncio.Runner(loop_factory=asyncio.SelectorEventLoop) as runner:
+        runner.run(resolve())
+
+    with database.connect() as connection:
+        assert connection.execute(
+            text(
+                "SELECT resolution_status,narration_status,narration,llm_call_count "
+                "FROM turns WHERE request_id=:request"
+            ),
+            {"request": REQUEST_A},
+        ).one() == (
+            "not_applied",
+            "completed",
+            "何を注意深く調べますか?",
+            1,
+        )
+        assert connection.scalar(text("SELECT count(*) FROM actions")) == 0
+        assert list(connection.execute(text("SELECT type FROM events")).scalars()) == [
+            "GMNarrationGenerated"
+        ]
+
+    reopened = _accept_from_database(database, _player_turn(request_id=REQUEST_B))
+    assert reopened.resolution_status == "pending"
+
+
+def test_invalid_intent_retries_are_bounded_and_end_in_fallback(database: Engine) -> None:
+    with database.begin() as connection:
+        _seed_resolution_state(connection)
+
+    class UnusedRandom:
+        def randint(self, lower: int, upper: int) -> int:
+            raise AssertionError(f"dice must not be used: {lower}-{upper}")
+
+    async def exhaust() -> list[object]:
+        url = database.url.render_as_string(hide_password=False)
+        async with _postgres_sessions(url) as factory:
+
+            def unit_of_work_factory() -> PostgresUnitOfWork:
+                return PostgresUnitOfWork(factory)
+
+            accepted = await _accept_turn(
+                factory, _player_turn("周囲を注意深く観察する")
+            )
+            worker = SkillCheckResolutionWorker(
+                unit_of_work_factory,
+                ScriptedFakeTransport(
+                    [
+                        {"kind": "action_plan", "actions": "invalid"},
+                        {"kind": "action_plan", "actions": "invalid"},
+                        {"kind": "action_plan", "actions": "invalid"},
+                    ]
+                ),
+                MvpV1Ruleset(DiceEngine(UnusedRandom())),
+                WorkerPhasePolicy(60, 3, 120, "fake-intent"),
+                rng_source="seeded_test",
+            )
+            deadlines: list[object] = []
+            for _ in range(3):
+                assert await worker.run_once(accepted.turn_id)
+                async with factory() as session:
+                    deadlines.append(
+                        await session.scalar(
+                            text(
+                                "SELECT resolution_deadline FROM turns WHERE id=:turn"
+                            ),
+                            {"turn": accepted.turn_id},
+                        )
+                    )
+            return deadlines
+
+    with asyncio.Runner(loop_factory=asyncio.SelectorEventLoop) as runner:
+        deadlines = runner.run(exhaust())
+
+    assert deadlines[0] == deadlines[1] == deadlines[2]
+    with database.connect() as connection:
+        assert connection.execute(
+            text(
+                "SELECT resolution_status,narration_status,recovery_reason,"
+                "llm_call_count,resolution_attempt_count "
+                "FROM turns WHERE request_id=:request"
+            ),
+            {"request": REQUEST_A},
+        ).one() == ("failed", "fallback", "INVALID_OUTPUT", 3, 3)
+        assert connection.scalar(text("SELECT count(*) FROM actions")) == 0
+        assert list(connection.execute(text("SELECT type FROM events")).scalars()) == [
+            "GMNarrationGenerated"
+        ]
+
+    reopened = _accept_from_database(database, _player_turn(request_id=REQUEST_B))
+    assert reopened.resolution_status == "pending"
+
+
+def test_invalid_narrative_output_consumes_the_single_call_budget(
+    database: Engine,
+) -> None:
+    with database.begin() as connection:
+        _seed_resolution_state(connection)
+
+    class UnusedRandom:
+        def randint(self, lower: int, upper: int) -> int:
+            raise AssertionError(f"dice must not be used: {lower}-{upper}")
+
+    async def resolve() -> int:
+        url = database.url.render_as_string(hide_password=False)
+        async with _postgres_sessions(url) as factory:
+
+            def unit_of_work_factory() -> PostgresUnitOfWork:
+                return PostgresUnitOfWork(factory)
+
+            accepted = await _accept_turn(factory, _player_turn("今日は静かだね"))
+            transport = ScriptedFakeTransport(
+                [{"kind": "narrative", "narration": 123, "choices": []}]
+            )
+            worker = SkillCheckResolutionWorker(
+                unit_of_work_factory,
+                transport,
+                MvpV1Ruleset(DiceEngine(UnusedRandom())),
+                WorkerPhasePolicy(60, 3, 120, "fake-narrative"),
+            )
+            assert await worker.run_once(accepted.turn_id)
+            assert not await worker.run_once(accepted.turn_id)
+            return transport.request_count
+
+    with asyncio.Runner(loop_factory=asyncio.SelectorEventLoop) as runner:
+        request_count = runner.run(resolve())
+
+    assert request_count == 1
+    with database.connect() as connection:
+        assert connection.execute(
+            text(
+                "SELECT resolution_status,narration_status,recovery_reason,"
+                "llm_call_count,resolution_attempt_count FROM turns "
+                "WHERE request_id=:request"
+            ),
+            {"request": REQUEST_A},
+        ).one() == ("failed", "fallback", "INVALID_OUTPUT", 1, 1)
+        assert connection.scalar(text("SELECT count(*) FROM actions")) == 0
+
+
+def test_narrative_route_commits_zero_actions_in_one_llm_call(database: Engine) -> None:
+    with database.begin() as connection:
+        _seed_resolution_state(connection)
+
+    class UnusedRandom:
+        def randint(self, lower: int, upper: int) -> int:
+            raise AssertionError(f"dice must not be used: {lower}-{upper}")
+
+    async def resolve() -> tuple[int, int]:
+        url = database.url.render_as_string(hide_password=False)
+        async with _postgres_sessions(url) as factory:
+
+            def unit_of_work_factory() -> PostgresUnitOfWork:
+                return PostgresUnitOfWork(factory)
+
+            accepted = await _accept_turn(factory, _player_turn("今日は静かだね"))
+            transport = ScriptedFakeTransport(
+                [
+                    {
+                        "kind": "narrative",
+                        "narration": "静かな風が練習場を通り抜ける。",
+                        "choices": [{"label": "少し休む"}],
+                    }
+                ]
+            )
+            worker = SkillCheckResolutionWorker(
+                unit_of_work_factory,
+                transport,
+                MvpV1Ruleset(DiceEngine(UnusedRandom())),
+                WorkerPhasePolicy(60, 3, 120, "fake-turn"),
+                choice_id_factory=lambda: UUID(CHOICE_A),
+            )
+            assert await worker.run_once(accepted.turn_id)
+            return transport.request_count, accepted.turn_id.int
+
+    with asyncio.Runner(loop_factory=asyncio.SelectorEventLoop) as runner:
+        request_count, _ = runner.run(resolve())
+
+    assert request_count == 1
+    with database.connect() as connection:
+        turn = connection.execute(
+            text(
+                "SELECT route,initial_route,routing_rule_version,routing_reason_codes,"
+                "resolution_status,narration_status,committed_state_version,narration,"
+                "llm_call_count FROM turns WHERE request_id=:request"
+            ),
+            {"request": REQUEST_A},
+        ).one()
+        assert turn == (
+            "narrative",
+            "narrative",
+            "mvp_v1",
+            ["narrative_or_fallback"],
+            "committed",
+            "completed",
+            0,
+            "静かな風が練習場を通り抜ける。",
+            1,
+        )
+        assert connection.scalar(text("SELECT count(*) FROM actions")) == 0
+        assert list(connection.execute(text("SELECT type FROM events")).scalars()) == [
+            "GMNarrationGenerated"
+        ]
+        assert connection.scalar(text("SELECT label FROM turn_choices")) == "少し休む"
+
+    reopened = _accept_from_database(database, _player_turn(request_id=REQUEST_B))
+    assert reopened.resolution_status == "pending"
+
+
+def test_narrative_escalation_reuses_first_call_as_mechanical_intent(
+    database: Engine,
+) -> None:
+    with database.begin() as connection:
+        _seed_resolution_state(connection)
+        connection.execute(
+            text(
+                "INSERT INTO mvp_skill_modifiers("
+                "campaign_id,character_id,skill_ref,modifier"
+                ") VALUES(:campaign,:actor,'perception',2)"
+            ),
+            {"campaign": CAMPAIGN_A, "actor": ACTOR_A},
+        )
+        connection.execute(
+            text(
+                "INSERT INTO mvp_scene_skill_checks("
+                "campaign_id,scene_id,check_ref,skill_ref,difficulty,public_description"
+                ") VALUES("
+                ":campaign,:scene,'inspect_device','perception','normal',"
+                "'装置には小さな起動印が刻まれている。'"
+                ")"
+            ),
+            {"campaign": CAMPAIGN_A, "scene": SCENE_A},
+        )
+
+    class FixedRandom:
+        def randint(self, lower: int, upper: int) -> int:
+            assert lower <= 10 <= upper
+            return 10
+
+    async def resolve() -> tuple[int, int]:
+        url = database.url.render_as_string(hide_password=False)
+        async with _postgres_sessions(url) as factory:
+
+            def unit_of_work_factory() -> PostgresUnitOfWork:
+                return PostgresUnitOfWork(factory)
+
+            accepted = await _accept_turn(factory, _player_turn("謎の装置を作動させる"))
+            resolution_transport = ScriptedFakeTransport(
+                [
+                    {
+                        "kind": "resolution_required",
+                        "actions": [
+                            {
+                                "kind": "skill_check",
+                                "skill_ref": "perception",
+                                "objective": "装置の起動方法を見抜く",
+                                "target_ref": None,
+                            }
+                        ],
+                    }
+                ]
+            )
+            resolution = SkillCheckResolutionWorker(
+                unit_of_work_factory,
+                resolution_transport,
+                MvpV1Ruleset(DiceEngine(FixedRandom())),
+                WorkerPhasePolicy(60, 3, 120, "fake-turn"),
+                action_id_factory=lambda: UUID(ACTION_A),
+                rng_source="seeded_test",
+            )
+            assert await resolution.run_once(accepted.turn_id)
+
+            narration_transport = ScriptedFakeTransport(
+                [{"narration": "起動印の意味を読み取った。", "choices": []}]
+            )
+            narration = NarrationWorker(
+                unit_of_work_factory,
+                narration_transport,
+                WorkerPhasePolicy(60, 3, 120, "fake-narration"),
+            )
+            assert await narration.run_once(accepted.turn_id)
+            return resolution_transport.request_count, narration_transport.request_count
+
+    with asyncio.Runner(loop_factory=asyncio.SelectorEventLoop) as runner:
+        resolution_calls, narration_calls = runner.run(resolve())
+
+    assert (resolution_calls, narration_calls) == (1, 1)
+    with database.connect() as connection:
+        turn = connection.execute(
+            text(
+                "SELECT route,initial_route,routing_reason_codes,resolution_status,"
+                "narration_status,llm_call_count FROM turns WHERE request_id=:request"
+            ),
+            {"request": REQUEST_A},
+        ).one()
+        assert turn == (
+            "mechanical",
+            "narrative",
+            ["narrative_or_fallback"],
+            "committed",
+            "completed",
+            2,
+        )
+        assert connection.scalar(text("SELECT count(*) FROM actions")) == 1
+
+
+def test_exhausted_resolution_lease_is_terminalized_without_another_llm_call(
+    database: Engine,
+) -> None:
+    with database.begin() as connection:
+        _seed_resolution_state(connection)
+    accepted = _accept_from_database(database, _player_turn())
+    with database.begin() as connection:
+        connection.execute(
+            text(
+                "UPDATE turns SET resolution_status='resolving',route='mechanical',"
+                "worker_epoch=1,lease_until=now()-interval '1 second',"
+                "resolution_attempt_count=3,resolution_started_at=now()-interval '2 minutes',"
+                "resolution_deadline=now()-interval '1 second' WHERE id=:turn"
+            ),
+            {"turn": accepted.turn_id},
+        )
+
+    class UnusedRandom:
+        def randint(self, lower: int, upper: int) -> int:
+            raise AssertionError(f"dice must not be used: {lower}-{upper}")
+
+    async def finalize() -> int:
+        url = database.url.render_as_string(hide_password=False)
+        async with _postgres_sessions(url) as factory:
+
+            def unit_of_work_factory() -> PostgresUnitOfWork:
+                return PostgresUnitOfWork(factory)
+
+            transport = ScriptedFakeTransport([])
+            worker = SkillCheckResolutionWorker(
+                unit_of_work_factory,
+                transport,
+                MvpV1Ruleset(DiceEngine(UnusedRandom())),
+                WorkerPhasePolicy(60, 3, 120, "fake-turn"),
+            )
+            assert await worker.run_once(accepted.turn_id)
+            return transport.request_count
+
+    with asyncio.Runner(loop_factory=asyncio.SelectorEventLoop) as runner:
+        request_count = runner.run(finalize())
+
+    assert request_count == 0
+    with database.connect() as connection:
+        assert connection.execute(
+            text(
+                "SELECT resolution_status,narration_status,recovery_reason "
+                "FROM turns WHERE id=:turn"
+            ),
+            {"turn": accepted.turn_id},
+        ).one() == ("failed", "fallback", "UNKNOWN")
+
+
+def test_exhausted_narration_lease_falls_back_without_another_llm_call(
+    database: Engine,
+) -> None:
+    with database.begin() as connection:
+        _seed_resolution_state(connection)
+        connection.execute(
+            text(
+                "INSERT INTO mvp_skill_modifiers("
+                "campaign_id,character_id,skill_ref,modifier"
+                ") VALUES(:campaign,:actor,'perception',2)"
+            ),
+            {"campaign": CAMPAIGN_A, "actor": ACTOR_A},
+        )
+        connection.execute(
+            text(
+                "INSERT INTO mvp_scene_skill_checks("
+                "campaign_id,scene_id,check_ref,skill_ref,difficulty,public_description"
+                ") VALUES("
+                ":campaign,:scene,'observe_room','perception','normal','足跡がある。'"
+                ")"
+            ),
+            {"campaign": CAMPAIGN_A, "scene": SCENE_A},
+        )
+
+    class FixedRandom:
+        def randint(self, lower: int, upper: int) -> int:
+            return 10
+
+    async def finalize() -> int:
+        url = database.url.render_as_string(hide_password=False)
+        async with _postgres_sessions(url) as factory:
+
+            def unit_of_work_factory() -> PostgresUnitOfWork:
+                return PostgresUnitOfWork(factory)
+
+            accepted = await _accept_turn(
+                factory, _player_turn("周囲を注意深く観察する")
+            )
+            resolution = SkillCheckResolutionWorker(
+                unit_of_work_factory,
+                ScriptedFakeTransport(
+                    [
+                        {
+                            "kind": "action_plan",
+                            "actions": [
+                                {
+                                    "kind": "skill_check",
+                                    "skill_ref": "perception",
+                                    "objective": "足跡を見つける",
+                                    "target_ref": None,
+                                }
+                            ],
+                        }
+                    ]
+                ),
+                MvpV1Ruleset(DiceEngine(FixedRandom())),
+                WorkerPhasePolicy(60, 3, 120, "fake-turn"),
+            )
+            assert await resolution.run_once(accepted.turn_id)
+            async with factory() as session:
+                await session.execute(
+                    text(
+                        "UPDATE turns SET narration_status='generating',"
+                        "narration_worker_epoch=1,"
+                        "narration_lease_until=now()-interval '1 second',"
+                        "narration_attempt_count=3,"
+                        "narration_started_at=now()-interval '2 minutes',"
+                        "narration_deadline=now()-interval '1 second' WHERE id=:turn"
+                    ),
+                    {"turn": accepted.turn_id},
+                )
+                await session.commit()
+            transport = ScriptedFakeTransport([])
+            narration = NarrationWorker(
+                unit_of_work_factory,
+                transport,
+                WorkerPhasePolicy(60, 3, 120, "fake-narration"),
+            )
+            assert await narration.run_once(accepted.turn_id)
+            return transport.request_count
+
+    with asyncio.Runner(loop_factory=asyncio.SelectorEventLoop) as runner:
+        request_count = runner.run(finalize())
+
+    assert request_count == 0
+    with database.connect() as connection:
+        assert connection.execute(
+            text(
+                "SELECT resolution_status,narration_status,recovery_reason,llm_call_count "
+                "FROM turns WHERE request_id=:request"
+            ),
+            {"request": REQUEST_A},
+        ).one() == ("committed", "fallback", "UNKNOWN", 1)
+
+
+def test_lost_commit_response_is_requeried_without_reapplying_action(
+    database: Engine,
+) -> None:
+    with database.begin() as connection:
+        _seed_resolution_state(connection)
+        connection.execute(
+            text(
+                "INSERT INTO mvp_skill_modifiers("
+                "campaign_id,character_id,skill_ref,modifier"
+                ") VALUES(:campaign,:actor,'perception',2)"
+            ),
+            {"campaign": CAMPAIGN_A, "actor": ACTOR_A},
+        )
+        connection.execute(
+            text(
+                "INSERT INTO mvp_scene_skill_checks("
+                "campaign_id,scene_id,check_ref,skill_ref,difficulty,public_description"
+                ") VALUES("
+                ":campaign,:scene,'observe_room','perception','normal','足跡がある。'"
+                ")"
+            ),
+            {"campaign": CAMPAIGN_A, "scene": SCENE_A},
+        )
+
+    class FixedRandom:
+        def randint(self, lower: int, upper: int) -> int:
+            return 10
+
+    async def resolve() -> None:
+        url = database.url.render_as_string(hide_password=False)
+        async with _postgres_sessions(url) as factory:
+            commits = 0
+
+            class LostResponseUnitOfWork(PostgresUnitOfWork):
+                async def commit(self) -> None:
+                    nonlocal commits
+                    await super().commit()
+                    commits += 1
+                    if commits == 5:
+                        raise ConnectionError("commit response was lost")
+
+            def unit_of_work_factory() -> PostgresUnitOfWork:
+                return LostResponseUnitOfWork(factory)
+
+            accepted = await _accept_turn(
+                factory, _player_turn("周囲を注意深く観察する")
+            )
+            worker = SkillCheckResolutionWorker(
+                unit_of_work_factory,
+                ScriptedFakeTransport(
+                    [
+                        {
+                            "kind": "action_plan",
+                            "actions": [
+                                {
+                                    "kind": "skill_check",
+                                    "skill_ref": "perception",
+                                    "objective": "足跡を見つける",
+                                    "target_ref": None,
+                                }
+                            ],
+                        }
+                    ]
+                ),
+                MvpV1Ruleset(DiceEngine(FixedRandom())),
+                WorkerPhasePolicy(60, 3, 120, "fake-turn"),
+                action_id_factory=lambda: UUID(ACTION_A),
+            )
+            assert await worker.run_once(accepted.turn_id)
+
+    with asyncio.Runner(loop_factory=asyncio.SelectorEventLoop) as runner:
+        runner.run(resolve())
+
+    with database.connect() as connection:
+        assert connection.scalar(text("SELECT count(*) FROM actions")) == 1
+        assert connection.execute(
+            text(
+                "SELECT resolution_status,narration_status,llm_call_count "
+                "FROM turns WHERE request_id=:request"
+            ),
+            {"request": REQUEST_A},
+        ).one() == ("committed", "pending", 1)
+
+
+def test_state_change_between_snapshot_and_commit_becomes_not_applied(
+    database: Engine,
+) -> None:
+    with database.begin() as connection:
+        _seed_resolution_state(connection)
+        connection.execute(
+            text(
+                "INSERT INTO mvp_skill_modifiers("
+                "campaign_id,character_id,skill_ref,modifier"
+                ") VALUES(:campaign,:actor,'perception',2)"
+            ),
+            {"campaign": CAMPAIGN_A, "actor": ACTOR_A},
+        )
+        connection.execute(
+            text(
+                "INSERT INTO mvp_scene_skill_checks("
+                "campaign_id,scene_id,check_ref,skill_ref,difficulty,public_description"
+                ") VALUES("
+                ":campaign,:scene,'observe_room','perception','normal','足跡がある。'"
+                ")"
+            ),
+            {"campaign": CAMPAIGN_A, "scene": SCENE_A},
+        )
+
+    class FixedRandom:
+        def randint(self, lower: int, upper: int) -> int:
+            return 10
+
+    class StateChangingTransport:
+        async def request(
+            self,
+            model_id: str,
+            purpose: str,
+            instruction: str,
+            input_data: str,
+            output_schema: dict[str, object],
+        ) -> object:
+            with database.begin() as connection:
+                connection.execute(
+                    text("UPDATE campaigns SET state_version=1 WHERE id=:campaign"),
+                    {"campaign": CAMPAIGN_A},
+                )
+            return {
+                "kind": "action_plan",
+                "actions": [
+                    {
+                        "kind": "skill_check",
+                        "skill_ref": "perception",
+                        "objective": "足跡を見つける",
+                        "target_ref": None,
+                    }
+                ],
+            }
+
+    async def resolve() -> None:
+        url = database.url.render_as_string(hide_password=False)
+        async with _postgres_sessions(url) as factory:
+
+            def unit_of_work_factory() -> PostgresUnitOfWork:
+                return PostgresUnitOfWork(factory)
+
+            accepted = await _accept_turn(
+                factory, _player_turn("周囲を注意深く観察する")
+            )
+            worker = SkillCheckResolutionWorker(
+                unit_of_work_factory,
+                StateChangingTransport(),
+                MvpV1Ruleset(DiceEngine(FixedRandom())),
+                WorkerPhasePolicy(60, 3, 120, "fake-turn"),
+            )
+            assert await worker.run_once(accepted.turn_id)
+
+    with asyncio.Runner(loop_factory=asyncio.SelectorEventLoop) as runner:
+        runner.run(resolve())
+
+    with database.connect() as connection:
+        assert connection.scalar(text("SELECT count(*) FROM actions")) == 0
+        assert connection.execute(
+            text(
+                "SELECT resolution_status,narration_status,narration,llm_call_count "
+                "FROM turns WHERE request_id=:request"
+            ),
+            {"request": REQUEST_A},
+        ).one() == (
+            "not_applied",
+            "completed",
+            "状況が更新されたため判定を確定しませんでした。もう一度入力してください。",
+            1,
+        )
+
+
+def test_state_change_before_worker_snapshot_does_not_reroll(
+    database: Engine,
+) -> None:
+    with database.begin() as connection:
+        _seed_resolution_state(connection)
+        connection.execute(
+            text(
+                "INSERT INTO mvp_skill_modifiers("
+                "campaign_id,character_id,skill_ref,modifier"
+                ") VALUES(:campaign,:actor,'perception',2)"
+            ),
+            {"campaign": CAMPAIGN_A, "actor": ACTOR_A},
+        )
+        connection.execute(
+            text(
+                "INSERT INTO mvp_scene_skill_checks("
+                "campaign_id,scene_id,check_ref,skill_ref,difficulty,public_description"
+                ") VALUES("
+                ":campaign,:scene,'observe_room','perception','normal','足跡がある。'"
+                ")"
+            ),
+            {"campaign": CAMPAIGN_A, "scene": SCENE_A},
+        )
+
+    class UnusedRandom:
+        def randint(self, lower: int, upper: int) -> int:
+            raise AssertionError(f"dice must not be used: {lower}-{upper}")
+
+    async def resolve() -> int:
+        url = database.url.render_as_string(hide_password=False)
+        async with _postgres_sessions(url) as factory:
+
+            def unit_of_work_factory() -> PostgresUnitOfWork:
+                return PostgresUnitOfWork(factory)
+
+            accepted = await _accept_turn(
+                factory, _player_turn("周囲を注意深く観察する")
+            )
+            async with factory() as session:
+                await session.execute(
+                    text("UPDATE campaigns SET state_version=1 WHERE id=:campaign"),
+                    {"campaign": CAMPAIGN_A},
+                )
+                await session.commit()
+            transport = ScriptedFakeTransport(
+                [
+                    {
+                        "kind": "action_plan",
+                        "actions": [
+                            {
+                                "kind": "skill_check",
+                                "skill_ref": "perception",
+                                "objective": "足跡を見つける",
+                                "target_ref": None,
+                            }
+                        ],
+                    }
+                ]
+            )
+            worker = SkillCheckResolutionWorker(
+                unit_of_work_factory,
+                transport,
+                MvpV1Ruleset(DiceEngine(UnusedRandom())),
+                WorkerPhasePolicy(60, 3, 120, "fake-turn"),
+            )
+            assert await worker.run_once(accepted.turn_id)
+            return transport.request_count
+
+    with asyncio.Runner(loop_factory=asyncio.SelectorEventLoop) as runner:
+        request_count = runner.run(resolve())
+
+    assert request_count == 0
+    with database.connect() as connection:
+        assert connection.scalar(text("SELECT count(*) FROM actions")) == 0
+        assert connection.execute(
+            text(
+                "SELECT resolution_status,narration_status,narration,llm_call_count "
+                "FROM turns WHERE request_id=:request"
+            ),
+            {"request": REQUEST_A},
+        ).one() == (
+            "not_applied",
+            "completed",
+            "状況が更新されたため判定を開始しませんでした。もう一度入力してください。",
+            0,
+        )
+
+
+def test_transient_provider_failure_retries_with_persistent_budget(
+    database: Engine,
+) -> None:
+    with database.begin() as connection:
+        _seed_resolution_state(connection)
+        connection.execute(
+            text(
+                "INSERT INTO mvp_skill_modifiers("
+                "campaign_id,character_id,skill_ref,modifier"
+                ") VALUES(:campaign,:actor,'perception',2)"
+            ),
+            {"campaign": CAMPAIGN_A, "actor": ACTOR_A},
+        )
+        connection.execute(
+            text(
+                "INSERT INTO mvp_scene_skill_checks("
+                "campaign_id,scene_id,check_ref,skill_ref,difficulty,public_description"
+                ") VALUES("
+                ":campaign,:scene,'observe_room','perception','normal','足跡がある。'"
+                ")"
+            ),
+            {"campaign": CAMPAIGN_A, "scene": SCENE_A},
+        )
+
+    class FixedRandom:
+        def randint(self, lower: int, upper: int) -> int:
+            return 10
+
+    async def resolve() -> int:
+        url = database.url.render_as_string(hide_password=False)
+        async with _postgres_sessions(url) as factory:
+
+            def unit_of_work_factory() -> PostgresUnitOfWork:
+                return PostgresUnitOfWork(factory)
+
+            accepted = await _accept_turn(
+                factory, _player_turn("周囲を注意深く観察する")
+            )
+            transport = ScriptedFakeTransport(
+                [
+                    ConnectionError("temporary provider failure"),
+                    {
+                        "kind": "action_plan",
+                        "actions": [
+                            {
+                                "kind": "skill_check",
+                                "skill_ref": "perception",
+                                "objective": "足跡を見つける",
+                                "target_ref": None,
+                            }
+                        ],
+                    },
+                ]
+            )
+            first = SkillCheckResolutionWorker(
+                unit_of_work_factory,
+                transport,
+                MvpV1Ruleset(DiceEngine(FixedRandom())),
+                WorkerPhasePolicy(60, 3, 120, "fake-turn"),
+            )
+            assert await first.run_once(accepted.turn_id)
+            replacement = SkillCheckResolutionWorker(
+                unit_of_work_factory,
+                transport,
+                MvpV1Ruleset(DiceEngine(FixedRandom())),
+                WorkerPhasePolicy(60, 3, 120, "fake-turn"),
+            )
+            assert await replacement.run_once(accepted.turn_id)
+            return transport.request_count
+
+    with asyncio.Runner(loop_factory=asyncio.SelectorEventLoop) as runner:
+        request_count = runner.run(resolve())
+
+    assert request_count == 2
+    with database.connect() as connection:
+        assert connection.execute(
+            text(
+                "SELECT resolution_status,narration_status,llm_call_count,"
+                "resolution_attempt_count FROM turns WHERE request_id=:request"
+            ),
+            {"request": REQUEST_A},
+        ).one() == ("committed", "pending", 2, 2)
+        assert connection.scalar(text("SELECT count(*) FROM actions")) == 1
+
+
+@pytest.mark.parametrize("revocation", ["membership", "controller"])
+def test_worker_rechecks_actor_authorization_before_llm(
+    database: Engine,
+    revocation: str,
+) -> None:
+    with database.begin() as connection:
+        _seed_resolution_state(connection)
+    accepted = _accept_from_database(
+        database, _player_turn("周囲を注意深く観察する")
+    )
+    with database.begin() as connection:
+        if revocation == "membership":
+            connection.execute(
+                text(
+                    "UPDATE campaign_members SET active=false "
+                    "WHERE campaign_id=:campaign AND principal_id=:principal"
+                ),
+                {"campaign": CAMPAIGN_A, "principal": PRINCIPAL_A},
+            )
+        else:
+            connection.execute(
+                text("UPDATE entities SET controller_id=NULL WHERE id=:actor"),
+                {"actor": ACTOR_A},
+            )
+
+    class UnusedRandom:
+        def randint(self, lower: int, upper: int) -> int:
+            raise AssertionError(f"dice must not be used: {lower}-{upper}")
+
+    async def resolve() -> int:
+        url = database.url.render_as_string(hide_password=False)
+        async with _postgres_sessions(url) as factory:
+
+            def unit_of_work_factory() -> PostgresUnitOfWork:
+                return PostgresUnitOfWork(factory)
+
+            transport = ScriptedFakeTransport([])
+            worker = SkillCheckResolutionWorker(
+                unit_of_work_factory,
+                transport,
+                MvpV1Ruleset(DiceEngine(UnusedRandom())),
+                WorkerPhasePolicy(60, 3, 120, "fake-turn"),
+            )
+            assert await worker.run_once(accepted.turn_id)
+            return transport.request_count
+
+    with asyncio.Runner(loop_factory=asyncio.SelectorEventLoop) as runner:
+        request_count = runner.run(resolve())
+
+    assert request_count == 0
+    with database.connect() as connection:
+        assert connection.execute(
+            text(
+                "SELECT resolution_status,narration_status,llm_call_count "
+                "FROM turns WHERE id=:turn"
+            ),
+            {"turn": accepted.turn_id},
+        ).one() == ("not_applied", "completed", 0)
+        assert connection.scalar(text("SELECT count(*) FROM actions")) == 0
+
+
+def test_commit_rechecks_actor_authorization_after_llm(database: Engine) -> None:
+    with database.begin() as connection:
+        _seed_resolution_state(connection)
+        connection.execute(
+            text(
+                "INSERT INTO mvp_skill_modifiers("
+                "campaign_id,character_id,skill_ref,modifier"
+                ") VALUES(:campaign,:actor,'perception',2)"
+            ),
+            {"campaign": CAMPAIGN_A, "actor": ACTOR_A},
+        )
+        connection.execute(
+            text(
+                "INSERT INTO mvp_scene_skill_checks("
+                "campaign_id,scene_id,check_ref,skill_ref,difficulty,public_description"
+                ") VALUES("
+                ":campaign,:scene,'observe_room','perception','normal','足跡がある。'"
+                ")"
+            ),
+            {"campaign": CAMPAIGN_A, "scene": SCENE_A},
+        )
+
+    class FixedRandom:
+        def randint(self, lower: int, upper: int) -> int:
+            return 10
+
+    class RevokingTransport:
+        async def request(
+            self,
+            model_id: str,
+            purpose: str,
+            instruction: str,
+            input_data: str,
+            output_schema: dict[str, object],
+        ) -> object:
+            with database.begin() as connection:
+                connection.execute(
+                    text(
+                        "UPDATE campaign_members SET active=false "
+                        "WHERE campaign_id=:campaign AND principal_id=:principal"
+                    ),
+                    {"campaign": CAMPAIGN_A, "principal": PRINCIPAL_A},
+                )
+            return {
+                "kind": "action_plan",
+                "actions": [
+                    {
+                        "kind": "skill_check",
+                        "skill_ref": "perception",
+                        "objective": "足跡を見つける",
+                        "target_ref": None,
+                    }
+                ],
+            }
+
+    async def resolve() -> None:
+        url = database.url.render_as_string(hide_password=False)
+        async with _postgres_sessions(url) as factory:
+
+            def unit_of_work_factory() -> PostgresUnitOfWork:
+                return PostgresUnitOfWork(factory)
+
+            accepted = await _accept_turn(
+                factory, _player_turn("周囲を注意深く観察する")
+            )
+            worker = SkillCheckResolutionWorker(
+                unit_of_work_factory,
+                RevokingTransport(),
+                MvpV1Ruleset(DiceEngine(FixedRandom())),
+                WorkerPhasePolicy(60, 3, 120, "fake-turn"),
+            )
+            assert await worker.run_once(accepted.turn_id)
+
+    with asyncio.Runner(loop_factory=asyncio.SelectorEventLoop) as runner:
+        runner.run(resolve())
+
+    with database.connect() as connection:
+        assert connection.execute(
+            text(
+                "SELECT resolution_status,narration_status,llm_call_count "
+                "FROM turns WHERE request_id=:request"
+            ),
+            {"request": REQUEST_A},
+        ).one() == ("not_applied", "completed", 1)
+        assert connection.scalar(text("SELECT count(*) FROM actions")) == 0

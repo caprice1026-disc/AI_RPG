@@ -17,10 +17,14 @@ def test_metadata_contains_contract_tables_and_worker_control_columns() -> None:
         "mvp_skill_modifiers",
         "mvp_weapons",
         "mvp_inventory",
+        "mvp_scene_skill_checks",
     } <= set(Base.metadata.tables)
 
     assert {
         "llm_call_budget",
+        "initial_route",
+        "routing_rule_version",
+        "routing_reason_codes",
         "resolution_attempt_count",
         "resolution_deadline",
         "narration_worker_epoch",

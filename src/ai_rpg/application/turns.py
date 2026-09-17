@@ -4,6 +4,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from uuid import UUID
 
+from ai_rpg.application.auth import AuthenticatedPrincipal
 from ai_rpg.application.ports import AuthorizationError as AuthorizationError
 from ai_rpg.application.ports import AuthorizationPolicy, UnitOfWork
 from ai_rpg.contracts import PlayerTurnInput, TurnResponse, make_decision_types
@@ -40,10 +41,14 @@ class TurnService:
         )
 
     async def accept(
-        self, principal_id: UUID, campaign_id: UUID, turn: PlayerTurnInput
+        self,
+        principal: AuthenticatedPrincipal,
+        campaign_id: UUID,
+        turn: PlayerTurnInput,
     ) -> TurnResponse:
         """権限を検証し、受付時の実効設定と共にTurnを保存する。"""
 
+        principal_id = principal.principal_id
         allowed = await self._authorization.can_access_campaign(principal_id, campaign_id)
         if not allowed:
             raise AuthorizationError("Campaignを参照する権限がありません")
