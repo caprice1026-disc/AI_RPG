@@ -1,45 +1,80 @@
+<div align="center">
+
 # AI_RPG
 
-LLMが物語上の意図と描写を担当し、ゲーム上の判定・状態変更・履歴は決定的なEngineとPostgreSQLで管理するAI TRPG基盤です。
+**LLMは物語を語る。ゲームの真実は、EngineとPostgreSQLが守る。**
 
-## 現在の状態
+LLMの創造性と、決定的なゲームルール・永続状態・障害復旧を分離したAI TRPG基盤です。
 
-まだ実モデルやUIを接続した完成アプリではありません。現在はFake LLMで、入力から技能判定、確定、描写、次Turn受付までを実PostgreSQL上で一往復できます。
+![Python 3.11+](https://img.shields.io/badge/Python-3.11%2B-3776AB?logo=python&logoColor=white)
+![FastAPI](https://img.shields.io/badge/FastAPI-0.115%2B-009688?logo=fastapi&logoColor=white)
+![PostgreSQL](https://img.shields.io/badge/PostgreSQL-16-4169E1?logo=postgresql&logoColor=white)
+![Status](https://img.shields.io/badge/status-MVP%20in%20progress-F59E0B)
 
-- FastAPIのhealth、Turn受付、認可付きTurn取得endpoint
-- 認証済みprincipalのApplication境界と、未設定時に必ず401となる既定認証
-- 受付時、LLM呼出前、確定直前のCampaign membership／Actor操作権再検証
-- 型付きのPlayer／LLM／Command／Result／Event契約
-- 再現可能なダイスと`mvp_v1`技能判定
-- 難易度名からDCへの変換を含む、Applicationから独立した`mvp_v1` ruleset
-- ADR-0009に基づく決定的なNarrative／Mechanical Router
-- PostgreSQL migration、Turnの冪等受付、lease、atomicなAction／Event確定
-- Infrastructure限定のSQLAlchemy型付きmodelと通常CRUD／snapshotの型付きクエリ
-- Turn単位のDB永続LLM予算、phase別attempt／固定deadline
-- 解決とは独立した描写lease／epochと、描写・Choice・GMイベントのatomic保存
-- timeout、Schema不正、worker交代、予算・deadline到達時のDB回収とfallback
-- 受付時state versionをworkerまで固定し、更新後の状態で黙って再判定しない競合処理
-- lock待ちを含めたDB実時刻によるlease／deadline検証
-- 描写がcompleted／fallbackになるまで次Turnを閉じるCampaign単位制約
-- damage、healing、item consumptionの型付きStateChangeと保存projection
-- Fake transportを使う技能判定、Narrative通常応答、Mechanical昇格
-- 並行受付、stale worker、commit応答喪失、二重確定、transaction rollbackの実PostgreSQLテスト
+[特徴](#特徴) ・ [クイックスタート](#クイックスタート) ・ [アーキテクチャ](#アーキテクチャ) ・ [コントリビューション](#コントリビューション)
 
-実モデル接続、攻撃・回復・アイテム使用の実行経路、SSE、UIはまだ行いません。既定のHTTP認証は意図的に未設定で、テストだけが認証済みprincipalを注入します。
+</div>
 
-## 責務の境界
+## AI_RPGとは
+
+AI_RPGは、LLMにゲーム状態を直接変更させないAI TRPGバックエンドです。LLMはプレイヤー入力から意図を抽出し、確定済み結果を描写します。判定、乱数、HPや在庫の変更、イベント履歴は、型付きのGame EngineとPostgreSQL transactionが担当します。
+
+現在のMVPでは、Fake LLMを使って次の一往復を実PostgreSQL上で再現できます。
+
+```text
+プレイヤー入力 → 意図抽出 → 技能判定 → atomic保存 → 結果描写 → 次Turn受付
+```
+
+> [!IMPORTANT]
+> 現在は基盤機能を検証するMVPです。実モデル、本番認証、常駐worker runner、SSE、UIはまだ接続していません。
+
+## 特徴
+
+| 領域 | AI_RPGが守ること |
+| --- | --- |
+| LLM境界 | LLM出力を`ActionIntent`として扱い、Commandや状態変更へ直接採用しない |
+| Game Engine | ダイス、難易度、補正、damage、healing、item consumptionを決定的に計算する |
+| 永続化 | Action、Event、Canonical State、Turnを一つのtransactionで確定する |
+| 冪等性 | 同じ`request_id`の再送、並行受付、commit応答喪失でも二重適用しない |
+| Worker | 解決と描写で独立したlease／epochを持ち、stale workerの保存を拒否する |
+| 予算と復旧 | LLM呼出回数、試行回数、deadlineをDBに残し、再起動後も引き継ぐ |
+| セキュリティ | 受付時、LLM呼出前、確定直前にCampaign membershipとActor操作権を再確認する |
+
+### 現在できること
+
+- FastAPIによるTurn受付と、認可付きTurn取得
+- Narrative／Mechanicalを分ける決定的なTurn Router
+- `mvp_v1` rulesetによる再現可能な技能判定
+- Fake transportによる通常描写とMechanicalへの昇格
+- PostgreSQL migrationとSQLAlchemy 2の型付きmodel／query
+- timeout、Schema不正、worker交代、予算切れ、deadline到達時の回収とfallback
+- state version競合、古いlease、二重確定、rollbackを含む実PostgreSQLテスト
+
+## アーキテクチャ
+
+```mermaid
+flowchart LR
+    P[Player input] --> API[FastAPI]
+    API --> R[Deterministic Router]
+    R --> I[LLM: Intent only]
+    I --> A[Application validation]
+    A --> E[Game Engine]
+    E --> DB[(PostgreSQL)]
+    DB --> N[LLM: Narration only]
+    N --> DTO[Public Turn DTO]
+```
 
 - `contracts/`: 外部入力、LLM入出力、公開レスポンス
 - `domain/`: Engineが正本として扱うCommand、Result、StateChange、Event
 - `engine/`: ダイス、HP、回復、在庫などのルール計算
-- `application/`: Engine結果とAction／Event／Canonical mutationの対応検証・投影
-- `infrastructure/`: PostgreSQL行lock、保存前値照合、SQL実行、外部adapter
+- `application/`: 認可、参照解決、Engine結果の検証、永続化projection
+- `infrastructure/`: PostgreSQL行lock、保存前値照合、Repository、外部adapter
 
-LLM出力は`ActionIntent`であり、DBへ直接保存するCommandや状態変更ではありません。Engineが`DamageApplied`、`HealingApplied`、`ItemConsumed`を生成し、Applicationが一度だけ永続化単位へ変換します。
+詳しい判断理由は[Architecture Decision Records](docs/adr/README.md)に残しています。
 
-## 開発環境
+## クイックスタート
 
-Python 3.11以上とPostgreSQLを使用します。Windowsでは既存の`.venv`を利用できます。
+必要なものはPython 3.11以上、[uv](https://docs.astral.sh/uv/)、PostgreSQLです。
 
 ```powershell
 .\.venv\Scripts\uv.exe sync --frozen
@@ -49,7 +84,7 @@ Python 3.11以上とPostgreSQLを使用します。Windowsでは既存の`.venv`
 .\.venv\Scripts\uv.exe build
 ```
 
-2026-09-17時点で、実PostgreSQLを指定した全スイートは`171 passed`、Ruffとmypyも成功しています。
+2026-09-17時点で、実PostgreSQLを指定した全スイートは`176 passed`です。
 
 PostgreSQL統合テストには、名前が`ai_rpg_test`で始まる専用の空DBを指定します。fixtureは既存テーブルがあるDBを拒否します。
 Alembicは空DBだけでなく、既存revisionからheadへの更新もテストします。
@@ -70,7 +105,7 @@ $env:AIRPG_TEST_DATABASE_URL = "postgresql+psycopg://postgres:postgres@localhost
 docker stop ai-rpg-test-postgres
 ```
 
-## Fake LLM一往復を自動受入テストで再現する
+## Fake LLMで一往復を試す
 
 実モデルのAPIキーは不要です。上記の専用PostgreSQLを用意し、次の受入テストを実行します。fixtureがmigration、Campaign／PC／Scene／技能条件、認証principal、固定ダイス、Fake応答を用意します。
 
@@ -79,7 +114,7 @@ $env:AIRPG_TEST_DATABASE_URL = "postgresql+psycopg://USER:PASSWORD@HOST:PORT/ai_
 .\.venv\Scripts\python.exe -m pytest tests\integration\postgres\test_migrations.py -q -p no:cacheprovider -k "fake_llm_skill_check_round_trip_reopens_turn_acceptance or narrative_route_commits_zero_actions_in_one_llm_call or narrative_escalation_reuses_first_call_as_mechanical_intent or narration_timeout_survives_worker_replacement_and_falls_back"
 ```
 
-中心シナリオは次を自動確認します。
+この受入テストは、次のシナリオを自動確認します。
 
 1. `POST /campaigns/{campaign_id}/turns`で「周囲を注意深く観察する」を受け付ける。
 2. 解決workerがDBで呼出予算を予約し、Fake Intentと固定出目10を使って`10 + 2 = 12`の成功を確定する。
@@ -87,10 +122,53 @@ $env:AIRPG_TEST_DATABASE_URL = "postgresql+psycopg://USER:PASSWORD@HOST:PORT/ai_
 4. `GET /campaigns/{campaign_id}/turns/{turn_id}`と同一request再送が同じ公開DTOを返す。
 5. 描写終端後に次のTurnを受け付ける。
 
-通常のMechanical経路はFake呼出2回、Narrative通常応答は1回です。timeoutや不正出力も送信直前に予約した回数を消費し、worker再生成後も予算とdeadlineはDBから引き継がれます。
-登録済み条件へ解決できない行動や行動不能なActorはprovider障害として再試行せず、1回のIntent取得後に`not_applied`として説明付きで終端化します。
+通常のMechanical経路はFake呼出2回、Narrative通常応答は1回です。timeoutや不正出力も呼出予算を消費し、worker再生成後も予算とdeadlineをDBから引き継ぎます。
 
-この再現方法ではpytest harnessが認証principal、ASGI API、解決worker、描写workerを接続し、worker交代も別インスタンスで検証します。独立したAPI／workerプロセスを起動するfixture投入CLI、本番認証adapter、常駐worker runnerの配布は後続範囲です。
+## ロードマップ
+
+- [x] Fake LLMによる技能判定の一往復
+- [x] 冪等受付、atomic確定、独立した描写worker
+- [x] 永続LLM予算、lease、deadline、障害復旧
+- [ ] 開発用の独立API／worker runner
+- [ ] 実モデルと本番認証adapter
+- [ ] 攻撃・回復・アイテム使用のAPI経路
+- [ ] SSEとプレイヤー向けUI
+
+## コントリビューション
+
+AI_RPGは開発途中です。小さなドキュメント改善、テスト追加、境界の整理から参加できます。
+
+1. [Issues](https://github.com/caprice1026-disc/AI_RPG/issues)で既存の議論を確認する。
+2. 初参加なら[`good first issue`](https://github.com/caprice1026-disc/AI_RPG/issues?q=is%3Aissue+is%3Aopen+label%3A%22good+first+issue%22)から探す。
+3. 大きな変更は実装前にIssueで目的と範囲を共有する。
+4. Pull Requestには変更理由と実行したテストを書く。
+
+Issueの目安として、次のラベルを使います。
+
+| ラベル | 対象 |
+| --- | --- |
+| `good first issue` | 小さく独立し、初参加でも取り組みやすい変更 |
+| `help wanted` | 設計・実装・検証への協力を募集する変更 |
+| `documentation` | README、ADR、契約書、実行手順の改善 |
+
+運用の参考: [GitHub Community Profile](https://docs.github.com/en/communities/setting-up-your-project-for-healthy-contributions/about-community-profiles-for-public-repositories) / [`good first issue`の活用](https://docs.github.com/en/communities/setting-up-your-project-for-healthy-contributions/encouraging-helpful-contributions-to-your-project-with-labels)
+
+## プロジェクト構成
+
+```text
+src/ai_rpg/
+├── api/              # FastAPI endpoint
+├── application/      # Use case、認可、worker、projection
+├── contracts/        # 外部・LLM・公開DTOの型
+├── domain/           # Command、Result、Event
+├── engine/           # 決定的なゲームルール
+├── infrastructure/   # PostgreSQLと外部adapter
+└── llm/              # Structured outputとFake transport
+
+migrations/           # Alembic migration
+tests/                # Unit、contract、PostgreSQL integration
+docs/                 # Architecture、ADR、実装方針
+```
 
 ## 設計資料
 
@@ -98,3 +176,4 @@ $env:AIRPG_TEST_DATABASE_URL = "postgresql+psycopg://USER:PASSWORD@HOST:PORT/ai_
 - [Contracts](docs/ai-trpg-contracts-v0.2.md)
 - [ADR index](docs/adr/README.md)
 - [MVP ruleset](docs/adr/0007-mvp-ruleset.md)
+- [Fake LLM round trip](docs/ai-trpg-fake-llm.md)
