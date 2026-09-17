@@ -70,7 +70,7 @@ from ai_rpg.infrastructure.postgres.repositories import (
     PostgresNarrationRepository,
     PostgresTurnRepository,
 )
-from ai_rpg.llm import ScriptedFakeTransport
+from ai_rpg.llm import ProviderRefusalError, ScriptedFakeTransport
 
 URL = os.getenv("AIRPG_TEST_DATABASE_URL")
 ROOT = Path(__file__).parents[3]
@@ -3032,6 +3032,94 @@ def test_resolution_context_uses_only_recent_completed_public_history(
     assert "SECRET_" not in serialized
 
 
+def test_ungrounded_result_narration_retries_then_falls_back(database: Engine) -> None:
+    with database.begin() as connection:
+        _seed_resolution_state(connection)
+        connection.execute(
+            text(
+                "INSERT INTO mvp_skill_modifiers("
+                "campaign_id,character_id,skill_ref,modifier"
+                ") VALUES(:campaign,:actor,'perception',2)"
+            ),
+            {"campaign": CAMPAIGN_A, "actor": ACTOR_A},
+        )
+        connection.execute(
+            text(
+                "INSERT INTO mvp_scene_skill_checks("
+                "campaign_id,scene_id,check_ref,skill_ref,difficulty,public_description"
+                ") VALUES("
+                ":campaign,:scene,'observe_room','perception','normal','足跡がある。'"
+                ")"
+            ),
+            {"campaign": CAMPAIGN_A, "scene": SCENE_A},
+        )
+
+    class FixedRandom:
+        def randint(self, lower: int, upper: int) -> int:
+            assert lower <= 10 <= upper
+            return 10
+
+    async def run_workers() -> int:
+        url = database.url.render_as_string(hide_password=False)
+        async with _postgres_sessions(url) as factory:
+
+            def unit_of_work_factory() -> PostgresUnitOfWork:
+                return PostgresUnitOfWork(factory)
+
+            accepted = await _accept_turn(
+                factory, _player_turn("周囲を注意深く観察する")
+            )
+            resolution = SkillCheckResolutionWorker(
+                unit_of_work_factory,
+                ScriptedFakeTransport(
+                    [
+                        {
+                            "kind": "action_plan",
+                            "actions": [
+                                {
+                                    "kind": "skill_check",
+                                    "skill_ref": "perception",
+                                    "objective": "足跡を見つける",
+                                    "target_ref": None,
+                                }
+                            ],
+                        }
+                    ]
+                ),
+                MvpV1Ruleset(DiceEngine(FixedRandom())),
+                WorkerPhasePolicy(60, 3, 120, "fake-intent"),
+            )
+            assert await resolution.run_once(accepted.turn_id)
+            transport = ScriptedFakeTransport(
+                [
+                    {"narration": "判定結果は999だった。", "choices": []},
+                    {"narration": "判定結果は999だった。", "choices": []},
+                ]
+            )
+            narration = NarrationWorker(
+                unit_of_work_factory,
+                transport,
+                WorkerPhasePolicy(60, 3, 120, "fake-narration"),
+            )
+            assert await narration.run_once(accepted.turn_id)
+            assert await narration.run_once(accepted.turn_id)
+            return transport.request_count
+
+    with asyncio.Runner(loop_factory=asyncio.SelectorEventLoop) as runner:
+        request_count = runner.run(run_workers())
+
+    assert request_count == 2
+    with database.connect() as connection:
+        assert connection.execute(
+            text(
+                "SELECT resolution_status,narration_status,recovery_reason,"
+                "llm_call_count,narration_attempt_count FROM turns "
+                "WHERE request_id=:request"
+            ),
+            {"request": REQUEST_A},
+        ).one() == ("committed", "fallback", "INVALID_OUTPUT", 3, 2)
+
+
 def test_incapacitated_actor_is_not_retried(database: Engine) -> None:
     with database.begin() as connection:
         _seed_resolution_state(connection)
@@ -3529,6 +3617,43 @@ def test_invalid_narrative_output_consumes_the_single_call_budget(
             {"request": REQUEST_A},
         ).one() == ("failed", "fallback", "INVALID_OUTPUT", 1, 1)
         assert connection.scalar(text("SELECT count(*) FROM actions")) == 0
+
+
+def test_provider_refusal_uses_public_recovery_reason(database: Engine) -> None:
+    with database.begin() as connection:
+        _seed_resolution_state(connection)
+
+    class UnusedRandom:
+        def randint(self, lower: int, upper: int) -> int:
+            raise AssertionError(f"dice must not be used: {lower}-{upper}")
+
+    async def resolve() -> None:
+        url = database.url.render_as_string(hide_password=False)
+        async with _postgres_sessions(url) as factory:
+
+            def unit_of_work_factory() -> PostgresUnitOfWork:
+                return PostgresUnitOfWork(factory)
+
+            accepted = await _accept_turn(factory, _player_turn("今日は静かだね"))
+            worker = SkillCheckResolutionWorker(
+                unit_of_work_factory,
+                ScriptedFakeTransport([ProviderRefusalError("refused")]),
+                MvpV1Ruleset(DiceEngine(UnusedRandom())),
+                WorkerPhasePolicy(60, 3, 120, "fake-narrative"),
+            )
+            assert await worker.run_once(accepted.turn_id)
+
+    with asyncio.Runner(loop_factory=asyncio.SelectorEventLoop) as runner:
+        runner.run(resolve())
+
+    with database.connect() as connection:
+        assert connection.execute(
+            text(
+                "SELECT resolution_status,narration_status,recovery_reason,llm_call_count "
+                "FROM turns WHERE request_id=:request"
+            ),
+            {"request": REQUEST_A},
+        ).one() == ("failed", "fallback", "MODEL_REFUSAL", 1)
 
 
 def test_narrative_route_commits_zero_actions_in_one_llm_call(database: Engine) -> None:

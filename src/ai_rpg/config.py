@@ -3,7 +3,7 @@
 from functools import lru_cache
 from typing import Self
 
-from pydantic import Field, model_validator
+from pydantic import Field, SecretStr, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -27,6 +27,7 @@ class Settings(BaseSettings):
     fast_model: str = Field(default="gpt-5-mini", min_length=1)
     quality_model: str = Field(default="gpt-5.4", min_length=1)
     background_model: str = Field(default="gpt-5-mini", min_length=1)
+    openai_api_key: SecretStr | None = None
     database_url: str = Field(
         default="postgresql+psycopg://airpg:airpg@localhost/airpg", min_length=1
     )

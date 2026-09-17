@@ -9,6 +9,10 @@ from uuid import UUID, uuid4
 
 from pydantic import TypeAdapter, ValidationError
 
+from ai_rpg.application.narration_grounding import (
+    NarrationGroundingError,
+    validate_mechanical_narration,
+)
 from ai_rpg.application.ports import (
     ActionRecord,
     AuthorizationError,
@@ -39,7 +43,12 @@ from ai_rpg.domain.events import RNGMetadata
 from ai_rpg.domain.models import CharacterState
 from ai_rpg.domain.results import ResolvedAction
 from ai_rpg.engine import MvpV1Ruleset
-from ai_rpg.llm import CallBudgetExceeded
+from ai_rpg.llm import (
+    CallBudgetExceeded,
+    ProviderHTTPError,
+    ProviderOutputError,
+    ProviderRefusalError,
+)
 from ai_rpg.llm.structured import ProviderTransport, StructuredOutputAdapter, StructuredRequest
 
 
@@ -242,11 +251,15 @@ class SkillCheckResolutionWorker:
             )
         except TimeoutError:
             return await self._handle_failure(work, "MODEL_TIMEOUT")
-        except ValidationError:
+        except ProviderRefusalError:
+            return await self._handle_failure(work, "MODEL_REFUSAL")
+        except (ValidationError, ProviderOutputError):
             return await self._handle_failure(work, "INVALID_OUTPUT")
         except CallBudgetExceeded:
             return await self._handle_failure(work, "UNKNOWN")
         except (ConnectionError, OSError):
+            return await self._handle_failure(work, "UNKNOWN")
+        except ProviderHTTPError:
             return await self._handle_failure(work, "UNKNOWN")
         except ResolutionInputError:
             return await self._finalize_not_applied(
@@ -290,11 +303,15 @@ class SkillCheckResolutionWorker:
                 )
         except TimeoutError:
             return await self._handle_failure(work, "MODEL_TIMEOUT")
-        except ValidationError:
+        except ProviderRefusalError:
+            return await self._handle_failure(work, "MODEL_REFUSAL")
+        except (ValidationError, ProviderOutputError):
             return await self._handle_failure(work, "INVALID_OUTPUT")
         except CallBudgetExceeded:
             return await self._handle_failure(work, "UNKNOWN")
         except (ConnectionError, OSError):
+            return await self._handle_failure(work, "UNKNOWN")
+        except ProviderHTTPError:
             return await self._handle_failure(work, "UNKNOWN")
         except Exception:
             return await self._handle_failure(work, "UNKNOWN")
@@ -751,18 +768,27 @@ class NarrationWorker:
                     StructuredRequest(
                         model_id=self._policy.model_id,
                         purpose="result_narration",
-                        system_instruction="保存済みの確定結果だけを描写し、新しいゲーム事実を追加しない。",
+                        system_instruction=(
+                            "保存済みの確定結果だけを描写し、新しいゲーム事実を追加しない。"
+                            "数値は入力にある値だけを使い、entity/itemを明示するときは"
+                            "allowed_entity_refsの@refだけを使う。"
+                        ),
                         input_data=_json(work.narration_input.model_dump(mode="json")),
                         output_adapter=TypeAdapter(MechanicalNarrationDraft),
                     )
                 )
+                validate_mechanical_narration(work.narration_input, draft)
         except TimeoutError:
             return await self._handle_failure(work, "MODEL_TIMEOUT")
-        except ValidationError:
+        except ProviderRefusalError:
+            return await self._handle_failure(work, "MODEL_REFUSAL")
+        except (ValidationError, ProviderOutputError, NarrationGroundingError):
             return await self._handle_failure(work, "INVALID_OUTPUT")
         except CallBudgetExceeded:
             return await self._handle_failure(work, "UNKNOWN")
         except (ConnectionError, OSError):
+            return await self._handle_failure(work, "UNKNOWN")
+        except ProviderHTTPError:
             return await self._handle_failure(work, "UNKNOWN")
         choices = tuple(
             ChoiceDraft(self._choice_id_factory(), ordinal, choice.label)

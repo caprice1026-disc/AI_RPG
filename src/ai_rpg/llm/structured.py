@@ -12,6 +12,24 @@ OutputT = TypeVar("OutputT")
 LLMPurpose: TypeAlias = Literal["intent", "narrative", "result_narration"]
 
 
+class ProviderError(RuntimeError):
+    """provider境界で分類済みの失敗。"""
+
+
+class ProviderHTTPError(ProviderError):
+    def __init__(self, status_code: int) -> None:
+        self.status_code = status_code
+        super().__init__(f"provider HTTP {status_code}")
+
+
+class ProviderOutputError(ProviderError):
+    """provider応答が空、未完了、またはJSONとして不正。"""
+
+
+class ProviderRefusalError(ProviderError):
+    """providerが構造化出力の代わりに拒否を返した。"""
+
+
 @dataclass(frozen=True, slots=True)
 class StructuredRequest(Generic[OutputT]):
     """モデルへ渡すデータと期待する出力契約。"""

@@ -50,10 +50,10 @@
 
 **作成・変更:** `src/ai_rpg/llm/openai.py`、`src/ai_rpg/llm/__init__.py`、`src/ai_rpg/config.py`、`src/ai_rpg/runtime.py`、`pyproject.toml`、`tests/contract/test_openai_transport.py`
 
-- [ ] HTTP transportを差し替えたcontract testで、model、instruction、input、JSON Schema、timeout、`Authorization`を確認する。
-- [ ] SDK自動retryを持たない単発requestとしてResponses APIを呼び、refusal、HTTP失敗、空/不正JSONをApplicationで分類できる例外へ変換する。
-- [ ] API keyは`AIRPG_OPENAI_API_KEY`からだけ読み、Fake実行では不要、本番adapter選択時だけfail fastにする。
-- [ ] 保存済み確定結果にない数値・entity・itemを描写した出力を拒否する事実整合性評価を追加し、予算内retryまたはfallbackへ送る。
+- [x] HTTP transportを差し替えたcontract testで、model、instruction、input、JSON Schema、timeout、`Authorization`を確認する。
+- [x] SDK自動retryを持たない単発requestとしてResponses APIを呼び、refusal、HTTP失敗、空/不正JSONをApplicationで分類できる例外へ変換する。
+- [x] API keyは`AIRPG_OPENAI_API_KEY`からだけ読み、Fake実行では不要、本番adapter選択時だけfail fastにする。
+- [x] 保存済み確定結果にない数値・明示entity/item refを描写した出力を拒否する事実整合性評価を追加し、予算内retryまたはfallbackへ送る。
 
 ## チェックポイント5: 最小プレイ画面
 
@@ -90,6 +90,6 @@
 | 1 レビュー3件 | 完了 | 完了 | `176 passed`、Ruff、mypy（2026-09-17） |
 | 2 独立Fake process | 完了 | 完了 | 実process受入を含む`179 passed`（2026-09-17） |
 | 3 複数Turn Context | 完了 | 完了 | 公開履歴・確認回答を含む`184 passed`（2026-09-17） |
-| 4 OpenAI adapter | 未着手 | 未着手 | - |
+| 4 OpenAI adapter | 完了 | 完了 | HTTP contract・拒否・事実逸脱を含む`200 passed`（2026-09-17） |
 | 5 最小プレイ画面 | 未着手 | 未着手 | - |
 | 6 攻撃・回復item・SSE | 未着手 | 未着手 | - |

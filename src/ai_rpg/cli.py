@@ -11,9 +11,9 @@ from uuid import UUID
 from ai_rpg.api import create_app
 from ai_rpg.application import AuthenticatedPrincipal
 from ai_rpg.config import get_settings
-from ai_rpg.llm import DevelopmentFakeTransport
 from ai_rpg.runtime import (
     build_narration_worker,
+    build_provider_transport,
     build_resolution_worker,
     migrate_database,
     run_worker,
@@ -95,11 +95,12 @@ def main(argv: Sequence[str] | None = None) -> None:
         )
         return
 
-    if not args.fake:
-        parser.error("worker起動には現在 --fake が必要です")
-    transport = DevelopmentFakeTransport()
+    try:
+        transport = build_provider_transport(settings, fake=args.fake)
+    except ValueError as error:
+        parser.error(str(error))
     worker = (
-        build_resolution_worker(settings, transport, deterministic=True)
+        build_resolution_worker(settings, transport, deterministic=args.fake)
         if args.command == "resolution-worker"
         else build_narration_worker(settings, transport)
     )

@@ -60,3 +60,15 @@ def test_recent_message_limit_rejects_out_of_range_values(
 
     with pytest.raises(ValidationError):
         Settings()
+
+
+def test_openai_api_key_is_read_as_a_secret(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("AIRPG_OPENAI_API_KEY", "test-secret")
+
+    settings = Settings()
+
+    assert settings.openai_api_key is not None
+    assert settings.openai_api_key.get_secret_value() == "test-secret"
+    assert "test-secret" not in repr(settings)

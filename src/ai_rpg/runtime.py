@@ -19,6 +19,7 @@ from ai_rpg.config import Settings
 from ai_rpg.engine import DiceEngine, MvpV1Ruleset, SecureRandomSource, SeededRandomSource
 from ai_rpg.infrastructure.database import create_session_factory
 from ai_rpg.infrastructure.postgres import PostgresUnitOfWork
+from ai_rpg.llm import DevelopmentFakeTransport, OpenAIResponsesTransport
 from ai_rpg.llm.structured import ProviderTransport
 
 
@@ -40,6 +41,17 @@ DEVELOPMENT_FIXTURE = DevelopmentFixture(
 
 class RunnableWorker(Protocol):
     async def run_once(self, turn_id: UUID | None = None) -> bool: ...
+
+
+def build_provider_transport(settings: Settings, *, fake: bool) -> ProviderTransport:
+    if fake:
+        return DevelopmentFakeTransport()
+    if settings.openai_api_key is None:
+        raise ValueError("AIRPG_OPENAI_API_KEY is required for real workers")
+    return OpenAIResponsesTransport(
+        settings.openai_api_key.get_secret_value(),
+        settings.llm_timeout_seconds,
+    )
 
 
 def selector_event_loop() -> asyncio.AbstractEventLoop:
