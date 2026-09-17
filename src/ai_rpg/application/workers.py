@@ -19,6 +19,7 @@ from ai_rpg.application.ports import (
     LLMPhase,
     NarrationWorkItem,
     NarrativeCommit,
+    PhaseDeadlineExceededError,
     ResolutionWorkItem,
     StateVersionConflictError,
     UnitOfWork,
@@ -355,6 +356,8 @@ class SkillCheckResolutionWorker:
                 work,
                 "状況が更新されたため応答を確定しませんでした。もう一度入力してください。",
             )
+        except PhaseDeadlineExceededError:
+            return await self._handle_failure(work, "UNKNOWN")
         except Exception as commit_error:
             if await self._commit_is_visible(work, require_completed_narration=True):
                 return True
@@ -401,6 +404,8 @@ class SkillCheckResolutionWorker:
                 work,
                 "状況が更新されたため判定を確定しませんでした。もう一度入力してください。",
             )
+        except PhaseDeadlineExceededError:
+            return await self._handle_failure(work, "UNKNOWN")
         except Exception as commit_error:
             if await self._commit_is_visible(work, require_completed_narration=False):
                 return True
@@ -462,11 +467,6 @@ class SkillCheckResolutionWorker:
     def _public_context(
         self, work: ResolutionWorkItem, snapshot: CanonicalSnapshot
     ) -> tuple[ContextFragment, ContextFragment]:
-        descriptions = [
-            str(check["public_description"])
-            for check in snapshot.skill_checks
-            if check["scene_id"] == work.scene_id
-        ]
         modifiers = [
             f"{row['skill_ref']}:{_stored_int(row['modifier']):+d}"
             for row in snapshot.skills
@@ -477,7 +477,7 @@ class SkillCheckResolutionWorker:
                 source="active_scene",
                 trust_level="trusted",
                 access_scope="public",
-                content="\n".join(descriptions) or "現在のSceneに公開済みの追加情報はない。",
+                content="現在のSceneに公開済みの追加情報はない。",
             ),
             ContextFragment(
                 source="active_pc",
@@ -515,15 +515,18 @@ class SkillCheckResolutionWorker:
     async def _finalize_not_applied(
         self, work: ResolutionWorkItem, question: str
     ) -> bool:
-        async with self._unit_of_work_factory() as unit_of_work:
-            finalized = await unit_of_work.turns.finalize_not_applied(
-                work.turn_id, work.worker_epoch
-            )
-            if not finalized:
-                await unit_of_work.rollback()
-                return False
-            await unit_of_work.commit()
-        return await self._save_terminal_narration(work.turn_id, question, None)
+        try:
+            async with self._unit_of_work_factory() as unit_of_work:
+                finalized = await unit_of_work.turns.finalize_not_applied(
+                    work.turn_id, work.worker_epoch, question
+                )
+                if not finalized:
+                    await unit_of_work.rollback()
+                    return False
+                await unit_of_work.commit()
+        except PhaseDeadlineExceededError:
+            return await self._handle_failure(work, "UNKNOWN")
+        return True
 
     async def _save_terminal_narration(
         self,
@@ -752,7 +755,7 @@ class NarrationWorker:
             )
             if not saved:
                 await unit_of_work.rollback()
-                return False
+                return await self._handle_failure(work, "UNKNOWN")
             await unit_of_work.commit()
         return True
 

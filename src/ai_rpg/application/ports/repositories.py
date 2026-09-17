@@ -50,6 +50,10 @@ class StateVersionConflictError(Exception):
     code = "STATE_VERSION_CONFLICT"
 
 
+class PhaseDeadlineExceededError(RuntimeError):
+    """現在ownerの処理結果がphase deadline後に到着した。"""
+
+
 @dataclass(frozen=True, slots=True)
 class TurnRow:
     id: UUID
@@ -203,7 +207,9 @@ class TurnRepository(Protocol):
 
     async def promote_to_mechanical(self, turn_id: UUID, worker_epoch: int) -> bool: ...
 
-    async def finalize_not_applied(self, turn_id: UUID, worker_epoch: int) -> bool: ...
+    async def finalize_not_applied(
+        self, turn_id: UUID, worker_epoch: int, narration: str
+    ) -> bool: ...
 
     async def commit_resolution(self, bundle: CommitBundle) -> int: ...
 

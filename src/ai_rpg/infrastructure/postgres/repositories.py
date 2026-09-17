@@ -31,6 +31,7 @@ from ai_rpg.application.ports.repositories import (
     NarrationRepository,
     NarrationWorkItem,
     NarrativeCommit,
+    PhaseDeadlineExceededError,
     ResolutionWorkItem,
     StateVersionConflictError,
     TurnInProgressError,
@@ -238,20 +239,26 @@ async def _assert_resolution_lease_current(
     turn_id: UUID,
     worker_epoch: int,
 ) -> None:
-    valid = await session.scalar(
-        text(
-            """
-            SELECT lease_until>clock_timestamp()
-            FROM turns
-            WHERE id=:turn
-              AND worker_epoch=:epoch
-              AND resolution_status='resolving'
-            """
-        ),
-        {"turn": turn_id, "epoch": worker_epoch},
-    )
-    if valid is not True:
+    validity = (
+        await session.execute(
+            text(
+                """
+                SELECT
+                    lease_until>clock_timestamp() AS lease_current,
+                    resolution_deadline>clock_timestamp() AS deadline_current
+                FROM turns
+                WHERE id=:turn
+                  AND worker_epoch=:epoch
+                  AND resolution_status='resolving'
+                """
+            ),
+            {"turn": turn_id, "epoch": worker_epoch},
+        )
+    ).mappings().one_or_none()
+    if validity is None or validity["lease_current"] is not True:
         raise RuntimeError("worker leaseが無効です")
+    if validity["deadline_current"] is not True:
+        raise PhaseDeadlineExceededError("resolution deadlineを超過しました")
 
 
 class PostgresTurnRepository:
@@ -724,7 +731,9 @@ class PostgresTurnRepository:
         )
         return result.scalar_one_or_none() is not None
 
-    async def finalize_not_applied(self, turn_id: UUID, worker_epoch: int) -> bool:
+    async def finalize_not_applied(
+        self, turn_id: UUID, worker_epoch: int, narration: str
+    ) -> bool:
         campaign_id = await self._session.scalar(
             select(TurnModel.campaign_id).where(TurnModel.id == turn_id)
         )
@@ -735,21 +744,67 @@ class PostgresTurnRepository:
             .where(CampaignModel.id == campaign_id)
             .with_for_update()
         )
-        result = await self._session.execute(
-            sql_update(TurnModel)
-            .where(
-                TurnModel.id == turn_id,
-                TurnModel.worker_epoch == worker_epoch,
-                TurnModel.resolution_status == "resolving",
-                TurnModel.lease_until > text("clock_timestamp()"),
+        turn = (
+            await self._session.execute(
+                select(TurnModel).where(TurnModel.id == turn_id).with_for_update()
             )
+        ).scalar_one()
+        if (
+            turn.resolution_status == "not_applied"
+            and turn.narration_status == "completed"
+        ):
+            return True
+        if turn.resolution_status != "resolving" or turn.worker_epoch != worker_epoch:
+            return False
+        await _assert_resolution_lease_current(self._session, turn_id, worker_epoch)
+        campaign = (
+            await self._session.execute(
+                select(CampaignModel.state_version, CampaignModel.event_sequence).where(
+                    CampaignModel.id == campaign_id
+                )
+            )
+        ).one()
+        sequence = int(campaign.event_sequence) + 1
+        await self._session.execute(
+            sql_update(CampaignModel)
+            .where(CampaignModel.id == campaign_id)
+            .values(event_sequence=sequence)
+        )
+        await self._session.execute(
+            sql_update(TurnModel)
+            .where(TurnModel.id == turn_id)
             .values(
                 resolution_status="not_applied",
+                narration_status="completed",
+                narration=narration,
                 lease_until=None,
             )
-            .returning(TurnModel.id)
         )
-        return result.scalar_one_or_none() is not None
+        payload = NarrationGeneratedPayload(narration=narration, fallback=False)
+        await self._session.execute(
+            text(
+                """
+                INSERT INTO events(
+                    id,campaign_id,scene_id,turn_id,action_id,
+                    sequence,state_version,type,schema_version,payload
+                )
+                VALUES(
+                    :id,:campaign,:scene,:turn,NULL,
+                    :sequence,:version,'GMNarrationGenerated',1,CAST(:payload AS jsonb)
+                )
+                """
+            ),
+            {
+                "id": self._event_id_factory(),
+                "campaign": campaign_id,
+                "scene": turn.scene_id,
+                "turn": turn_id,
+                "sequence": sequence,
+                "version": int(campaign.state_version),
+                "payload": _json(payload.model_dump(mode="json")),
+            },
+        )
+        return True
 
     async def commit_resolution(self, bundle: CommitBundle) -> int:
         # デッドロックを避ける不変順序: Campaign、Turn。
@@ -1435,6 +1490,7 @@ class PostgresNarrationRepository:
                   AND narration_worker_epoch=:epoch
                   AND narration_status='generating'
                   AND narration_lease_until>clock_timestamp()
+                  AND (:fallback OR narration_deadline>clock_timestamp())
                 RETURNING scene_id,actor_id,committed_state_version
                 """
             ),
@@ -1442,6 +1498,7 @@ class PostgresNarrationRepository:
                 "status": "fallback" if fallback_reason else "completed",
                 "n": narration,
                 "reason": fallback_reason,
+                "fallback": fallback_reason is not None,
                 "t": turn_id,
                 "c": campaign_id,
                 "epoch": worker_epoch,
