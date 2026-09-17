@@ -15,7 +15,11 @@ dependencies = [
   "pydantic-settings>=2.7,<3",
   "sqlalchemy[asyncio]>=2.0,<3",
   "psycopg[binary]>=3.2,<4",
+  "uvicorn>=0.34,<1",
 ]
+
+[project.scripts]
+ai-rpg = "ai_rpg.cli:main"
 
 [dependency-groups]
 dev = [

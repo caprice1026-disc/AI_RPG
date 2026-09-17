@@ -3,6 +3,7 @@
 import asyncio
 import json
 import os
+import socket
 import subprocess
 import sys
 import time
@@ -18,7 +19,7 @@ from unittest.mock import MagicMock
 from uuid import UUID, uuid4
 
 import pytest
-from httpx import ASGITransport, AsyncClient
+from httpx import ASGITransport, AsyncClient, Client
 from sqlalchemy import Connection, Engine, RowMapping, create_engine, event, text
 from sqlalchemy.engine import make_url
 from sqlalchemy.exc import DBAPIError, IntegrityError
@@ -4559,3 +4560,159 @@ def test_narration_result_after_phase_deadline_becomes_fallback(database: Engine
             "UNKNOWN",
             "判定結果は保存されましたが、描写を生成できませんでした。",
         )
+
+
+def test_development_fixture_is_idempotent(database: Engine) -> None:
+    from ai_rpg.runtime import seed_development_fixture
+
+    url = database.url.render_as_string(hide_password=False)
+    first = seed_development_fixture(url)
+    second = seed_development_fixture(url)
+
+    assert second == first
+    with database.connect() as connection:
+        assert connection.scalar(
+            text("SELECT count(*) FROM campaigns WHERE id=:id"),
+            {"id": first.campaign_id},
+        ) == 1
+        assert connection.scalar(
+            text(
+                "SELECT count(*) FROM campaign_members "
+                "WHERE campaign_id=:campaign AND principal_id=:principal AND active"
+            ),
+            {"campaign": first.campaign_id, "principal": first.principal_id},
+        ) == 1
+        assert connection.scalar(
+            text(
+                "SELECT count(*) FROM mvp_characters "
+                "WHERE campaign_id=:campaign AND entity_id=:actor"
+            ),
+            {"campaign": first.campaign_id, "actor": first.actor_id},
+        ) == 1
+        assert connection.execute(
+            text(
+                "SELECT modifier FROM mvp_skill_modifiers "
+                "WHERE campaign_id=:campaign AND character_id=:actor "
+                "AND skill_ref='perception'"
+            ),
+            {"campaign": first.campaign_id, "actor": first.actor_id},
+        ).scalar_one() == 2
+        assert connection.execute(
+            text(
+                "SELECT difficulty,public_description FROM mvp_scene_skill_checks "
+                "WHERE campaign_id=:campaign AND scene_id=:scene "
+                "AND check_ref='observe_room'"
+            ),
+            {"campaign": first.campaign_id, "scene": first.scene_id},
+        ).one() == ("normal", "床に新しい足跡が残っている。")
+
+
+def test_independent_cli_processes_complete_fake_round_trip(database: Engine) -> None:
+    from ai_rpg.runtime import DEVELOPMENT_FIXTURE
+
+    url = database.url.render_as_string(hide_password=False)
+    env = {**os.environ, "AIRPG_DATABASE_URL": url, "PYTHONUNBUFFERED": "1"}
+    seed = subprocess.run(
+        [sys.executable, "-m", "ai_rpg.cli", "seed-dev"],
+        cwd=ROOT,
+        env=env,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    assert json.loads(seed.stdout)["campaign_id"] == str(DEVELOPMENT_FIXTURE.campaign_id)
+
+    with socket.socket() as listener:
+        listener.bind(("127.0.0.1", 0))
+        port = listener.getsockname()[1]
+    api = subprocess.Popen(
+        [
+            sys.executable,
+            "-m",
+            "ai_rpg.cli",
+            "api",
+            "--host",
+            "127.0.0.1",
+            "--port",
+            str(port),
+            "--dev-principal",
+            str(DEVELOPMENT_FIXTURE.principal_id),
+        ],
+        cwd=ROOT,
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+    )
+    try:
+        base_url = f"http://127.0.0.1:{port}"
+        deadline = time.monotonic() + 10
+        while True:
+            if api.poll() is not None:
+                output = api.stdout.read() if api.stdout is not None else ""
+                pytest.fail(f"API process exited before readiness: {output}")
+            try:
+                with Client(base_url=base_url) as client:
+                    if client.get("/health").status_code == 200:
+                        break
+            except OSError:
+                pass
+            if time.monotonic() >= deadline:
+                pytest.fail("API process did not become ready")
+            time.sleep(0.05)
+
+        request_id = uuid4()
+        with Client(base_url=base_url) as client:
+            accepted = client.post(
+                f"/campaigns/{DEVELOPMENT_FIXTURE.campaign_id}/turns",
+                json={
+                    "request_id": str(request_id),
+                    "expected_state_version": 0,
+                    "actor_id": str(DEVELOPMENT_FIXTURE.actor_id),
+                    "content": {"kind": "text", "text": "周囲を注意深く観察する"},
+                },
+            )
+        assert accepted.status_code == 202
+        turn_id = accepted.json()["turn_id"]
+
+        commands = [
+            ("resolution-worker", True),
+            ("resolution-worker", False),
+            ("narration-worker", True),
+            ("narration-worker", False),
+        ]
+        for command, expected_processed in commands:
+            completed = subprocess.run(
+                [sys.executable, "-m", "ai_rpg.cli", command, "--fake", "--once"],
+                cwd=ROOT,
+                env=env,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            assert json.loads(completed.stdout)["processed"] is expected_processed
+
+        with Client(base_url=base_url) as client:
+            response = client.get(
+                f"/campaigns/{DEVELOPMENT_FIXTURE.campaign_id}/turns/{turn_id}"
+            )
+        assert response.status_code == 200
+        assert response.json()["resolution_status"] == "committed"
+        assert response.json()["narration_status"] == "completed"
+        assert response.json()["action_results"][0]["result"]["outcome"] == "success"
+        with database.connect() as connection:
+            assert connection.scalar(
+                text("SELECT count(*) FROM actions WHERE turn_id=:turn"),
+                {"turn": turn_id},
+            ) == 1
+            assert connection.scalar(
+                text("SELECT count(*) FROM events WHERE turn_id=:turn"),
+                {"turn": turn_id},
+            ) == 3
+    finally:
+        api.terminate()
+        try:
+            api.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            api.kill()
+            api.wait(timeout=5)

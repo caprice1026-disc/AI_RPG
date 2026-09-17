@@ -84,7 +84,7 @@ flowchart LR
 .\.venv\Scripts\uv.exe build
 ```
 
-2026-09-17時点で、実PostgreSQLを指定した全スイートは`176 passed`です。
+2026-09-17時点で、実PostgreSQLを指定した全スイートは`179 passed`です。
 
 PostgreSQL統合テストには、名前が`ai_rpg_test`で始まる専用の空DBを指定します。fixtureは既存テーブルがあるDBを拒否します。
 Alembicは空DBだけでなく、既存revisionからheadへの更新もテストします。
@@ -124,12 +124,59 @@ $env:AIRPG_TEST_DATABASE_URL = "postgresql+psycopg://USER:PASSWORD@HOST:PORT/ai_
 
 通常のMechanical経路はFake呼出2回、Narrative通常応答は1回です。timeoutや不正出力も呼出予算を消費し、worker再生成後も予算とdeadlineをDBから引き継ぎます。
 
+### APIとworkerを別processで動かす
+
+実際のprocess分離を試す場合は、テストDBとは別に開発DBを用意します。
+
+```powershell
+docker run --rm --name ai-rpg-dev-postgres `
+  -e POSTGRES_USER=airpg `
+  -e POSTGRES_PASSWORD=airpg `
+  -e POSTGRES_DB=airpg `
+  -p 5432:5432 -d postgres:16
+$env:AIRPG_DATABASE_URL = "postgresql+psycopg://airpg:airpg@localhost/airpg"
+.\.venv\Scripts\ai-rpg.exe seed-dev
+```
+
+続いて3つのPowerShellを開き、同じ`AIRPG_DATABASE_URL`を設定して起動します。
+
+```powershell
+# Terminal 1: 開発principalを明示したAPI
+.\.venv\Scripts\ai-rpg.exe api `
+  --dev-principal 10000000-0000-0000-0000-000000000021
+
+# Terminal 2: 解決worker
+.\.venv\Scripts\ai-rpg.exe resolution-worker --fake
+
+# Terminal 3: 描写worker
+.\.venv\Scripts\ai-rpg.exe narration-worker --fake
+```
+
+Turnを投入し、返された`turn_id`をGETすると進行状態と描写を確認できます。
+
+```powershell
+$requestId = [guid]::NewGuid()
+$body = @{
+  request_id = $requestId
+  expected_state_version = 0
+  actor_id = "10000000-0000-0000-0000-000000000031"
+  content = @{ kind = "text"; text = "周囲を注意深く観察する" }
+} | ConvertTo-Json -Depth 4
+$turn = Invoke-RestMethod -Method Post `
+  -Uri "http://127.0.0.1:8000/campaigns/10000000-0000-0000-0000-000000000001/turns" `
+  -ContentType "application/json" -Body $body
+Invoke-RestMethod `
+  -Uri "http://127.0.0.1:8000/campaigns/10000000-0000-0000-0000-000000000001/turns/$($turn.turn_id)"
+```
+
+`--once`を付けるとworkerは一回だけ取得を試みて終了します。processを停止・再起動しても、Turn、予算、lease、確定済み結果はPostgreSQLから引き継がれます。`--dev-principal`は開発時だけ明示的に有効化する認証差し替えで、通常起動では引き続き401を返します。
+
 ## ロードマップ
 
 - [x] Fake LLMによる技能判定の一往復
 - [x] 冪等受付、atomic確定、独立した描写worker
 - [x] 永続LLM予算、lease、deadline、障害復旧
-- [ ] 開発用の独立API／worker runner
+- [x] 開発用の独立API／worker runner
 - [ ] 実モデルと本番認証adapter
 - [ ] 攻撃・回復・アイテム使用のAPI経路
 - [ ] SSEとプレイヤー向けUI

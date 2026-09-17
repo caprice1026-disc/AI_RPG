@@ -1,5 +1,6 @@
 """構造化出力adapterの下で使うscript式Fake transport。"""
 
+import json
 from collections.abc import Sequence
 from dataclasses import dataclass
 
@@ -41,3 +42,39 @@ class ScriptedFakeTransport:
         if isinstance(outcome, BaseException):
             raise outcome
         return outcome
+
+
+class DevelopmentFakeTransport:
+    """別processの開発実行で同じ一往復を再現する決定的Fake。"""
+
+    async def request(
+        self,
+        model_id: str,
+        purpose: LLMPurpose,
+        instruction: str,
+        input_data: str,
+        output_schema: dict[str, object],
+    ) -> object:
+        if purpose == "intent":
+            return {
+                "kind": "action_plan",
+                "actions": [
+                    {
+                        "kind": "skill_check",
+                        "skill_ref": "perception",
+                        "objective": "周囲の痕跡を見つける",
+                        "target_ref": None,
+                    }
+                ],
+            }
+        if purpose == "narrative":
+            return {
+                "kind": "narrative",
+                "narration": "静かな時間が流れている。",
+                "choices": [],
+            }
+        payload = json.loads(input_data)
+        actions = payload.get("resolved_actions", [])
+        facts = actions[0].get("result", {}).get("facts", []) if actions else []
+        narration = str(facts[0]) if facts else "判定結果が確定した。"
+        return {"narration": narration, "choices": []}

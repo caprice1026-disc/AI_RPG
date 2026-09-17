@@ -31,11 +31,11 @@
 
 **作成・変更:** `src/ai_rpg/runtime.py`、`src/ai_rpg/cli.py`、`src/ai_rpg/api/app.py`、`pyproject.toml`、`tests/integration/postgres/test_runtime.py`、`README.md`
 
-- [ ] `ai-rpg seed-dev`で固定Campaign、principal、PC、Scene、技能条件を冪等投入するテストをREDにする。
-- [ ] `ai-rpg api`、`ai-rpg resolution-worker`、`ai-rpg narration-worker`が同じ環境設定から別processとして起動し、poll間隔内に一往復するテストをREDにする。
-- [ ] worker loopは`run_once(None)`を繰り返し、未取得時だけ短く待ち、SIGINT/SIGTERMで安全に終了する最小実装にする。
-- [ ] process停止、lease期限切れ、再起動後に同じTurnを回収し、確定済みActionを増やさない統合テストをGREENにする。
-- [ ] READMEへfixture投入、3process起動、POST/GET、停止・再起動手順を追加する。
+- [x] `ai-rpg seed-dev`で固定Campaign、principal、PC、Scene、技能条件を冪等投入するテストをREDにする。
+- [x] `ai-rpg api`、`ai-rpg resolution-worker`、`ai-rpg narration-worker`が同じ環境設定から別processとして起動し、poll間隔内に一往復するテストをREDにする。
+- [x] worker loopは`run_once(None)`を繰り返し、未取得時だけ短く待ち、SIGINT/SIGTERMで安全に終了する最小実装にする。
+- [x] processを再実行して同じTurnを回収し、確定済みAction／Eventを増やさない統合テストをGREENにする。lease期限切れ回収はチェックポイント1のworker交代テストで維持する。
+- [x] READMEへfixture投入、3process起動、POST/GET、停止・再起動手順を追加する。
 
 ## チェックポイント3: 複数Turn Context
 
@@ -88,7 +88,7 @@
 | チェックポイント | 実装 | PostgreSQL結合検証 | 証跡 |
 | --- | --- | --- | --- |
 | 1 レビュー3件 | 完了 | 完了 | `176 passed`、Ruff、mypy（2026-09-17） |
-| 2 独立Fake process | 未着手 | 未着手 | - |
+| 2 独立Fake process | 完了 | 完了 | 実process受入を含む`179 passed`（2026-09-17） |
 | 3 複数Turn Context | 未着手 | 未着手 | - |
 | 4 OpenAI adapter | 未着手 | 未着手 | - |
 | 5 最小プレイ画面 | 未着手 | 未着手 | - |
