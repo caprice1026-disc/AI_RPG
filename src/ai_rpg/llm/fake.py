@@ -56,6 +56,30 @@ class DevelopmentFakeTransport:
         output_schema: dict[str, object],
     ) -> object:
         if purpose == "intent":
+            payload = json.loads(input_data)
+            player_text = str(payload.get("player_text", ""))
+            if "攻撃" in player_text:
+                return {
+                    "kind": "action_plan",
+                    "actions": [
+                        {
+                            "kind": "attack",
+                            "target_ref": "goblin",
+                            "weapon_ref": "iron_sword",
+                        }
+                    ],
+                }
+            if "ポーション" in player_text or "回復" in player_text:
+                return {
+                    "kind": "action_plan",
+                    "actions": [
+                        {
+                            "kind": "use_item",
+                            "item_ref": "healing_potion",
+                            "target_ref": None,
+                        }
+                    ],
+                }
             return {
                 "kind": "action_plan",
                 "actions": [

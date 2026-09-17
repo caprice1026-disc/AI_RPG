@@ -68,12 +68,12 @@
 
 **変更:** `src/ai_rpg/contracts/llm_decisions.py`、`src/ai_rpg/domain/commands.py`、`src/ai_rpg/engine/ruleset.py`、`src/ai_rpg/application/workers.py`、`src/ai_rpg/infrastructure/postgres/repositories.py`、`src/ai_rpg/api/app.py`、`tests/integration/postgres/test_migrations.py`、`tests/integration/test_api.py`
 
-- [ ] 型付きAttack/UseItem Intentを登録済みentity、weapon、inventoryへ解決し、所有権、対象、0 HP、残数をApplicationで拒否するテストをREDにする。
-- [ ] Engineの既存`AttackCommand`/`UseItemCommand`経路をworkerへ接続し、damage、`HealingApplied`、`ItemConsumed`を一transactionで保存する。
-- [ ] 命中失敗、HP下限/上限、在庫0、stale version、event失敗rollback、同一request再送を実PostgreSQLで確認する。
-- [ ] 認可済みCampaign eventをsequence順に投影する`PublicEvent` queryとSSE endpointを追加する。
-- [ ] `Last-Event-ID`再送、at-least-once重複、15秒heartbeat、membership失効、遅い接続の切断をAPI testで確認する。
-- [ ] プレイ画面をpolling fallbackを残したままSSE更新へ切り替える。
+- [x] 型付きAttack/UseItem Intentを登録済みentity、weapon、inventoryへ解決し、所有権、対象、0 HP、残数をApplicationで拒否するテストをREDにする。
+- [x] Engineの既存`AttackCommand`/`UseItemCommand`経路をworkerへ接続し、damage、`HealingApplied`、`ItemConsumed`を一transactionで保存する。
+- [x] 命中失敗、HP下限/上限、在庫0、stale version、event失敗rollback、同一request再送を実PostgreSQLで確認する。
+- [x] 認可済みCampaign eventをsequence順に投影する`PublicEvent` queryとSSE endpointを追加する。
+- [x] `Last-Event-ID`再送、at-least-once重複、15秒heartbeat、membership失効、遅い接続の切断をAPI testで確認する。
+- [x] プレイ画面をpolling fallbackを残したままSSE更新へ切り替える。
 
 ## 各チェックポイントの検証
 
@@ -92,4 +92,4 @@
 | 3 複数Turn Context | 完了 | 完了 | 公開履歴・確認回答を含む`184 passed`（2026-09-17） |
 | 4 OpenAI adapter | 完了 | 完了 | HTTP contract・拒否・事実逸脱を含む`200 passed`（2026-09-17） |
 | 5 最小プレイ画面 | 完了 | 完了 | `201 passed`、実browserで送信・終端・401・390px表示を確認（2026-09-17） |
-| 6 攻撃・回復item・SSE | 未着手 | 未着手 | - |
+| 6 攻撃・回復item・SSE | 完了 | 完了 | `221 passed`、型付きAction、公開event、実browserのSSE／polling fallbackを確認（2026-09-17） |

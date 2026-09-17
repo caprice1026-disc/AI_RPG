@@ -29,6 +29,9 @@ class DevelopmentFixture:
     scene_id: UUID
     principal_id: UUID
     actor_id: UUID
+    target_id: UUID
+    weapon_id: UUID
+    healing_potion_id: UUID
 
 
 DEVELOPMENT_FIXTURE = DevelopmentFixture(
@@ -36,6 +39,9 @@ DEVELOPMENT_FIXTURE = DevelopmentFixture(
     scene_id=UUID("10000000-0000-0000-0000-000000000011"),
     principal_id=UUID("10000000-0000-0000-0000-000000000021"),
     actor_id=UUID("10000000-0000-0000-0000-000000000031"),
+    target_id=UUID("10000000-0000-0000-0000-000000000032"),
+    weapon_id=UUID("10000000-0000-0000-0000-000000000041"),
+    healing_potion_id=UUID("10000000-0000-0000-0000-000000000042"),
 )
 
 
@@ -95,12 +101,18 @@ def seed_development_fixture(database_url: str) -> DevelopmentFixture:
             )
             connection.execute(
                 text(
-                    "INSERT INTO entities(id,campaign_id,kind,controller_id) "
-                    "VALUES(:actor,:campaign,'pc',:principal) "
-                    "ON CONFLICT (id) DO NOTHING"
+                    "INSERT INTO entities(id,campaign_id,kind,controller_id,ref,label) VALUES"
+                    "(:actor,:campaign,'pc',:principal,'hero','主人公'),"
+                    "(:target,:campaign,'npc',NULL,'goblin','ゴブリン'),"
+                    "(:weapon,:campaign,'item',NULL,'iron_sword','鉄の剣'),"
+                    "(:potion,:campaign,'item',NULL,'healing_potion','回復ポーション') "
+                    "ON CONFLICT (id) DO UPDATE SET ref=EXCLUDED.ref,label=EXCLUDED.label"
                 ),
                 {
                     "actor": fixture.actor_id,
+                    "target": fixture.target_id,
+                    "weapon": fixture.weapon_id,
+                    "potion": fixture.healing_potion_id,
                     "campaign": fixture.campaign_id,
                     "principal": fixture.principal_id,
                 },
@@ -117,10 +129,39 @@ def seed_development_fixture(database_url: str) -> DevelopmentFixture:
                 text(
                     "INSERT INTO mvp_characters("
                     "campaign_id,entity_id,current_hp,max_hp,defense,attack_bonus"
-                    ") VALUES(:campaign,:actor,10,10,12,2) "
+                    ") VALUES(:campaign,:actor,6,10,12,2),"
+                    "(:campaign,:target,10,10,11,1) "
                     "ON CONFLICT (campaign_id,entity_id) DO NOTHING"
                 ),
-                {"campaign": fixture.campaign_id, "actor": fixture.actor_id},
+                {
+                    "campaign": fixture.campaign_id,
+                    "actor": fixture.actor_id,
+                    "target": fixture.target_id,
+                },
+            )
+            connection.execute(
+                text(
+                    "INSERT INTO mvp_weapons("
+                    "campaign_id,entity_id,damage_expression,damage_bonus"
+                    ") VALUES(:campaign,:weapon,'1d6',0) "
+                    "ON CONFLICT (campaign_id,entity_id) DO NOTHING"
+                ),
+                {"campaign": fixture.campaign_id, "weapon": fixture.weapon_id},
+            )
+            connection.execute(
+                text(
+                    "INSERT INTO mvp_inventory("
+                    "campaign_id,owner_id,item_id,quantity,equipped"
+                    ") VALUES(:campaign,:actor,:weapon,1,true),"
+                    "(:campaign,:actor,:potion,2,false) "
+                    "ON CONFLICT (campaign_id,owner_id,item_id) DO NOTHING"
+                ),
+                {
+                    "campaign": fixture.campaign_id,
+                    "actor": fixture.actor_id,
+                    "weapon": fixture.weapon_id,
+                    "potion": fixture.healing_potion_id,
+                },
             )
             connection.execute(
                 text(

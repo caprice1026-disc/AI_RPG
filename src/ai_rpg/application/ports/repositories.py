@@ -7,7 +7,7 @@ from datetime import datetime
 from typing import Literal, Protocol, TypeAlias
 from uuid import UUID
 
-from ai_rpg.contracts import PlayerTurnInput, TurnResponse
+from ai_rpg.contracts import PlayerTurnInput, PublicEvent, TurnResponse
 from ai_rpg.contracts.responses import MechanicalNarrationInput
 from ai_rpg.domain.commands import Command
 from ai_rpg.domain.events import RNGMetadata
@@ -124,6 +124,7 @@ class CanonicalSnapshot:
     equipment: tuple[Mapping[str, object], ...]
     inventory: tuple[Mapping[str, object], ...]
     skill_checks: tuple[Mapping[str, object], ...]
+    entities: tuple[Mapping[str, object], ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -281,11 +282,18 @@ class LLMCallRepository(Protocol):
     ) -> FailureDisposition | None: ...
 
 
+class PublicEventRepository(Protocol):
+    async def list_after(
+        self, campaign_id: UUID, after: int, *, limit: int
+    ) -> tuple[PublicEvent, ...]: ...
+
+
 class RepositorySet(Protocol):
     turns: TurnRepository
     canonical: CanonicalRepository
     narration: NarrationRepository
     llm_calls: LLMCallRepository
+    events: PublicEventRepository
 
 
 class UnitOfWork(RepositorySet, AbstractAsyncContextManager["UnitOfWork"], Protocol):

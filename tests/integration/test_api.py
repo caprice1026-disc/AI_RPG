@@ -10,10 +10,11 @@ from httpx import ASGITransport, AsyncClient
 from ai_rpg.api import create_app
 from ai_rpg.application import (
     AuthenticatedPrincipal,
+    AuthorizationError,
     IdempotencyConflictError,
     TurnInProgressError,
 )
-from ai_rpg.contracts import TurnResponse
+from ai_rpg.contracts import PublicEvent, PublicTurnEventPayload, TurnResponse
 
 CAMPAIGN_ID = UUID("00000000-0000-0000-0000-000000000001")
 PRINCIPAL_ID = UUID("00000000-0000-0000-0000-000000000021")
@@ -79,6 +80,8 @@ async def test_play_screen_is_served_with_accessible_core_controls() -> None:
     assert 'id="send-action"' in response.text
     assert 'role="status"' in response.text
     assert "aria-live=\"polite\"" in response.text
+    assert "new EventSource" in response.text
+    assert "pollTurn" in response.text
 
 
 @pytest.mark.integration
@@ -193,3 +196,96 @@ async def test_accept_turn_maps_application_conflicts(
 
     assert response.status_code == status_code
     assert response.json() == {"detail": {"code": code}}
+
+
+def _public_event(event_id: int) -> PublicEvent:
+    return PublicEvent(
+        id=event_id,
+        type="turn.updated",
+        schema_version=1,
+        payload=PublicTurnEventPayload(turn=_pending_response()),
+    )
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_sse_replays_after_last_event_id_and_deduplicates() -> None:
+    event_stream = AsyncMock()
+    event_stream.poll.side_effect = [
+        (_public_event(6),),
+        (_public_event(6), _public_event(7)),
+        AuthorizationError(),
+    ]
+    app = create_app(
+        turn_service=AsyncMock(),
+        turn_query_service=AsyncMock(),
+        event_stream_service=event_stream,
+        principal_provider=_authenticated,
+        event_poll_seconds=0,
+    )
+
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.get(
+            f"/campaigns/{CAMPAIGN_ID}/events",
+            headers={"Last-Event-ID": "5"},
+        )
+
+    assert response.status_code == 200
+    assert response.headers["content-type"].startswith("text/event-stream")
+    assert response.headers["cache-control"] == "no-cache"
+    assert response.headers["x-accel-buffering"] == "no"
+    assert response.text.count("id: 6\n") == 1
+    assert response.text.count("id: 7\n") == 1
+    assert "event: turn.updated\n" in response.text
+    assert '"schema_version":1' in response.text
+    assert [call.args[2] for call in event_stream.poll.await_args_list] == [5, 6, 7]
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_sse_emits_heartbeat_and_closes_after_membership_revocation() -> None:
+    event_stream = AsyncMock()
+    event_stream.poll.side_effect = [(), (), AuthorizationError()]
+    app = create_app(
+        turn_service=AsyncMock(),
+        turn_query_service=AsyncMock(),
+        event_stream_service=event_stream,
+        principal_provider=_authenticated,
+        event_poll_seconds=0,
+        event_heartbeat_seconds=0.000001,
+    )
+
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.get(f"/campaigns/{CAMPAIGN_ID}/events")
+
+    assert response.status_code == 200
+    assert response.text == ": heartbeat\n\n"
+    assert event_stream.poll.await_count == 3
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_sse_rejects_invalid_cursor_and_initially_forbidden_campaign() -> None:
+    event_stream = AsyncMock()
+    event_stream.poll.side_effect = AuthorizationError()
+    app = create_app(
+        turn_service=AsyncMock(),
+        turn_query_service=AsyncMock(),
+        event_stream_service=event_stream,
+        principal_provider=_authenticated,
+    )
+
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        invalid = await client.get(
+            f"/campaigns/{CAMPAIGN_ID}/events",
+            headers={"Last-Event-ID": "not-a-number"},
+        )
+        forbidden = await client.get(f"/campaigns/{CAMPAIGN_ID}/events")
+
+    assert invalid.status_code == 400
+    assert invalid.json() == {"detail": {"code": "INVALID_EVENT_CURSOR"}}
+    assert forbidden.status_code == 403
+    assert forbidden.json() == {"detail": {"code": "FORBIDDEN"}}

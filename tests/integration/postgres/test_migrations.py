@@ -68,6 +68,7 @@ from ai_rpg.infrastructure.postgres.repositories import (
     PostgresCanonicalRepository,
     PostgresLLMCallRepository,
     PostgresNarrationRepository,
+    PostgresPublicEventRepository,
     PostgresTurnRepository,
 )
 from ai_rpg.llm import ProviderRefusalError, ScriptedFakeTransport
@@ -99,6 +100,7 @@ CHOICE_A = "00000000-0000-0000-0000-000000000081"
 CHOICE_B = "00000000-0000-0000-0000-000000000082"
 CHOICE_C = "00000000-0000-0000-0000-000000000083"
 ITEM_A = "00000000-0000-0000-0000-000000000091"
+WEAPON_A = "00000000-0000-0000-0000-000000000092"
 
 
 def _run_alembic(url: str, *arguments: str) -> None:
@@ -488,10 +490,24 @@ def _seed_resolution_state(connection: Connection) -> None:
     _seed_members_entities_and_scene(connection)
     connection.execute(
         text(
-            "INSERT INTO entities(id,campaign_id,kind) "
-            "VALUES(:actor,:campaign,'npc'),(:item,:campaign,'item')"
+            "UPDATE entities SET ref='hero',label='主人公' "
+            "WHERE campaign_id=:campaign AND id=:actor"
         ),
-        {"actor": ACTOR_C, "item": ITEM_A, "campaign": CAMPAIGN_A},
+        {"campaign": CAMPAIGN_A, "actor": ACTOR_A},
+    )
+    connection.execute(
+        text(
+            "INSERT INTO entities(id,campaign_id,kind,ref,label) "
+            "VALUES(:actor,:campaign,'npc','goblin','ゴブリン'),"
+            "(:item,:campaign,'item','healing_potion','回復ポーション'),"
+            "(:weapon,:campaign,'item','iron_sword','鉄の剣')"
+        ),
+        {
+            "actor": ACTOR_C,
+            "item": ITEM_A,
+            "weapon": WEAPON_A,
+            "campaign": CAMPAIGN_A,
+        },
     )
     connection.execute(
         text(
@@ -504,9 +520,22 @@ def _seed_resolution_state(connection: Connection) -> None:
     connection.execute(
         text(
             "INSERT INTO mvp_inventory(campaign_id,owner_id,item_id,quantity,equipped) "
-            "VALUES(:campaign,:owner,:item,2,false)"
+            "VALUES(:campaign,:owner,:item,2,false),"
+            "(:campaign,:owner,:weapon,1,true)"
         ),
-        {"campaign": CAMPAIGN_A, "owner": ACTOR_A, "item": ITEM_A},
+        {
+            "campaign": CAMPAIGN_A,
+            "owner": ACTOR_A,
+            "item": ITEM_A,
+            "weapon": WEAPON_A,
+        },
+    )
+    connection.execute(
+        text(
+            "INSERT INTO mvp_weapons(campaign_id,entity_id,damage_expression,damage_bonus) "
+            "VALUES(:campaign,:weapon,'1d6',0)"
+        ),
+        {"campaign": CAMPAIGN_A, "weapon": WEAPON_A},
     )
 
 
@@ -4805,6 +4834,397 @@ def test_narration_result_after_phase_deadline_becomes_fallback(database: Engine
             "UNKNOWN",
             "判定結果は保存されましたが、描写を生成できませんでした。",
         )
+
+
+@pytest.mark.parametrize(
+    ("player_text", "intent", "rolls", "expected_hp", "expected_quantity", "events"),
+    [
+        (
+            "鉄の剣でゴブリンを攻撃する",
+            {"kind": "attack", "target_ref": "goblin", "weapon_ref": "iron_sword"},
+            [10, 4],
+            (5, 6),
+            2,
+            ["DiceRolled", "DiceRolled", "DamageApplied", "ActionResolved"],
+        ),
+        (
+            "回復ポーションを飲む",
+            {"kind": "use_item", "item_ref": "healing_potion", "target_ref": None},
+            [2],
+            (9, 10),
+            1,
+            ["DiceRolled", "HealingApplied", "ItemConsumed", "ActionResolved"],
+        ),
+    ],
+)
+def test_worker_commits_attack_and_healing_item_from_registered_refs(
+    database: Engine,
+    player_text: str,
+    intent: dict[str, object],
+    rolls: list[int],
+    expected_hp: tuple[int, int],
+    expected_quantity: int,
+    events: list[str],
+) -> None:
+    with database.begin() as connection:
+        _seed_resolution_state(connection)
+        connection.execute(
+            text(
+                "UPDATE mvp_characters SET current_hp=5 "
+                "WHERE campaign_id=:campaign AND entity_id=:actor"
+            ),
+            {"campaign": CAMPAIGN_A, "actor": ACTOR_A},
+        )
+
+    class FixedSequence:
+        def __init__(self) -> None:
+            self.values = iter(rolls)
+
+        def randint(self, lower: int, upper: int) -> int:
+            value = next(self.values)
+            assert lower <= value <= upper
+            return value
+
+    async def resolve() -> dict[str, Any]:
+        url = database.url.render_as_string(hide_password=False)
+        async with _postgres_sessions(url) as factory:
+            accepted = await _accept_turn(factory, _player_turn(player_text))
+
+            def unit_of_work_factory() -> PostgresUnitOfWork:
+                return PostgresUnitOfWork(factory)
+
+            transport = ScriptedFakeTransport(
+                [{"kind": "action_plan", "actions": [intent]}]
+            )
+            worker = SkillCheckResolutionWorker(
+                unit_of_work_factory,
+                transport,
+                MvpV1Ruleset(DiceEngine(FixedSequence())),
+                WorkerPhasePolicy(60, 3, 120, "fake-intent"),
+                rng_source="seeded_test",
+            )
+            assert await worker.run_once(accepted.turn_id)
+            return json.loads(transport.calls[0].input_data)
+
+    with asyncio.Runner(loop_factory=asyncio.SelectorEventLoop) as runner:
+        llm_input = runner.run(resolve())
+
+    assert set(llm_input["supported_action_types"]) == {
+        "attack",
+        "use_item",
+    }
+    assert {entity["ref"] for entity in llm_input["allowed_entity_refs"]} == {
+        "goblin",
+        "healing_potion",
+        "hero",
+        "iron_sword",
+    }
+    with database.connect() as connection:
+        hp = connection.execute(
+            text(
+                "SELECT current_hp FROM mvp_characters "
+                "WHERE campaign_id=:campaign AND entity_id IN (:actor,:target) "
+                "ORDER BY entity_id"
+            ),
+            {"campaign": CAMPAIGN_A, "actor": ACTOR_A, "target": ACTOR_C},
+        ).scalars().all()
+        assert tuple(hp) == expected_hp
+        assert connection.scalar(
+            text(
+                "SELECT quantity FROM mvp_inventory "
+                "WHERE campaign_id=:campaign AND owner_id=:actor AND item_id=:item"
+            ),
+            {"campaign": CAMPAIGN_A, "actor": ACTOR_A, "item": ITEM_A},
+        ) == expected_quantity
+        assert connection.scalar(
+            text("SELECT state_version FROM campaigns WHERE id=:campaign"),
+            {"campaign": CAMPAIGN_A},
+        ) == 1
+        assert list(
+            connection.execute(
+                text("SELECT type FROM events ORDER BY sequence")
+            ).scalars()
+        ) == events
+
+
+def test_worker_attack_miss_keeps_hp_and_state_version(database: Engine) -> None:
+    with database.begin() as connection:
+        _seed_resolution_state(connection)
+        connection.execute(
+            text(
+                "UPDATE mvp_characters SET defense=30 "
+                "WHERE campaign_id=:campaign AND entity_id=:target"
+            ),
+            {"campaign": CAMPAIGN_A, "target": ACTOR_C},
+        )
+
+    class FixedMiss:
+        def randint(self, lower: int, upper: int) -> int:
+            assert lower <= 1 <= upper
+            return 1
+
+    async def resolve() -> None:
+        url = database.url.render_as_string(hide_password=False)
+        async with _postgres_sessions(url) as factory:
+            accepted = await _accept_turn(factory, _player_turn("ゴブリンを攻撃する"))
+
+            def unit_of_work_factory() -> PostgresUnitOfWork:
+                return PostgresUnitOfWork(factory)
+
+            worker = SkillCheckResolutionWorker(
+                unit_of_work_factory,
+                ScriptedFakeTransport(
+                    [
+                        {
+                            "kind": "action_plan",
+                            "actions": [
+                                {
+                                    "kind": "attack",
+                                    "target_ref": "goblin",
+                                    "weapon_ref": "iron_sword",
+                                }
+                            ],
+                        }
+                    ]
+                ),
+                MvpV1Ruleset(DiceEngine(FixedMiss())),
+                WorkerPhasePolicy(60, 3, 120, "fake-intent"),
+                rng_source="seeded_test",
+            )
+            assert await worker.run_once(accepted.turn_id)
+
+    with asyncio.Runner(loop_factory=asyncio.SelectorEventLoop) as runner:
+        runner.run(resolve())
+
+    with database.connect() as connection:
+        action = connection.execute(
+            text("SELECT result FROM actions")
+        ).scalar_one()
+        assert action["outcome"] == "failure"
+        assert len(action["dice"]) == 1
+        assert connection.scalar(
+            text("SELECT state_version FROM campaigns WHERE id=:campaign"),
+            {"campaign": CAMPAIGN_A},
+        ) == 0
+        assert connection.scalar(
+            text(
+                "SELECT current_hp FROM mvp_characters "
+                "WHERE campaign_id=:campaign AND entity_id=:target"
+            ),
+            {"campaign": CAMPAIGN_A, "target": ACTOR_C},
+        ) == 10
+        assert list(
+            connection.execute(text("SELECT type FROM events ORDER BY sequence")).scalars()
+        ) == ["DiceRolled", "ActionResolved"]
+
+
+def test_later_attack_on_target_reduced_to_zero_is_not_applicable(
+    database: Engine,
+) -> None:
+    with database.begin() as connection:
+        _seed_resolution_state(connection)
+        connection.execute(
+            text(
+                "UPDATE mvp_characters SET current_hp=3,defense=1 "
+                "WHERE campaign_id=:campaign AND entity_id=:target"
+            ),
+            {"campaign": CAMPAIGN_A, "target": ACTOR_C},
+        )
+
+    class FixedSequence:
+        def __init__(self) -> None:
+            self.values = iter([10, 4])
+
+        def randint(self, lower: int, upper: int) -> int:
+            value = next(self.values)
+            assert lower <= value <= upper
+            return value
+
+    attack = {
+        "kind": "attack",
+        "target_ref": "goblin",
+        "weapon_ref": "iron_sword",
+    }
+
+    async def resolve() -> None:
+        url = database.url.render_as_string(hide_password=False)
+        async with _postgres_sessions(url) as factory:
+            accepted = await _accept_turn(factory, _player_turn("二回攻撃する"))
+
+            def unit_of_work_factory() -> PostgresUnitOfWork:
+                return PostgresUnitOfWork(factory)
+
+            worker = SkillCheckResolutionWorker(
+                unit_of_work_factory,
+                ScriptedFakeTransport(
+                    [{"kind": "action_plan", "actions": [attack, attack]}]
+                ),
+                MvpV1Ruleset(DiceEngine(FixedSequence())),
+                WorkerPhasePolicy(60, 3, 120, "fake-intent"),
+                rng_source="seeded_test",
+            )
+            assert await worker.run_once(accepted.turn_id)
+
+    with asyncio.Runner(loop_factory=asyncio.SelectorEventLoop) as runner:
+        runner.run(resolve())
+
+    with database.connect() as connection:
+        assert list(
+            connection.execute(
+                text("SELECT result_kind FROM actions ORDER BY ordinal")
+            ).scalars()
+        ) == ["applied", "not_applicable"]
+        assert connection.scalar(
+            text(
+                "SELECT current_hp FROM mvp_characters "
+                "WHERE campaign_id=:campaign AND entity_id=:target"
+            ),
+            {"campaign": CAMPAIGN_A, "target": ACTOR_C},
+        ) == 0
+        assert list(
+            connection.execute(text("SELECT type FROM events ORDER BY sequence")).scalars()
+        ) == [
+            "DiceRolled",
+            "DiceRolled",
+            "DamageApplied",
+            "ActionResolved",
+            "ActionResolved",
+        ]
+
+
+@pytest.mark.parametrize(
+    ("intent", "mutation"),
+    [
+        (
+            {"kind": "attack", "target_ref": "goblin", "weapon_ref": "healing_potion"},
+            "none",
+        ),
+        (
+            {
+                "kind": "use_item",
+                "item_ref": "healing_potion",
+                "target_ref": "goblin",
+            },
+            "injure",
+        ),
+        (
+            {"kind": "attack", "target_ref": "goblin", "weapon_ref": None},
+            "incapacitate",
+        ),
+        (
+            {"kind": "attack", "target_ref": "goblin", "weapon_ref": None},
+            "incapacitate_target",
+        ),
+        (
+            {"kind": "use_item", "item_ref": "healing_potion", "target_ref": None},
+            "empty_inventory",
+        ),
+    ],
+)
+def test_worker_rejects_illegal_attack_and_item_intents_without_game_writes(
+    database: Engine,
+    intent: dict[str, object],
+    mutation: str,
+) -> None:
+    with database.begin() as connection:
+        _seed_resolution_state(connection)
+        if mutation == "injure":
+            connection.execute(
+                text(
+                    "UPDATE mvp_characters SET current_hp=5 "
+                    "WHERE campaign_id=:campaign AND entity_id=:actor"
+                ),
+                {"campaign": CAMPAIGN_A, "actor": ACTOR_A},
+            )
+        elif mutation == "incapacitate":
+            connection.execute(
+                text(
+                    "UPDATE mvp_characters SET current_hp=0 "
+                    "WHERE campaign_id=:campaign AND entity_id=:actor"
+                ),
+                {"campaign": CAMPAIGN_A, "actor": ACTOR_A},
+            )
+        elif mutation == "incapacitate_target":
+            connection.execute(
+                text(
+                    "UPDATE mvp_characters SET current_hp=0 "
+                    "WHERE campaign_id=:campaign AND entity_id=:target"
+                ),
+                {"campaign": CAMPAIGN_A, "target": ACTOR_C},
+            )
+        elif mutation == "empty_inventory":
+            connection.execute(
+                text(
+                    "UPDATE mvp_inventory SET quantity=0 "
+                    "WHERE campaign_id=:campaign AND owner_id=:actor AND item_id=:item"
+                ),
+                {"campaign": CAMPAIGN_A, "actor": ACTOR_A, "item": ITEM_A},
+            )
+
+    async def resolve() -> None:
+        url = database.url.render_as_string(hide_password=False)
+        async with _postgres_sessions(url) as factory:
+            player_text = (
+                "攻撃する" if intent["kind"] == "attack" else "回復ポーションを使う"
+            )
+            accepted = await _accept_turn(factory, _player_turn(player_text))
+
+            def unit_of_work_factory() -> PostgresUnitOfWork:
+                return PostgresUnitOfWork(factory)
+
+            worker = SkillCheckResolutionWorker(
+                unit_of_work_factory,
+                ScriptedFakeTransport(
+                    [{"kind": "action_plan", "actions": [intent]}]
+                ),
+                MvpV1Ruleset(DiceEngine(MagicMock())),
+                WorkerPhasePolicy(60, 3, 120, "fake-intent"),
+            )
+            assert await worker.run_once(accepted.turn_id)
+
+    with asyncio.Runner(loop_factory=asyncio.SelectorEventLoop) as runner:
+        runner.run(resolve())
+
+    with database.connect() as connection:
+        assert connection.scalar(text("SELECT count(*) FROM actions")) == 0
+        assert connection.scalar(
+            text("SELECT state_version FROM campaigns WHERE id=:campaign"),
+            {"campaign": CAMPAIGN_A},
+        ) == 0
+        assert connection.scalar(
+            text("SELECT resolution_status FROM turns")
+        ) == "not_applied"
+
+
+def test_public_event_query_projects_turns_in_sequence_after_cursor(
+    database: Engine,
+) -> None:
+    with database.begin() as connection:
+        _seed_resolution_state(connection)
+    accepted = _accept_from_database(database, _player_turn())
+    _acquire_lease_from_database(database, accepted.turn_id)
+    _commit_resolution_from_database(database, _resolution_bundle(accepted.turn_id))
+    assert _save_narration_from_database(database, accepted.turn_id, ())
+
+    async def fetch() -> tuple[tuple[object, ...], tuple[object, ...]]:
+        url = database.url.render_as_string(hide_password=False)
+        async with _postgres_sessions(url) as factory, factory() as session:
+            repository = PostgresPublicEventRepository(session)
+            visible = await repository.list_after(UUID(CAMPAIGN_A), 1, limit=10)
+            other_campaign = await repository.list_after(UUID(CAMPAIGN_B), 0, limit=10)
+            return visible, other_campaign
+
+    with asyncio.Runner(loop_factory=asyncio.SelectorEventLoop) as runner:
+        visible, other_campaign = runner.run(fetch())
+
+    assert [event.id for event in visible] == [2, 3]
+    assert all(event.type == "turn.updated" for event in visible)
+    assert all(event.payload.turn.turn_id == accepted.turn_id for event in visible)
+    assert all(event.payload.turn.narration_status == "completed" for event in visible)
+    assert "rng" not in json.dumps(
+        [event.model_dump(mode="json") for event in visible]
+    )
+    assert other_campaign == ()
 
 
 def test_development_fixture_is_idempotent(database: Engine) -> None:

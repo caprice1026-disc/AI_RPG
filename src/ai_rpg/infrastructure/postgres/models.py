@@ -73,6 +73,8 @@ class EntityModel(Base):
     kind: Mapped[str] = mapped_column(Text, nullable=False)
     controller_id: Mapped[UUID | None] = mapped_column(PG_UUID(as_uuid=True))
     archived_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    ref: Mapped[str | None] = mapped_column(Text)
+    label: Mapped[str | None] = mapped_column(Text)
 
     __table_args__ = (
         UniqueConstraint("campaign_id", "id"),
@@ -81,6 +83,22 @@ class EntityModel(Base):
             ["campaign_members.campaign_id", "campaign_members.principal_id"],
         ),
         CheckConstraint("kind IN ('pc','npc','item','object')"),
+        CheckConstraint("(ref IS NULL)=(label IS NULL)", name="entity_ref_pair"),
+        CheckConstraint(
+            "ref IS NULL OR ref ~ '^[a-z][a-z0-9_]{0,63}$'",
+            name="entity_ref_format",
+        ),
+        CheckConstraint(
+            "label IS NULL OR length(label) BETWEEN 1 AND 500",
+            name="entity_label_length",
+        ),
+        Index(
+            "entities_campaign_ref",
+            "campaign_id",
+            "ref",
+            unique=True,
+            postgresql_where=text("ref IS NOT NULL"),
+        ),
     )
 
 

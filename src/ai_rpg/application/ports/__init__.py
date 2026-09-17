@@ -23,6 +23,7 @@ from ai_rpg.application.ports.repositories import (
     NarrationWorkItem,
     NarrativeCommit,
     PhaseDeadlineExceededError,
+    PublicEventRepository,
     RecentMessage,
     RepositorySet,
     ResolutionWorkItem,
@@ -32,6 +33,7 @@ from ai_rpg.application.ports.repositories import (
     TurnRow,
     UnitOfWork,
 )
+from ai_rpg.contracts import PublicEvent
 
 
 class AuthorizationPolicy(Protocol):
@@ -44,7 +46,7 @@ class AuthorizationPolicy(Protocol):
 class PublicEventSource(Protocol):
     """認可済み公開イベントをcursor以降から購読するport。"""
 
-    def subscribe(self, campaign_id: UUID, after: int) -> AsyncIterator[str]:
+    def subscribe(self, campaign_id: UUID, after: int) -> AsyncIterator[PublicEvent]:
         """transport非依存のイベント表現を返す。"""
 
 
@@ -68,6 +70,7 @@ __all__ = [
     "NarrationWorkItem",
     "NarrativeCommit",
     "PhaseDeadlineExceededError",
+    "PublicEventRepository",
     "PublicEventSource",
     "RecentMessage",
     "RepositorySet",

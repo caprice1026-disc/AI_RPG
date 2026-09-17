@@ -397,6 +397,12 @@
         ["committed", "not_applied", "failed"].includes(turn.resolution_status);
     }
 
+    function observeTurn(turn) {
+      updateStatus(turn);
+      const pendingText = document.querySelector('[data-role="processing"] .pending span:last-child');
+      if (pendingText) pendingText.textContent = turn.resolution_status === "committed" ? "描写を生成しています…" : "判定を処理しています…";
+    }
+
     async function api(path, options = {}) {
       const response = await fetch(path, options);
       if (!response.ok) {
@@ -412,12 +418,53 @@
     async function pollTurn(campaignId, turnId) {
       while (true) {
         const turn = await api(`/campaigns/${encodeURIComponent(campaignId)}/turns/${encodeURIComponent(turnId)}`);
-        updateStatus(turn);
-        const pendingText = document.querySelector('[data-role="processing"] .pending span:last-child');
-        if (pendingText) pendingText.textContent = turn.resolution_status === "committed" ? "描写を生成しています…" : "判定を処理しています…";
+        observeTurn(turn);
         if (terminal(turn)) return turn;
         await new Promise(resolve => setTimeout(resolve, 750));
       }
+    }
+
+    function waitForTurn(campaignId, turnId) {
+      if (!("EventSource" in window)) return pollTurn(campaignId, turnId);
+      return new Promise((resolve, reject) => {
+        let settled = false;
+        let polling = false;
+        const events = new EventSource(`/campaigns/${encodeURIComponent(campaignId)}/events`);
+        const fallbackTimer = setTimeout(startPolling, 1500);
+
+        function finish(turn) {
+          if (settled) return;
+          settled = true;
+          clearTimeout(fallbackTimer);
+          events.close();
+          resolve(turn);
+        }
+
+        async function startPolling() {
+          if (settled || polling) return;
+          polling = true;
+          ui["connection-label"].textContent = "Pollingで追跡";
+          try {
+            finish(await pollTurn(campaignId, turnId));
+          } catch (error) {
+            if (!settled) reject(error);
+          }
+        }
+
+        events.addEventListener("turn.updated", event => {
+          try {
+            const turn = JSON.parse(event.data).payload?.turn;
+            if (!turn || turn.turn_id !== turnId) return;
+            observeTurn(turn);
+            if (terminal(turn)) finish(turn);
+          } catch (_) { /* malformed public event is ignored; polling remains available */ }
+        });
+        events.onopen = () => { ui["connection-label"].textContent = "SSE接続済み"; };
+        events.onerror = () => {
+          events.close();
+          startPolling();
+        };
+      });
     }
 
     async function submitTurn(content, displayText) {
@@ -446,7 +493,7 @@
           })
         });
         updateStatus(accepted);
-        const completed = terminal(accepted) ? accepted : await pollTurn(campaignId, accepted.turn_id);
+        const completed = terminal(accepted) ? accepted : await waitForTurn(campaignId, accepted.turn_id);
         renderCompleted(completed);
         if (content.kind === "text") ui["action-text"].value = "";
       } catch (error) {

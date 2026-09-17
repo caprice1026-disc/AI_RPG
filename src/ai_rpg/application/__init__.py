@@ -1,6 +1,7 @@
 """Turnユースケース、認可、参照解決、トランザクション境界。"""
 
 from ai_rpg.application.auth import AuthenticatedPrincipal
+from ai_rpg.application.event_stream import EventStreamService
 from ai_rpg.application.ports import (
     AuthorizationError,
     AuthorizationPolicy,
@@ -28,6 +29,7 @@ __all__ = [
     "AuthorizationError",
     "AuthorizationPolicy",
     "ChoiceNotAvailableError",
+    "EventStreamService",
     "IdempotencyConflictError",
     "InvalidCommitBundleError",
     "NarrationWorker",

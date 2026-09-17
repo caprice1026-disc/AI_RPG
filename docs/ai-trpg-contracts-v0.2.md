@@ -469,10 +469,15 @@ CREATE TABLE entities (
     kind text NOT NULL CHECK (kind IN ('pc','npc','item','object')),
     controller_id uuid,
     archived_at timestamptz,
+    ref text CHECK (ref IS NULL OR ref ~ '^[a-z][a-z0-9_]{0,63}$'),
+    label text CHECK (label IS NULL OR length(label) BETWEEN 1 AND 500),
     UNIQUE (campaign_id, id),
     FOREIGN KEY (campaign_id, controller_id)
-        REFERENCES campaign_members(campaign_id, principal_id)
+        REFERENCES campaign_members(campaign_id, principal_id),
+    CHECK ((ref IS NULL) = (label IS NULL))
 );
+CREATE UNIQUE INDEX entities_campaign_ref
+    ON entities(campaign_id, ref) WHERE ref IS NOT NULL;
 
 CREATE TABLE scenes (
     id uuid PRIMARY KEY,

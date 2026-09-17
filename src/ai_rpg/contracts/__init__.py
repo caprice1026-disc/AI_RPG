@@ -1,6 +1,7 @@
 """外部入力、LLM入出力、公開DTOの契約。"""
 
 from ai_rpg.contracts.context import ContextFragment, EntityRef, OutputLimits
+from ai_rpg.contracts.events import PublicEvent, PublicTurnEventPayload
 from ai_rpg.contracts.llm_decisions import (
     ActionIntent,
     AttackIntent,
@@ -21,6 +22,8 @@ __all__ = [
     "NarrativeDecision",
     "OutputLimits",
     "PlayerTurnInput",
+    "PublicEvent",
+    "PublicTurnEventPayload",
     "TextInput",
     "TurnRecovery",
     "TurnResponse",

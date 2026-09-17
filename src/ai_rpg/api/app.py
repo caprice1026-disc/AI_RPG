@@ -1,17 +1,20 @@
 """FastAPI application factory。"""
 
-from collections.abc import Awaitable, Callable
+import asyncio
+from collections.abc import AsyncIterator, Awaitable, Callable
 from pathlib import Path
 from typing import Annotated
 from uuid import UUID
 
-from fastapi import Depends, FastAPI, HTTPException, status
-from fastapi.responses import FileResponse
+from fastapi import Depends, FastAPI, Header, HTTPException, Request, status
+from fastapi.responses import FileResponse, StreamingResponse
+from starlette.types import Message, Send
 
 from ai_rpg.application import (
     AuthenticatedPrincipal,
     AuthorizationError,
     ChoiceNotAvailableError,
+    EventStreamService,
     IdempotencyConflictError,
     StateVersionConflictError,
     TurnInProgressError,
@@ -37,6 +40,41 @@ ApplicationError = (
 _PLAY_SCREEN = Path(__file__).with_name("static") / "index.html"
 
 
+class _TimedStreamingResponse(StreamingResponse):
+    """書込みが詰まったsubscriberを切り、DB pollを保持し続けない。"""
+
+    send_timeout_seconds = 5.0
+
+    async def stream_response(self, send: Send) -> None:
+        async def timed_send(message: Message) -> None:
+            async with asyncio.timeout(self.send_timeout_seconds):
+                await send(message)
+
+        try:
+            await timed_send(
+                {
+                    "type": "http.response.start",
+                    "status": self.status_code,
+                    "headers": self.raw_headers,
+                }
+            )
+            async for chunk in self.body_iterator:
+                if not isinstance(chunk, bytes | memoryview):
+                    chunk = chunk.encode(self.charset)
+                await timed_send(
+                    {
+                        "type": "http.response.body",
+                        "body": chunk,
+                        "more_body": True,
+                    }
+                )
+            await timed_send(
+                {"type": "http.response.body", "body": b"", "more_body": False}
+            )
+        except TimeoutError:
+            return
+
+
 async def _unconfigured_principal() -> AuthenticatedPrincipal:
     raise HTTPException(
         status_code=status.HTTP_401_UNAUTHORIZED,
@@ -58,11 +96,25 @@ def create_app(
     *,
     turn_service: TurnService | None = None,
     turn_query_service: TurnQueryService | None = None,
+    event_stream_service: EventStreamService | None = None,
     principal_provider: PrincipalProvider = _unconfigured_principal,
+    event_poll_seconds: float = 0.5,
+    event_heartbeat_seconds: float = 15.0,
+    event_send_timeout_seconds: float = 5.0,
 ) -> FastAPI:
     """DB接続をrequest時まで遅延したHTTP applicationを構築する。"""
 
-    if turn_service is None or turn_query_service is None:
+    if (
+        event_poll_seconds < 0
+        or event_heartbeat_seconds <= 0
+        or event_send_timeout_seconds <= 0
+    ):
+        raise ValueError("event pollとheartbeatの間隔が不正です")
+    if (
+        turn_service is None
+        or turn_query_service is None
+        or event_stream_service is None
+    ):
         settings = get_settings()
         sessions = create_session_factory(settings.database_url)
         authorization = PostgresAuthorizationPolicy(sessions)
@@ -82,6 +134,10 @@ def create_app(
             )
         if turn_query_service is None:
             turn_query_service = TurnQueryService(authorization, unit_of_work_factory)
+        if event_stream_service is None:
+            event_stream_service = EventStreamService(
+                authorization, unit_of_work_factory
+            )
 
     app = FastAPI(title="AI RPG API", version="0.1.0")
 
@@ -133,5 +189,75 @@ def create_app(
             return await turn_query_service.get(principal, campaign_id, turn_id)
         except (AuthorizationError, TurnNotFoundError) as error:
             raise _application_error(error) from error
+
+    @app.get("/campaigns/{campaign_id}/events", tags=["events"])
+    async def stream_events(
+        campaign_id: UUID,
+        request: Request,
+        principal: Annotated[AuthenticatedPrincipal, Depends(principal_provider)],
+        last_event_id: Annotated[str | None, Header(alias="Last-Event-ID")] = None,
+    ) -> StreamingResponse:
+        assert event_stream_service is not None
+        try:
+            cursor = 0 if last_event_id is None else int(last_event_id)
+            if cursor < 0:
+                raise ValueError
+        except ValueError as error:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail={"code": "INVALID_EVENT_CURSOR"},
+            ) from error
+
+        try:
+            initial = await event_stream_service.poll(principal, campaign_id, cursor)
+        except AuthorizationError as error:
+            raise _application_error(error) from error
+
+        async def event_body() -> AsyncIterator[str]:
+            nonlocal cursor
+            pending = initial
+            loop = asyncio.get_running_loop()
+            heartbeat_at = loop.time() + event_heartbeat_seconds
+            while not await request.is_disconnected():
+                events = pending
+                pending = ()
+                if not events:
+                    try:
+                        events = await event_stream_service.poll(
+                            principal, campaign_id, cursor
+                        )
+                    except AuthorizationError:
+                        return
+                emitted = False
+                for event in events:
+                    if await request.is_disconnected():
+                        return
+                    if event.id <= cursor:
+                        continue
+                    cursor = event.id
+                    emitted = True
+                    yield (
+                        f"id: {event.id}\n"
+                        f"event: {event.type}\n"
+                        f"data: {event.model_dump_json()}\n\n"
+                    )
+                if emitted:
+                    heartbeat_at = loop.time() + event_heartbeat_seconds
+                    continue
+                if loop.time() >= heartbeat_at:
+                    yield ": heartbeat\n\n"
+                    heartbeat_at = loop.time() + event_heartbeat_seconds
+                await asyncio.sleep(event_poll_seconds)
+
+        response = _TimedStreamingResponse(
+            event_body(),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "X-Accel-Buffering": "no",
+            },
+        )
+        response.send_timeout_seconds = event_send_timeout_seconds
+        return response
 
     return app

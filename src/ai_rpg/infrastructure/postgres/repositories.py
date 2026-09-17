@@ -32,6 +32,7 @@ from ai_rpg.application.ports.repositories import (
     NarrationWorkItem,
     NarrativeCommit,
     PhaseDeadlineExceededError,
+    PublicEventRepository,
     RecentMessage,
     ResolutionWorkItem,
     StateVersionConflictError,
@@ -45,7 +46,12 @@ from ai_rpg.application.resolution import (
     TurnCommitContext,
     project_resolution,
 )
-from ai_rpg.contracts import PlayerTurnInput, TurnResponse
+from ai_rpg.contracts import (
+    PlayerTurnInput,
+    PublicEvent,
+    PublicTurnEventPayload,
+    TurnResponse,
+)
 from ai_rpg.contracts.responses import (
     MechanicalNarrationInput,
     RecoveryReason,
@@ -59,6 +65,7 @@ from ai_rpg.infrastructure.postgres.models import (
     CampaignMemberModel,
     CampaignModel,
     EntityModel,
+    EventModel,
     MvpCharacterModel,
     MvpInventoryModel,
     MvpSceneSkillCheckModel,
@@ -1256,6 +1263,7 @@ class PostgresCanonicalRepository:
             await rows(MvpWeaponModel.__table__),
             await rows(MvpInventoryModel.__table__),
             await rows(MvpSceneSkillCheckModel.__table__),
+            await rows(EntityModel.__table__),
         )
 
     async def update_with_campaign_lock(
@@ -1685,6 +1693,46 @@ class PostgresNarrationRepository:
         return True
 
 
+class PostgresPublicEventRepository:
+    """永続event sequenceを秘密を含まない公開Turn表現へ投影する。"""
+
+    def __init__(self, session: AsyncSession) -> None:
+        self._session = session
+
+    async def list_after(
+        self, campaign_id: UUID, after: int, *, limit: int
+    ) -> tuple[PublicEvent, ...]:
+        rows = (
+            await self._session.execute(
+                select(EventModel.sequence, EventModel.turn_id)
+                .where(
+                    EventModel.campaign_id == campaign_id,
+                    EventModel.sequence > after,
+                    EventModel.turn_id.is_not(None),
+                )
+                .order_by(EventModel.sequence)
+                .limit(limit)
+            )
+        ).all()
+        turns = PostgresTurnRepository(self._session)
+        public: list[PublicEvent] = []
+        for sequence, turn_id in rows:
+            if turn_id is None:
+                continue
+            response = await turns.get_response(campaign_id, turn_id)
+            if response is None:
+                continue
+            public.append(
+                PublicEvent(
+                    id=int(sequence),
+                    type="turn.updated",
+                    schema_version=1,
+                    payload=PublicTurnEventPayload(turn=response),
+                )
+            )
+        return tuple(public)
+
+
 class PostgresUnitOfWork:
     """例外時に必ずrollbackするsession単位Unit of Work。"""
 
@@ -1692,6 +1740,7 @@ class PostgresUnitOfWork:
     canonical: CanonicalRepository
     narration: NarrationRepository
     llm_calls: LLMCallRepository
+    events: PublicEventRepository
 
     def __init__(self, factory: async_sessionmaker[AsyncSession]) -> None:
         self._factory = factory
@@ -1703,6 +1752,7 @@ class PostgresUnitOfWork:
         self.canonical = PostgresCanonicalRepository(self._session)
         self.narration = PostgresNarrationRepository(self._session)
         self.llm_calls = PostgresLLMCallRepository(self._session)
+        self.events = PostgresPublicEventRepository(self._session)
         return self
 
     async def __aexit__(self, exc_type: object, exc: object, tb: object) -> None:

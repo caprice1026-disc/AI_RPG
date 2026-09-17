@@ -22,11 +22,11 @@ AI_RPGは、LLMにゲーム状態を直接変更させないAI TRPGバックエ�
 現在のMVPでは、Fake LLMを使って次の一往復を実PostgreSQL上で再現できます。
 
 ```text
-プレイヤー入力 → 意図抽出 → 技能判定 → atomic保存 → 結果描写 → 次Turn受付
+プレイヤー入力 → 意図抽出 → 技能判定／攻撃／回復 → atomic保存 → 結果描写 → SSE更新
 ```
 
 > [!IMPORTANT]
-> 現在は基盤機能を検証するMVPです。開発用の最小プレイ画面は利用できますが、本番認証、攻撃・回復アイテムのAPI経路、SSEはまだ接続していません。
+> 現在は基盤機能を検証するMVPです。開発用のプレイ画面、攻撃・回復アイテム、SSEは利用できますが、本番認証adapterはまだ接続していません。
 
 ## 特徴
 
@@ -49,6 +49,8 @@ AI_RPGは、LLMにゲーム状態を直接変更させないAI TRPGバックエ�
 - OpenAI Responses APIのStructured Outputs adapter（単発request・暗黙retryなし）
 - 完了済みTurnだけから組み立てる、公開範囲を限定した複数Turn Context
 - Campaign／Actorを指定してTurnを送信し、判定と描写を確認できる最小プレイ画面
+- 登録済み参照だけを使う攻撃、HP下限／上限、回復ポーションと在庫消費
+- Campaign event sequenceをcursorにしたSSEと、接続失敗時のGET polling fallback
 - PostgreSQL migrationとSQLAlchemy 2の型付きmodel／query
 - timeout、Schema不正、worker交代、予算切れ、deadline到達時の回収とfallback
 - state version競合、古いlease、二重確定、rollbackを含む実PostgreSQLテスト
@@ -65,6 +67,8 @@ flowchart LR
     E --> DB[(PostgreSQL)]
     DB --> N[LLM: Narration only]
     N --> DTO[Public Turn DTO]
+    DB --> SSE[SSE: Public events]
+    SSE --> P
 ```
 
 - `contracts/`: 外部入力、LLM入出力、公開レスポンス
@@ -87,7 +91,7 @@ flowchart LR
 .\.venv\Scripts\uv.exe build
 ```
 
-2026-09-17時点で、実PostgreSQLを指定した全スイートは`201 passed`です。
+2026-09-17時点で、実PostgreSQLを指定した全スイートは`221 passed`です。
 
 PostgreSQL統合テストには、名前が`ai_rpg_test`で始まる専用の空DBを指定します。fixtureは既存テーブルがあるDBを拒否します。
 Alembicは空DBだけでなく、既存revisionからheadへの更新もテストします。
@@ -157,7 +161,7 @@ $env:AIRPG_DATABASE_URL = "postgresql+psycopg://airpg:airpg@localhost/airpg"
 
 Turnを投入し、返された`turn_id`をGETすると進行状態と描写を確認できます。
 
-ブラウザでは`http://127.0.0.1:8000/`を開き、Campaign IDとActor IDを入力すれば同じ一往復を試せます。画面はGET pollingで終端状態まで追跡し、送信中の二重送信を防ぎます。開発用principalを指定せずAPIを起動した場合は401の案内を表示し、認証を暗黙に迂回しません。
+ブラウザでは`http://127.0.0.1:8000/`を開き、Campaign IDとActor IDを入力すれば同じ一往復を試せます。開発fixtureには`hero`、`goblin`、`iron_sword`、`healing_potion`が登録されているため、「周囲を注意深く観察する」「鉄の剣でゴブリンを攻撃する」「回復ポーションを飲む」を試せます。画面はSSEを優先し、接続できない場合はGET pollingで終端状態まで追跡します。送信中の二重送信を防ぎ、開発用principalを指定せずAPIを起動した場合は401の案内を表示して認証を暗黙に迂回しません。
 
 ```powershell
 $requestId = [guid]::NewGuid()
@@ -192,6 +196,18 @@ $env:AIRPG_QUALITY_MODEL = "gpt-5.4"
 
 API keyは実provider選択時だけ検証され、Fake実行には不要です。各物理requestの直前にDBのTurn予算を予約し、timeout、拒否、不正JSON、Schema不一致、描写の事実逸脱も消費済みとして扱います。Mechanical描写は、保存済み結果にない数値、Canonical UUID、未登録の明示`@ref`を保存前に拒否します。
 
+## SSEでTurn更新を受け取る
+
+`GET /campaigns/{campaign_id}/events`は、認可済みCampaignの永続event sequenceをSSE `id`として、raw domain eventではなく公開`TurnResponse`へ投影した`turn.updated`を返します。再接続時は`Last-Event-ID`を送ると、そのsequenceより後を再取得できます。
+
+```text
+id: 12
+event: turn.updated
+data: {"id":12,"type":"turn.updated","schema_version":1,"payload":{"turn":{...}}}
+```
+
+配信はat-least-onceなのでClientは`id`で重複を除外します。serverは15秒ごとにheartbeatを送り、短いpollごとにCampaign membershipを再確認します。書込みが詰まった接続はtimeoutで閉じ、workerやDB transactionを保持しません。
+
 ## ロードマップ
 
 - [x] Fake LLMによる技能判定の一往復
@@ -202,8 +218,8 @@ API keyは実provider選択時だけ検証され、Fake実行には不要です�
 - [x] OpenAI Responses API adapter
 - [ ] 本番認証adapter
 - [x] 最小のプレイヤー向け画面
-- [ ] 攻撃・回復・アイテム使用のAPI経路
-- [ ] SSEによるリアルタイム更新
+- [x] 攻撃・回復・アイテム使用のAPI経路
+- [x] SSEによるリアルタイム更新
 
 ## コントリビューション
 
