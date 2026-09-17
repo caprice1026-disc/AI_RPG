@@ -31,7 +31,7 @@ class GMInput(Contract):
     player_text: InputText
     scene_view: ContextFragment
     pc_view: ContextFragment
-    recent_messages: list[ContextFragment] = Field(max_length=20)
+    recent_messages: list[ContextFragment] = Field(max_length=100)
     allowed_entity_refs: list[EntityRef] = Field(max_length=100)
     output_limits: OutputLimits
 

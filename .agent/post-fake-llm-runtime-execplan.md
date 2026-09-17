@@ -41,10 +41,10 @@
 
 **変更:** `src/ai_rpg/application/ports/repositories.py`、`src/ai_rpg/application/workers.py`、`src/ai_rpg/infrastructure/postgres/repositories.py`、`src/ai_rpg/contracts/context.py`、`tests/integration/postgres/test_migrations.py`
 
-- [ ] 完了済みTurnだけを新しい順で上限取得し、時系列順の公開`recent_messages`へ変換するテストをREDにする。
-- [ ] player入力、保存済みnarration、公開Action結果だけを含め、内部failure code、秘密の判定条件、未完了Turnを除外するqueryを実装する。
-- [ ] 直前の確認質問と次の回答をContextへ含め、回答Turnを同じactor/Sceneの入力として解釈できるFakeシナリオをGREENにする。
-- [ ] `AIRPG_RECENT_MESSAGES_LIMIT=0..100`をworker processへ渡し、取得上限と順序を確認する。
+- [x] 完了済みTurnだけを新しい順で上限取得し、時系列順の公開`recent_messages`へ変換するテストをREDにする。
+- [x] player入力、保存済みnarration、公開Action結果だけを含め、内部failure code、秘密の判定条件、未完了Turnを除外するqueryを実装する。
+- [x] 直前の確認質問と次の回答をContextへ含め、回答Turnを同じactor/Sceneの入力として解釈できるFakeシナリオをGREENにする。
+- [x] `AIRPG_RECENT_MESSAGES_LIMIT=0..100`をworker processへ渡し、取得上限と順序を確認する。
 
 ## チェックポイント4: ADR-0006 OpenAI adapter
 
@@ -89,7 +89,7 @@
 | --- | --- | --- | --- |
 | 1 レビュー3件 | 完了 | 完了 | `176 passed`、Ruff、mypy（2026-09-17） |
 | 2 独立Fake process | 完了 | 完了 | 実process受入を含む`179 passed`（2026-09-17） |
-| 3 複数Turn Context | 未着手 | 未着手 | - |
+| 3 複数Turn Context | 完了 | 完了 | 公開履歴・確認回答を含む`184 passed`（2026-09-17） |
 | 4 OpenAI adapter | 未着手 | 未着手 | - |
 | 5 最小プレイ画面 | 未着手 | 未着手 | - |
 | 6 攻撃・回復item・SSE | 未着手 | 未着手 | - |

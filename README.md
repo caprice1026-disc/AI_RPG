@@ -26,7 +26,7 @@ AI_RPGは、LLMにゲーム状態を直接変更させないAI TRPGバックエ�
 ```
 
 > [!IMPORTANT]
-> 現在は基盤機能を検証するMVPです。実モデル、本番認証、常駐worker runner、SSE、UIはまだ接続していません。
+> 現在は基盤機能を検証するMVPです。実モデル、本番認証、SSE、プレイヤー向けUIはまだ接続していません。
 
 ## 特徴
 
@@ -46,6 +46,7 @@ AI_RPGは、LLMにゲーム状態を直接変更させないAI TRPGバックエ�
 - Narrative／Mechanicalを分ける決定的なTurn Router
 - `mvp_v1` rulesetによる再現可能な技能判定
 - Fake transportによる通常描写とMechanicalへの昇格
+- 完了済みTurnだけから組み立てる、公開範囲を限定した複数Turn Context
 - PostgreSQL migrationとSQLAlchemy 2の型付きmodel／query
 - timeout、Schema不正、worker交代、予算切れ、deadline到達時の回収とfallback
 - state version競合、古いlease、二重確定、rollbackを含む実PostgreSQLテスト
@@ -84,7 +85,7 @@ flowchart LR
 .\.venv\Scripts\uv.exe build
 ```
 
-2026-09-17時点で、実PostgreSQLを指定した全スイートは`179 passed`です。
+2026-09-17時点で、実PostgreSQLを指定した全スイートは`184 passed`です。
 
 PostgreSQL統合テストには、名前が`ai_rpg_test`で始まる専用の空DBを指定します。fixtureは既存テーブルがあるDBを拒否します。
 Alembicは空DBだけでなく、既存revisionからheadへの更新もテストします。
@@ -171,13 +172,17 @@ Invoke-RestMethod `
 
 `--once`を付けるとworkerは一回だけ取得を試みて終了します。processを停止・再起動しても、Turn、予算、lease、確定済み結果はPostgreSQLから引き継がれます。`--dev-principal`は開発時だけ明示的に有効化する認証差し替えで、通常起動では引き続き401を返します。
 
+解決workerへ渡す直近の公開履歴は`AIRPG_RECENT_MESSAGES_LIMIT`で0〜100件に設定でき、既定値は20です。0にすると履歴を渡しません。対象は同じCampaign・Scene・Actorの終端Turnだけで、プレイヤー入力、公開Action結果、保存済み描写を古い順に渡します。
+
 ## ロードマップ
 
 - [x] Fake LLMによる技能判定の一往復
 - [x] 冪等受付、atomic確定、独立した描写worker
 - [x] 永続LLM予算、lease、deadline、障害復旧
 - [x] 開発用の独立API／worker runner
+- [x] 公開範囲を限定した複数Turn Context
 - [ ] 実モデルと本番認証adapter
+- [ ] 最小のプレイヤー向け画面
 - [ ] 攻撃・回復・アイテム使用のAPI経路
 - [ ] SSEとプレイヤー向けUI
 

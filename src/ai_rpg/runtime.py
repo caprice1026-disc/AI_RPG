@@ -163,6 +163,7 @@ def build_resolution_worker(
             settings.fast_model,
             settings.llm_timeout_seconds,
         ),
+        recent_messages_limit=settings.recent_messages_limit,
         rng_source="seeded_test" if deterministic else "secure",
     )
 

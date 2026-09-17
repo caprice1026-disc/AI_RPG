@@ -2912,6 +2912,126 @@ def test_fake_llm_skill_check_round_trip_reopens_turn_acceptance(
         ) == ["DiceRolled", "ActionResolved", "GMNarrationGenerated"]
 
 
+def test_resolution_context_uses_only_recent_completed_public_history(
+    database: Engine,
+) -> None:
+    with database.begin() as connection:
+        _seed_resolution_state(connection)
+        connection.execute(
+            text(
+                "INSERT INTO mvp_scene_skill_checks("
+                "campaign_id,scene_id,check_ref,skill_ref,difficulty,public_description"
+                ") VALUES("
+                ":campaign,:scene,'secret_check','perception','normal',"
+                "'SECRET_SUCCESS_DESCRIPTION'"
+                ")"
+            ),
+            {"campaign": CAMPAIGN_A, "scene": SCENE_A},
+        )
+        connection.execute(
+            text(
+                "INSERT INTO turns("
+                "id,campaign_id,scene_id,request_id,created_by,actor_id,input_payload,"
+                "request_hash,input_kind,input_text,expected_state_version,"
+                "committed_state_version,route,resolution_status,committed_at,"
+                "narration_status,narration,narration_input,resolution_failure_code,created_at"
+                ") VALUES("
+                ":turn_a,:campaign,:scene,:request_a,:principal,:actor,'{}',"
+                "decode(repeat('00',32),'hex'),'text','床を調べる',0,0,'mechanical',"
+                "'committed',now(),'completed','古い足跡を見つけた。',"
+                "'{\"private\":\"SECRET_NARRATION_INPUT\"}',"
+                "'SECRET_FAILURE_CODE',now()-interval '2 minutes'"
+                "),("
+                ":turn_b,:campaign,:scene,:request_b,:principal,:actor,'{}',"
+                "decode(repeat('01',32),'hex'),'text','扉を調べる',0,NULL,'mechanical',"
+                "'not_applied',NULL,'completed','左右どちらの扉を調べますか?',"
+                "NULL,'SECRET_CLARIFICATION_FAILURE',now()-interval '1 minute'"
+                ")"
+            ),
+            {
+                "turn_a": TURN_A,
+                "turn_b": TURN_B,
+                "campaign": CAMPAIGN_A,
+                "scene": SCENE_A,
+                "request_a": REQUEST_A,
+                "request_b": REQUEST_B,
+                "principal": PRINCIPAL_A,
+                "actor": ACTOR_A,
+            },
+        )
+        connection.execute(
+            text(
+                "INSERT INTO actions("
+                "id,campaign_id,turn_id,ordinal,actor_id,kind,command,result,"
+                "result_kind,ruleset_version"
+                ") VALUES("
+                ":action,:campaign,:turn,1,:actor,'skill_check',"
+                "'{\"private\":\"SECRET_COMMAND\"}',"
+                "'{\"kind\":\"applied\",\"outcome\":\"success\","
+                "\"facts\":[\"足跡の向きは北だ。\"],\"dice\":[],"
+                "\"state_changes\":[]}',"
+                "'applied','mvp_v1'"
+                ")"
+            ),
+            {
+                "action": ACTION_A,
+                "campaign": CAMPAIGN_A,
+                "turn": TURN_A,
+                "actor": ACTOR_A,
+            },
+        )
+
+    async def resolve_answer() -> dict[str, Any]:
+        url = database.url.render_as_string(hide_password=False)
+        async with _postgres_sessions(url) as factory:
+            await _accept_turn(factory, _player_turn("左の扉です", REQUEST_C))
+
+            def unit_of_work_factory() -> PostgresUnitOfWork:
+                return PostgresUnitOfWork(factory)
+
+            transport = ScriptedFakeTransport(
+                [
+                    {
+                        "kind": "narrative",
+                        "narration": "左の扉へ向かった。",
+                        "choices": [],
+                    }
+                ]
+            )
+            worker = SkillCheckResolutionWorker(
+                unit_of_work_factory,
+                transport,
+                MvpV1Ruleset(DiceEngine(MagicMock())),
+                WorkerPhasePolicy(60, 3, 120, "fake-narrative"),
+                recent_messages_limit=5,
+            )
+            assert await worker.run_once()
+            assert transport.request_count == 1
+            return json.loads(transport.calls[0].input_data)
+
+    with asyncio.Runner(loop_factory=asyncio.SelectorEventLoop) as runner:
+        llm_input = runner.run(resolve_answer())
+
+    assert llm_input["player_text"] == "左の扉です"
+    assert [message["source"] for message in llm_input["recent_messages"]] == [
+        "recent_player",
+        "recent_action_result",
+        "recent_gm",
+        "recent_player",
+        "recent_gm",
+    ]
+    assert [message["content"] for message in llm_input["recent_messages"]] == [
+        "床を調べる",
+        '{"dice":[],"facts":["足跡の向きは北だ。"],"kind":"applied",'
+        '"outcome":"success"}',
+        "古い足跡を見つけた。",
+        "扉を調べる",
+        "左右どちらの扉を調べますか?",
+    ]
+    serialized = json.dumps(llm_input, ensure_ascii=False)
+    assert "SECRET_" not in serialized
+
+
 def test_incapacitated_actor_is_not_retried(database: Engine) -> None:
     with database.begin() as connection:
         _seed_resolution_state(connection)

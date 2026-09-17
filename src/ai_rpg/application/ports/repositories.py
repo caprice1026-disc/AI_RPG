@@ -86,6 +86,12 @@ FailureDisposition: TypeAlias = Literal["retry", "terminal"]
 
 
 @dataclass(frozen=True, slots=True)
+class RecentMessage:
+    source: Literal["recent_player", "recent_action_result", "recent_gm"]
+    content: str
+
+
+@dataclass(frozen=True, slots=True)
 class ResolutionWorkItem:
     turn_id: UUID
     campaign_id: UUID
@@ -97,6 +103,7 @@ class ResolutionWorkItem:
     max_actions: int
     expected_state_version: int
     player_text: str
+    recent_messages: tuple[RecentMessage, ...]
     route: Literal["narrative", "mechanical"] | None
 
 
@@ -193,7 +200,11 @@ class TurnRepository(Protocol):
     ) -> Lease | None: ...
 
     async def get_resolution_work(
-        self, turn_id: UUID, worker_epoch: int
+        self,
+        turn_id: UUID,
+        worker_epoch: int,
+        *,
+        recent_messages_limit: int,
     ) -> ResolutionWorkItem | None: ...
 
     async def record_initial_route(

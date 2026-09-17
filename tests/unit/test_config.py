@@ -38,3 +38,25 @@ def test_provider_timeout_must_fit_inside_worker_lease(
 
     with pytest.raises(ValidationError):
         Settings()
+
+
+@pytest.mark.parametrize(("value", "expected"), [("0", 0), ("100", 100)])
+def test_recent_message_limit_accepts_configured_boundaries(
+    monkeypatch: pytest.MonkeyPatch,
+    value: str,
+    expected: int,
+) -> None:
+    monkeypatch.setenv("AIRPG_RECENT_MESSAGES_LIMIT", value)
+
+    assert Settings().recent_messages_limit == expected
+
+
+@pytest.mark.parametrize("value", ["-1", "101"])
+def test_recent_message_limit_rejects_out_of_range_values(
+    monkeypatch: pytest.MonkeyPatch,
+    value: str,
+) -> None:
+    monkeypatch.setenv("AIRPG_RECENT_MESSAGES_LIMIT", value)
+
+    with pytest.raises(ValidationError):
+        Settings()

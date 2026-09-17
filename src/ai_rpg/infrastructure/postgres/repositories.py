@@ -8,7 +8,7 @@ from collections.abc import Callable, Mapping, Sequence
 from typing import Literal
 from uuid import UUID, uuid4
 
-from sqlalchemy import RowMapping, exists, or_, select, text
+from sqlalchemy import RowMapping, and_, exists, or_, select, text
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from sqlalchemy.sql import update as sql_update
@@ -32,6 +32,7 @@ from ai_rpg.application.ports.repositories import (
     NarrationWorkItem,
     NarrativeCommit,
     PhaseDeadlineExceededError,
+    RecentMessage,
     ResolutionWorkItem,
     StateVersionConflictError,
     TurnInProgressError,
@@ -52,7 +53,9 @@ from ai_rpg.contracts.responses import (
 )
 from ai_rpg.domain.commands import AttackCommand, UseItemCommand
 from ai_rpg.domain.events import NarrationGeneratedPayload
+from ai_rpg.domain.results import AppliedResult, NotApplicableResult
 from ai_rpg.infrastructure.postgres.models import (
+    ActionModel,
     CampaignMemberModel,
     CampaignModel,
     EntityModel,
@@ -69,6 +72,28 @@ from ai_rpg.infrastructure.postgres.models import (
 
 def _json(value: object) -> str:
     return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str)
+
+
+def _public_action_summary(result: Mapping[str, object]) -> str | None:
+    """Canonical IDを除いた、公開DTO由来のAction結果だけをContextへ載せる。"""
+
+    kind = result.get("kind")
+    if kind == "applied":
+        applied = AppliedResult.model_validate(result)
+        return _json(
+            {
+                "kind": applied.kind,
+                "outcome": applied.outcome,
+                "facts": applied.facts,
+                "dice": [die.model_dump(mode="json") for die in applied.dice],
+            }
+        )[:8000]
+    if kind == "not_applicable":
+        not_applicable = NotApplicableResult.model_validate(result)
+        return _json(
+            {"kind": not_applicable.kind, "reason": not_applicable.reason}
+        )
+    return None
 
 
 def request_hash(
@@ -611,9 +636,87 @@ class PostgresTurnRepository:
             )
         )
 
+    async def _recent_messages(
+        self,
+        current: RowMapping,
+        limit: int,
+    ) -> tuple[RecentMessage, ...]:
+        if limit == 0:
+            return ()
+        history = list(
+            (
+                await self._session.execute(
+                    select(
+                        TurnModel.id.label("turn_id"),
+                        TurnModel.input_text,
+                        TurnChoiceModel.label.label("choice_label"),
+                        TurnModel.narration,
+                        TurnModel.created_at,
+                    )
+                    .outerjoin(
+                        TurnChoiceModel,
+                        TurnChoiceModel.id == TurnModel.selected_choice_id,
+                    )
+                    .where(
+                        TurnModel.campaign_id == current["campaign_id"],
+                        TurnModel.scene_id == current["scene_id"],
+                        TurnModel.actor_id == current["actor_id"],
+                        TurnModel.resolution_status.in_(
+                            ("committed", "not_applied", "failed")
+                        ),
+                        TurnModel.narration_status.in_(("completed", "fallback")),
+                        or_(
+                            TurnModel.created_at < current["created_at"],
+                            and_(
+                                TurnModel.created_at == current["created_at"],
+                                TurnModel.id < current["id"],
+                            ),
+                        ),
+                    )
+                    .order_by(TurnModel.created_at.desc(), TurnModel.id.desc())
+                    .limit(limit)
+                )
+            ).mappings()
+        )
+        if not history:
+            return ()
+
+        turn_ids = [row["turn_id"] for row in history]
+        action_rows = (
+            await self._session.execute(
+                select(ActionModel.turn_id, ActionModel.ordinal, ActionModel.result)
+                .where(ActionModel.turn_id.in_(turn_ids))
+                .order_by(ActionModel.turn_id, ActionModel.ordinal)
+            )
+        ).mappings()
+        actions_by_turn: dict[UUID, list[str]] = {}
+        for action in action_rows:
+            summary = _public_action_summary(action["result"])
+            if summary is not None:
+                actions_by_turn.setdefault(action["turn_id"], []).append(summary)
+
+        messages: list[RecentMessage] = []
+        for row in reversed(history):
+            player_text = row["input_text"] or row["choice_label"]
+            if player_text:
+                messages.append(RecentMessage("recent_player", str(player_text)[:8000]))
+            messages.extend(
+                RecentMessage("recent_action_result", summary)
+                for summary in actions_by_turn.get(row["turn_id"], ())
+            )
+            if row["narration"]:
+                messages.append(RecentMessage("recent_gm", str(row["narration"])[:8000]))
+        return tuple(messages[-limit:])
+
     async def get_resolution_work(
-        self, turn_id: UUID, worker_epoch: int
+        self,
+        turn_id: UUID,
+        worker_epoch: int,
+        *,
+        recent_messages_limit: int,
     ) -> ResolutionWorkItem | None:
+        if not 0 <= recent_messages_limit <= 100:
+            raise ValueError("recent_messages_limitは0から100の範囲で指定してください")
         row = (
             await self._session.execute(
                 text(
@@ -644,6 +747,7 @@ class PostgresTurnRepository:
                         t.max_actions,
                         t.expected_state_version,
                         t.route,
+                        t.created_at,
                         COALESCE(t.input_text,c.label) AS player_text
                     FROM turns AS t
                     LEFT JOIN turn_choices AS c ON c.id=t.selected_choice_id
@@ -658,6 +762,7 @@ class PostgresTurnRepository:
         ).mappings().one_or_none()
         if row is None:
             return None
+        recent_messages = await self._recent_messages(row, recent_messages_limit)
         return ResolutionWorkItem(
             turn_id=row["id"],
             campaign_id=row["campaign_id"],
@@ -669,6 +774,7 @@ class PostgresTurnRepository:
             max_actions=int(row["max_actions"]),
             expected_state_version=int(row["expected_state_version"]),
             player_text=str(row["player_text"]),
+            recent_messages=recent_messages,
             route=row["route"],
         )
 

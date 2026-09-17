@@ -128,6 +128,7 @@ class SkillCheckResolutionWorker:
         action_id_factory: Callable[[], UUID] = uuid4,
         choice_id_factory: Callable[[], UUID] = uuid4,
         router: TurnRouter | None = None,
+        recent_messages_limit: int = 20,
         rng_source: Literal["secure", "seeded_test", "recorded_replay"] = "secure",
         rng_implementation_version: str = "mvp_v1",
     ) -> None:
@@ -138,6 +139,9 @@ class SkillCheckResolutionWorker:
         self._action_id_factory = action_id_factory
         self._choice_id_factory = choice_id_factory
         self._router = router or RuleBasedTurnRouter()
+        if not 0 <= recent_messages_limit <= 100:
+            raise ValueError("recent_messages_limitは0から100の範囲で指定してください")
+        self._recent_messages_limit = recent_messages_limit
         self._rng_source = rng_source
         self._rng_implementation_version = rng_implementation_version
 
@@ -156,7 +160,9 @@ class SkillCheckResolutionWorker:
         async with self._unit_of_work_factory() as unit_of_work:
             snapshot = await unit_of_work.canonical.snapshot(lease.turn.campaign_id)
             work = await unit_of_work.turns.get_resolution_work(
-                lease.turn.id, lease.turn.worker_epoch
+                lease.turn.id,
+                lease.turn.worker_epoch,
+                recent_messages_limit=self._recent_messages_limit,
             )
             await unit_of_work.commit()
         if work is None:
@@ -437,7 +443,7 @@ class SkillCheckResolutionWorker:
             player_text=work.player_text,
             scene_view=scene_view,
             pc_view=pc_view,
-            recent_messages=[],
+            recent_messages=self._recent_context(work),
             allowed_entity_refs=[],
             output_limits=OutputLimits(max_actions=work.max_actions, max_choices=5),
         )
@@ -457,12 +463,29 @@ class SkillCheckResolutionWorker:
             player_text=work.player_text,
             scene_view=scene_view,
             pc_view=pc_view,
-            recent_messages=[],
+            recent_messages=self._recent_context(work),
             allowed_entity_refs=[],
             output_limits=OutputLimits(max_actions=work.max_actions, max_choices=5),
             supported_action_types=["skill_check"],
             supported_skill_refs=supported_skills,
         )
+
+    @staticmethod
+    def _recent_context(work: ResolutionWorkItem) -> list[ContextFragment]:
+        trust = {
+            "recent_player": "untrusted",
+            "recent_action_result": "derived",
+            "recent_gm": "trusted",
+        }
+        return [
+            ContextFragment(
+                source=message.source,
+                trust_level=trust[message.source],
+                access_scope="public",
+                content=message.content,
+            )
+            for message in work.recent_messages
+        ]
 
     def _public_context(
         self, work: ResolutionWorkItem, snapshot: CanonicalSnapshot
