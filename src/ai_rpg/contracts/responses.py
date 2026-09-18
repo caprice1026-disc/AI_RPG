@@ -91,3 +91,10 @@ class TurnResponse(Contract):
         if (self.narration_status == "fallback") != self.recovery.fallback:
             raise ValueError("fallback状態とrecoveryは一致する必要があります")
         return self
+
+
+class CampaignStateResponse(Contract):
+    """プレイ再開に必要なCampaignの正本versionと最新Turn。"""
+
+    state_version: NonNegativeInt
+    latest_turn: TurnResponse | None

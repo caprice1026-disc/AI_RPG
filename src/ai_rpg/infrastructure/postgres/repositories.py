@@ -47,6 +47,7 @@ from ai_rpg.application.resolution import (
     project_resolution,
 )
 from ai_rpg.contracts import (
+    CampaignStateResponse,
     PlayerTurnInput,
     PublicEvent,
     PublicTurnEventPayload,
@@ -425,6 +426,31 @@ class PostgresTurnRepository:
     ) -> TurnResponse | None:
         row = await self._response_row(campaign_id, turn_id)
         return None if row is None else self._to_response(row)
+
+    async def get_campaign_state(self, campaign_id: UUID) -> CampaignStateResponse:
+        state_version = (
+            await self._session.execute(
+                select(CampaignModel.state_version)
+                .where(CampaignModel.id == campaign_id)
+                .with_for_update()
+            )
+        ).scalar_one()
+        latest_turn_id = (
+            await self._session.execute(
+                select(TurnModel.id)
+                .where(TurnModel.campaign_id == campaign_id)
+                .order_by(TurnModel.created_at.desc(), TurnModel.id.desc())
+                .limit(1)
+            )
+        ).scalar_one_or_none()
+        latest_turn = (
+            None
+            if latest_turn_id is None
+            else await self.get_response(campaign_id, latest_turn_id)
+        )
+        return CampaignStateResponse(
+            state_version=int(state_version), latest_turn=latest_turn
+        )
 
     async def _request_row(
         self, campaign_id: UUID, principal_id: UUID, request_id: UUID

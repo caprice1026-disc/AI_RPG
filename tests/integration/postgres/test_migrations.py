@@ -2869,6 +2869,7 @@ def test_fake_llm_skill_check_round_trip_reopens_turn_acceptance(
                 completed = await client.get(
                     f"/campaigns/{CAMPAIGN_A}/turns/{turn_id}"
                 )
+                campaign_state = await client.get(f"/campaigns/{CAMPAIGN_A}/state")
                 replay = await client.post(
                     f"/campaigns/{CAMPAIGN_A}/turns",
                     json={
@@ -2891,6 +2892,11 @@ def test_fake_llm_skill_check_round_trip_reopens_turn_acceptance(
                     },
                 )
             assert completed.status_code == 200
+            assert campaign_state.status_code == 200
+            assert campaign_state.json() == {
+                "state_version": completed.json()["committed_state_version"],
+                "latest_turn": completed.json(),
+            }
             assert replay.status_code == 202
             assert replay.json() == completed.json()
             assert intent_transport.calls[0].purpose == "intent"
@@ -3096,7 +3102,7 @@ def test_ungrounded_result_narration_retries_then_falls_back(database: Engine) -
                 return PostgresUnitOfWork(factory)
 
             accepted = await _accept_turn(
-                factory, _player_turn("周囲を注意深く観察する")
+                factory, _player_turn("999の判定結果で周囲を注意深く観察する")
             )
             resolution = SkillCheckResolutionWorker(
                 unit_of_work_factory,
@@ -4947,6 +4953,143 @@ def test_worker_commits_attack_and_healing_item_from_registered_refs(
         ) == events
 
 
+@pytest.mark.parametrize(
+    (
+        "initial_hp",
+        "quantity",
+        "roll",
+        "reason",
+        "expected_hp",
+        "expected_quantity",
+        "follow_up_attack",
+    ),
+    [
+        (9, 2, 6, "rule_precondition", 10, 1, True),
+        (5, 1, 2, "resource_unavailable", 9, 0, False),
+    ],
+)
+def test_worker_keeps_first_heal_when_second_use_becomes_not_applicable(
+    database: Engine,
+    initial_hp: int,
+    quantity: int,
+    roll: int,
+    reason: str,
+    expected_hp: int,
+    expected_quantity: int,
+    follow_up_attack: bool,
+) -> None:
+    with database.begin() as connection:
+        _seed_resolution_state(connection)
+        connection.execute(
+            text(
+                "UPDATE mvp_characters SET current_hp=:hp "
+                "WHERE campaign_id=:campaign AND entity_id=:actor"
+            ),
+            {"hp": initial_hp, "campaign": CAMPAIGN_A, "actor": ACTOR_A},
+        )
+        connection.execute(
+            text(
+                "UPDATE mvp_inventory SET quantity=:quantity "
+                "WHERE campaign_id=:campaign AND owner_id=:actor AND item_id=:item"
+            ),
+            {
+                "quantity": quantity,
+                "campaign": CAMPAIGN_A,
+                "actor": ACTOR_A,
+                "item": ITEM_A,
+            },
+        )
+
+    class FixedHeal:
+        def __init__(self) -> None:
+            self.calls = 0
+            self.values = iter([roll, 10, 4] if follow_up_attack else [roll])
+
+        def randint(self, lower: int, upper: int) -> int:
+            self.calls += 1
+            value = next(self.values)
+            assert lower <= value <= upper
+            return value
+
+    random = FixedHeal()
+    item = {"kind": "use_item", "item_ref": "healing_potion", "target_ref": None}
+    intents = [item, item]
+    if follow_up_attack:
+        intents.append(
+            {"kind": "attack", "target_ref": "goblin", "weapon_ref": "iron_sword"}
+        )
+
+    async def resolve() -> None:
+        url = database.url.render_as_string(hide_password=False)
+        async with _postgres_sessions(url) as factory:
+            accepted = await _accept_turn(factory, _player_turn("回復ポーションを二回使う"))
+
+            def unit_of_work_factory() -> PostgresUnitOfWork:
+                return PostgresUnitOfWork(factory)
+
+            worker = SkillCheckResolutionWorker(
+                unit_of_work_factory,
+                ScriptedFakeTransport([{"kind": "action_plan", "actions": intents}]),
+                MvpV1Ruleset(DiceEngine(random)),
+                WorkerPhasePolicy(60, 3, 120, "fake-intent"),
+                rng_source="seeded_test",
+            )
+            assert await worker.run_once(accepted.turn_id)
+
+    with asyncio.Runner(loop_factory=asyncio.SelectorEventLoop) as runner:
+        runner.run(resolve())
+
+    assert random.calls == (3 if follow_up_attack else 1)
+    with database.connect() as connection:
+        assert connection.execute(
+            text(
+                "SELECT resolution_status,committed_state_version "
+                "FROM turns WHERE request_id=:request"
+            ),
+            {"request": REQUEST_A},
+        ).one() == ("committed", 1)
+        assert connection.scalar(
+            text(
+                "SELECT current_hp FROM mvp_characters "
+                "WHERE campaign_id=:campaign AND entity_id=:actor"
+            ),
+            {"campaign": CAMPAIGN_A, "actor": ACTOR_A},
+        ) == expected_hp
+        assert connection.scalar(
+            text(
+                "SELECT quantity FROM mvp_inventory "
+                "WHERE campaign_id=:campaign AND owner_id=:actor AND item_id=:item"
+            ),
+            {"campaign": CAMPAIGN_A, "actor": ACTOR_A, "item": ITEM_A},
+        ) == expected_quantity
+        action_rows = list(
+            connection.execute(
+                text(
+                    "SELECT result_kind,result->>'reason' FROM actions ORDER BY ordinal"
+                )
+            )
+        )
+        expected_actions = [("applied", None), ("not_applicable", reason)]
+        if follow_up_attack:
+            expected_actions.append(("applied", None))
+        assert action_rows == expected_actions
+        event_types = list(
+            connection.execute(text("SELECT type FROM events ORDER BY sequence")).scalars()
+        )
+        expected_events = [
+            "DiceRolled",
+            "HealingApplied",
+            "ItemConsumed",
+            "ActionResolved",
+            "ActionResolved",
+        ]
+        if follow_up_attack:
+            expected_events.extend(
+                ["DiceRolled", "DiceRolled", "DamageApplied", "ActionResolved"]
+            )
+        assert event_types == expected_events
+
+
 def test_worker_attack_miss_keeps_hp_and_state_version(database: Engine) -> None:
     with database.begin() as connection:
         _seed_resolution_state(connection)
@@ -5118,6 +5261,10 @@ def test_later_attack_on_target_reduced_to_zero_is_not_applicable(
         (
             {"kind": "use_item", "item_ref": "healing_potion", "target_ref": None},
             "empty_inventory",
+        ),
+        (
+            {"kind": "use_item", "item_ref": "healing_potion", "target_ref": None},
+            "none",
         ),
     ],
 )

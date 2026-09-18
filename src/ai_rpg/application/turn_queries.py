@@ -5,7 +5,7 @@ from uuid import UUID
 
 from ai_rpg.application.auth import AuthenticatedPrincipal
 from ai_rpg.application.ports import AuthorizationError, AuthorizationPolicy, UnitOfWork
-from ai_rpg.contracts import TurnResponse
+from ai_rpg.contracts import CampaignStateResponse, TurnResponse
 
 
 class TurnNotFoundError(Exception):
@@ -37,5 +37,19 @@ class TurnQueryService:
             response = await unit_of_work.turns.get_response(campaign_id, turn_id)
             if response is None:
                 raise TurnNotFoundError("Turnが存在しません")
+            await unit_of_work.commit()
+        return response
+
+    async def get_campaign_state(
+        self,
+        principal: AuthenticatedPrincipal,
+        campaign_id: UUID,
+    ) -> CampaignStateResponse:
+        if not await self._authorization.can_access_campaign(
+            principal.principal_id, campaign_id
+        ):
+            raise AuthorizationError("Campaignを参照する権限がありません")
+        async with self._unit_of_work_factory() as unit_of_work:
+            response = await unit_of_work.turns.get_campaign_state(campaign_id)
             await unit_of_work.commit()
         return response

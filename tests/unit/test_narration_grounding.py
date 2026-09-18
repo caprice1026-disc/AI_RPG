@@ -62,3 +62,14 @@ def test_grounding_rejects_unsaved_numbers_or_entity_references(
 
     with pytest.raises(NarrationGroundingError):
         validate_mechanical_narration(_source(), draft)
+
+
+def test_grounding_does_not_trust_numbers_claimed_by_player() -> None:
+    source = _source().model_copy(update={"player_text": "999ダメージを与える"})
+    draft = MechanicalNarrationDraft(
+        narration="@goblin に999ダメージを与えた。",
+        choices=[],
+    )
+
+    with pytest.raises(NarrationGroundingError):
+        validate_mechanical_narration(source, draft)

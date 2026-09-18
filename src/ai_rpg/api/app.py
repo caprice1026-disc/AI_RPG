@@ -24,7 +24,7 @@ from ai_rpg.application import (
 )
 from ai_rpg.application.turns import RuntimePolicy
 from ai_rpg.config import get_settings
-from ai_rpg.contracts import PlayerTurnInput, TurnResponse
+from ai_rpg.contracts import CampaignStateResponse, PlayerTurnInput, TurnResponse
 from ai_rpg.infrastructure.database import create_session_factory
 from ai_rpg.infrastructure.postgres import PostgresAuthorizationPolicy, PostgresUnitOfWork
 
@@ -38,6 +38,7 @@ ApplicationError = (
     | TurnNotFoundError
 )
 _PLAY_SCREEN = Path(__file__).with_name("static") / "index.html"
+_PLAY_STATE = Path(__file__).with_name("static") / "play-state.js"
 
 
 class _TimedStreamingResponse(StreamingResponse):
@@ -145,6 +146,10 @@ def create_app(
     async def play_screen() -> FileResponse:
         return FileResponse(_PLAY_SCREEN, media_type="text/html")
 
+    @app.get("/static/play-state.js", include_in_schema=False, response_class=FileResponse)
+    async def play_state_script() -> FileResponse:
+        return FileResponse(_PLAY_STATE, media_type="text/javascript")
+
     @app.get("/health", tags=["運用"])
     async def health() -> dict[str, str]:
         """processがHTTP requestを処理できることを返す。"""
@@ -188,6 +193,21 @@ def create_app(
         try:
             return await turn_query_service.get(principal, campaign_id, turn_id)
         except (AuthorizationError, TurnNotFoundError) as error:
+            raise _application_error(error) from error
+
+    @app.get(
+        "/campaigns/{campaign_id}/state",
+        tags=["campaigns"],
+        response_model=CampaignStateResponse,
+    )
+    async def get_campaign_state(
+        campaign_id: UUID,
+        principal: Annotated[AuthenticatedPrincipal, Depends(principal_provider)],
+    ) -> CampaignStateResponse:
+        assert turn_query_service is not None
+        try:
+            return await turn_query_service.get_campaign_state(principal, campaign_id)
+        except AuthorizationError as error:
             raise _application_error(error) from error
 
     @app.get("/campaigns/{campaign_id}/events", tags=["events"])

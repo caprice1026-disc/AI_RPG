@@ -263,6 +263,7 @@
 
   <div id="live-status" class="visually-hidden" role="status" aria-live="polite"></div>
 
+  <script src="/static/play-state.js"></script>
   <script>
     const ui = Object.fromEntries([
       "campaign-id", "actor-id", "action-text", "send-action", "composer", "timeline",
@@ -279,15 +280,18 @@
       UNAUTHENTICATED: "認証が設定されていません。開発時はAPIを --dev-principal 付きで起動してください。",
       FORBIDDEN: "このCampaignまたはActorを操作する権限がありません。",
       TURN_IN_PROGRESS: "前のTurnを処理中です。完了後にもう一度送信してください。",
-      STATE_VERSION_CONFLICT: "世界の状態が更新されています。最新のTurnを確認して再送してください。",
+      STATE_VERSION_CONFLICT: "世界の状態が更新されたため行動は送信していません。内容を確認してから再送してください。",
       CHOICE_NOT_AVAILABLE: "その選択肢は現在利用できません。",
       IDEMPOTENCY_CONFLICT: "同じrequest IDに異なる入力が使われました。"
     };
     let busy = false;
-    let stateVersion = Number(localStorage.getItem("ai-rpg-state-version") || 0);
+    let stateVersion = null;
+    let stateCampaignId = null;
+    const renderedTurns = new Set();
+    localStorage.removeItem("ai-rpg-state-version");
     ui["campaign-id"].value = localStorage.getItem("ai-rpg-campaign") || "";
     ui["actor-id"].value = localStorage.getItem("ai-rpg-actor") || "";
-    ui["version-value"].textContent = String(stateVersion);
+    ui["version-value"].textContent = "—";
 
     function announce(message) {
       ui["live-status"].textContent = message;
@@ -297,6 +301,8 @@
       busy = value;
       ui["send-action"].disabled = value;
       ui["action-text"].disabled = value;
+      ui["campaign-id"].disabled = value;
+      ui["actor-id"].disabled = value;
       document.querySelectorAll(".choice").forEach(button => { button.disabled = value; });
       ui["send-action"].textContent = value ? "処理中…" : "送信";
     }
@@ -338,15 +344,51 @@
       announce(message);
     }
 
+    function showRetry(message, retry) {
+      const box = document.createElement("div");
+      box.className = "notice error";
+      const text = document.createElement("span");
+      text.textContent = message;
+      const button = document.createElement("button");
+      button.type = "button";
+      button.className = "choice";
+      button.textContent = "同じ送信を再試行";
+      button.addEventListener("click", retry);
+      box.append(text, document.createElement("br"), button);
+      addMessage("SYSTEM", "system", box);
+      announce(message);
+    }
+
+    function setStateVersion(campaignId, version) {
+      stateCampaignId = campaignId;
+      stateVersion = version;
+      ui["version-value"].textContent = String(version);
+    }
+
+    function resetView() {
+      renderedTurns.clear();
+      ui.timeline.replaceChildren();
+      const empty = document.createElement("li");
+      empty.id = "empty-state";
+      empty.className = "empty";
+      empty.textContent = "Campaignの状態を読み込んでいます。";
+      ui.timeline.append(empty);
+      ui["route-value"].textContent = "—";
+      ui["resolution-value"].textContent = "待機中";
+      ui["narration-value"].textContent = "待機中";
+      ui["turn-value"].textContent = "—";
+      ui["version-value"].textContent = "—";
+      stateCampaignId = null;
+      stateVersion = null;
+    }
+
     function updateStatus(turn) {
       ui["route-value"].textContent = labels[turn.route] || "—";
       ui["resolution-value"].textContent = labels[turn.resolution_status] || turn.resolution_status;
       ui["narration-value"].textContent = labels[turn.narration_status] || turn.narration_status;
       ui["turn-value"].textContent = turn.turn_id;
       if (turn.committed_state_version !== null) {
-        stateVersion = turn.committed_state_version;
-        localStorage.setItem("ai-rpg-state-version", String(stateVersion));
-        ui["version-value"].textContent = String(stateVersion);
+        setStateVersion(ui["campaign-id"].value.trim(), turn.committed_state_version);
       }
       if (turn.recovery?.fallback) {
         ui.recovery.hidden = false;
@@ -358,6 +400,8 @@
 
     function renderCompleted(turn) {
       document.querySelector('[data-role="processing"]')?.remove();
+      if (renderedTurns.has(turn.turn_id)) return;
+      renderedTurns.add(turn.turn_id);
       for (const action of turn.action_results || []) {
         const result = action.result;
         const lines = [];
@@ -410,9 +454,21 @@
         try { code = (await response.json()).detail?.code || code; } catch (_) { /* no body */ }
         const error = new Error(errors[code] || `API error (${response.status})`);
         error.status = response.status;
+        error.code = code;
         throw error;
       }
       return response.json();
+    }
+
+    async function refreshCampaignState(campaignId, { resume = false } = {}) {
+      const state = await api(`/campaigns/${encodeURIComponent(campaignId)}/state`);
+      if (ui["campaign-id"].value.trim() !== campaignId) return state;
+      setStateVersion(campaignId, state.state_version);
+      if (state.latest_turn) {
+        updateStatus(state.latest_turn);
+        if (resume) await resumeTurn(campaignId, state.latest_turn);
+      }
+      return state;
     }
 
     async function pollTurn(campaignId, turnId) {
@@ -467,6 +523,69 @@
       });
     }
 
+    async function resumeTurn(campaignId, turn) {
+      setBusy(true);
+      processingMessage();
+      try {
+        observeTurn(turn);
+        const completed = terminal(turn) ? turn : await waitForTurn(campaignId, turn.turn_id);
+        renderCompleted(completed);
+      } catch (error) {
+        document.querySelector('[data-role="processing"]')?.remove();
+        showError(error instanceof Error ? error.message : "Turnの追跡に失敗しました。");
+      } finally {
+        setBusy(false);
+      }
+    }
+
+    async function continuePending(pending, showPlayer) {
+      setBusy(true);
+      if (showPlayer) addMessage("YOU", "player", pending.displayText);
+      processingMessage();
+      announce("Turnを送信しました。判定中です。");
+      try {
+        let accepted;
+        if (pending.turnId) {
+          accepted = await api(
+            `/campaigns/${encodeURIComponent(pending.campaignId)}/turns/${encodeURIComponent(pending.turnId)}`
+          );
+        } else {
+          accepted = await api(`/campaigns/${encodeURIComponent(pending.campaignId)}/turns`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(pending.body)
+          });
+          pending = { ...pending, turnId: accepted.turn_id };
+          AiRpgPending.save(localStorage, pending);
+        }
+        updateStatus(accepted);
+        const completed = terminal(accepted) ? accepted : await waitForTurn(pending.campaignId, accepted.turn_id);
+        renderCompleted(completed);
+        AiRpgPending.clear(localStorage);
+        if (pending.body.content.kind === "text") ui["action-text"].value = "";
+      } catch (error) {
+        document.querySelector('[data-role="processing"]')?.remove();
+        if (["STATE_VERSION_CONFLICT", "TURN_IN_PROGRESS", "CHOICE_NOT_AVAILABLE", "IDEMPOTENCY_CONFLICT"].includes(error?.code)) {
+          AiRpgPending.clear(localStorage);
+          try { await refreshCampaignState(pending.campaignId, { resume: error.code === "TURN_IN_PROGRESS" }); } catch (_) { /* original error remains primary */ }
+          showError(error.message);
+        } else {
+          const message = error instanceof Error ? error.message : "Turnの処理に失敗しました。";
+          showRetry(message, () => {
+            const saved = AiRpgPending.load(localStorage);
+            if (saved) continuePending(saved, false);
+          });
+        }
+        if (error?.status === 401) {
+          ui.connection.dataset.state = "error";
+          ui["connection-label"].textContent = "認証が必要";
+        }
+      } finally {
+        setBusy(false);
+        ui["action-text"].focus();
+      }
+    }
+
     async function submitTurn(content, displayText) {
       if (busy) return;
       const campaignId = ui["campaign-id"].value.trim();
@@ -477,36 +596,35 @@
       }
       localStorage.setItem("ai-rpg-campaign", campaignId);
       localStorage.setItem("ai-rpg-actor", actorId);
+      const existing = AiRpgPending.load(localStorage);
+      if (existing) {
+        showRetry("前の送信結果が未確認です。新しい行動の前に同じ送信を再試行してください。", () => continuePending(existing, false));
+        return;
+      }
       setBusy(true);
-      addMessage("YOU", "player", displayText.trim());
-      processingMessage();
-      announce("Turnを送信しました。判定中です。");
+      let pending = null;
       try {
-        const accepted = await api(`/campaigns/${encodeURIComponent(campaignId)}/turns`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            request_id: crypto.randomUUID(),
-            expected_state_version: stateVersion,
-            actor_id: actorId,
-            content
-          })
-        });
-        updateStatus(accepted);
-        const completed = terminal(accepted) ? accepted : await waitForTurn(campaignId, accepted.turn_id);
-        renderCompleted(completed);
-        if (content.kind === "text") ui["action-text"].value = "";
-      } catch (error) {
-        document.querySelector('[data-role="processing"]')?.remove();
-        showError(error instanceof Error ? error.message : "Turnの処理に失敗しました。");
-        if (error?.status === 401) {
-          ui.connection.dataset.state = "error";
-          ui["connection-label"].textContent = "認証が必要";
+        const knownVersion = stateCampaignId === campaignId ? stateVersion : null;
+        const current = await refreshCampaignState(campaignId);
+        if (knownVersion !== null && current.state_version !== knownVersion) {
+          showError("世界の状態が更新されました。行動内容を確認してから再送してください。");
+          return;
         }
+        pending = AiRpgPending.create({
+          campaignId,
+          actorId,
+          displayText,
+          content,
+          stateVersion: current.state_version,
+          requestId: crypto.randomUUID()
+        });
+        AiRpgPending.save(localStorage, pending);
+      } catch (error) {
+        showError(error instanceof Error ? error.message : "Turnの処理に失敗しました。");
       } finally {
         setBusy(false);
-        ui["action-text"].focus();
       }
+      if (pending) await continuePending(pending, true);
     }
 
     ui.composer.addEventListener("submit", event => {
@@ -519,6 +637,35 @@
         event.preventDefault();
         ui.composer.requestSubmit();
       }
+    });
+    ui["campaign-id"].addEventListener("change", async () => {
+      if (busy) return;
+      const campaignId = ui["campaign-id"].value.trim();
+      localStorage.setItem("ai-rpg-campaign", campaignId);
+      resetView();
+      if (!campaignId) return;
+      try {
+        await refreshCampaignState(campaignId, { resume: true });
+      } catch (error) {
+        showError(error instanceof Error ? error.message : "Campaignの読込みに失敗しました。");
+      }
+    });
+
+    async function restoreSession() {
+      const pending = AiRpgPending.load(localStorage);
+      if (pending) {
+        ui["campaign-id"].value = pending.campaignId;
+        ui["actor-id"].value = pending.actorId;
+        await refreshCampaignState(pending.campaignId);
+        await continuePending(pending, false);
+        return;
+      }
+      const campaignId = ui["campaign-id"].value.trim();
+      if (campaignId) await refreshCampaignState(campaignId, { resume: true });
+    }
+
+    restoreSession().catch(error => {
+      showError(error instanceof Error ? error.message : "保存済みSessionの復元に失敗しました。");
     });
 
     fetch("/health")

@@ -13,6 +13,37 @@ from ai_rpg.llm.structured import (
 )
 
 
+def _supported_schema(value: object) -> object:
+    """Pydanticのdiscriminated unionをOpenAI対応のJSON Schemaへ変換する。"""
+
+    if isinstance(value, dict):
+        normalized: dict[str, object] = {}
+        for key, nested in value.items():
+            if key == "discriminator":
+                continue
+            normalized["anyOf" if key == "oneOf" else key] = _supported_schema(nested)
+        return normalized
+    if isinstance(value, list):
+        return [_supported_schema(item) for item in value]
+    return value
+
+
+def _object_envelope(schema: dict[str, object]) -> dict[str, object]:
+    definitions = schema.get("$defs")
+    nested = _supported_schema(
+        {key: value for key, value in schema.items() if key != "$defs"}
+    )
+    envelope: dict[str, object] = {
+        "type": "object",
+        "properties": {"result": nested},
+        "required": ["result"],
+        "additionalProperties": False,
+    }
+    if definitions is not None:
+        envelope["$defs"] = _supported_schema(definitions)
+    return envelope
+
+
 class OpenAIResponsesTransport:
     """暗黙retryなしでResponses APIを一回だけ呼び出す。"""
 
@@ -41,6 +72,7 @@ class OpenAIResponsesTransport:
         input_data: str,
         output_schema: dict[str, object],
     ) -> object:
+        provider_schema = _object_envelope(output_schema)
         body = {
             "model": model_id,
             "instructions": instruction,
@@ -51,7 +83,7 @@ class OpenAIResponsesTransport:
                     "type": "json_schema",
                     "name": f"ai_rpg_{purpose}",
                     "strict": True,
-                    "schema": output_schema,
+                    "schema": provider_schema,
                 }
             },
         }
@@ -106,6 +138,9 @@ class OpenAIResponsesTransport:
         if not output_text:
             raise ProviderOutputError("OpenAI structured output is empty")
         try:
-            return json.loads(output_text)
+            structured = json.loads(output_text)
         except json.JSONDecodeError as error:
             raise ProviderOutputError("OpenAI structured output is invalid JSON") from error
+        if not isinstance(structured, Mapping) or set(structured) != {"result"}:
+            raise ProviderOutputError("OpenAI structured output envelope is invalid")
+        return structured["result"]

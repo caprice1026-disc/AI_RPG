@@ -13,7 +13,7 @@ from ai_rpg.application import (
     TurnNotFoundError,
     TurnQueryService,
 )
-from ai_rpg.contracts import TurnResponse
+from ai_rpg.contracts import CampaignStateResponse, TurnResponse
 
 
 def _principal() -> AuthenticatedPrincipal:
@@ -89,3 +89,21 @@ async def test_get_reports_missing_turn_without_leaking_internal_rows() -> None:
         await service.get(principal, uuid4(), uuid4())
 
     unit_of_work.commit.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_get_campaign_state_returns_version_and_latest_turn() -> None:
+    principal = _principal()
+    campaign_id = uuid4()
+    state = CampaignStateResponse(state_version=4, latest_turn=_response())
+    authorization = AsyncMock(spec=AuthorizationPolicy)
+    authorization.can_access_campaign.return_value = True
+    unit_of_work = AsyncMock()
+    unit_of_work.__aenter__.return_value = unit_of_work
+    unit_of_work.turns = AsyncMock()
+    unit_of_work.turns.get_campaign_state.return_value = state
+    service = TurnQueryService(authorization, MagicMock(return_value=unit_of_work))
+
+    assert await service.get_campaign_state(principal, campaign_id) == state
+    unit_of_work.turns.get_campaign_state.assert_awaited_once_with(campaign_id)
+    unit_of_work.commit.assert_awaited_once()

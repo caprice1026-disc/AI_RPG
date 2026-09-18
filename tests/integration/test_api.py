@@ -14,7 +14,12 @@ from ai_rpg.application import (
     IdempotencyConflictError,
     TurnInProgressError,
 )
-from ai_rpg.contracts import PublicEvent, PublicTurnEventPayload, TurnResponse
+from ai_rpg.contracts import (
+    CampaignStateResponse,
+    PublicEvent,
+    PublicTurnEventPayload,
+    TurnResponse,
+)
 
 CAMPAIGN_ID = UUID("00000000-0000-0000-0000-000000000001")
 PRINCIPAL_ID = UUID("00000000-0000-0000-0000-000000000021")
@@ -80,8 +85,21 @@ async def test_play_screen_is_served_with_accessible_core_controls() -> None:
     assert 'id="send-action"' in response.text
     assert 'role="status"' in response.text
     assert "aria-live=\"polite\"" in response.text
+    assert '<script src="/static/play-state.js"></script>' in response.text
     assert "new EventSource" in response.text
     assert "pollTurn" in response.text
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_play_state_script_is_served() -> None:
+    transport = ASGITransport(app=create_app())
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.get("/static/play-state.js")
+
+    assert response.status_code == 200
+    assert response.headers["content-type"].startswith("text/javascript")
+    assert "AiRpgPending" in response.text
 
 
 @pytest.mark.integration
@@ -158,6 +176,30 @@ async def test_get_turn_returns_public_response() -> None:
     assert principal.principal_id == PRINCIPAL_ID
     assert campaign_id == CAMPAIGN_ID
     assert turn_id == TURN_ID
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_get_campaign_state_returns_authoritative_version_and_latest_turn() -> None:
+    turn_service = AsyncMock()
+    query_service = AsyncMock()
+    state = CampaignStateResponse(state_version=4, latest_turn=_pending_response())
+    query_service.get_campaign_state.return_value = state
+    app = create_app(
+        turn_service=turn_service,
+        turn_query_service=query_service,
+        principal_provider=_authenticated,
+    )
+
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.get(f"/campaigns/{CAMPAIGN_ID}/state")
+
+    assert response.status_code == 200
+    assert response.json() == state.model_dump(mode="json")
+    principal, campaign_id = query_service.get_campaign_state.await_args.args
+    assert principal.principal_id == PRINCIPAL_ID
+    assert campaign_id == CAMPAIGN_ID
 
 
 @pytest.mark.integration

@@ -46,9 +46,9 @@ AI_RPGは、LLMにゲーム状態を直接変更させないAI TRPGバックエ�
 - Narrative／Mechanicalを分ける決定的なTurn Router
 - `mvp_v1` rulesetによる再現可能な技能判定
 - Fake transportによる通常描写とMechanicalへの昇格
-- OpenAI Responses APIのStructured Outputs adapter（単発request・暗黙retryなし）
+- OpenAI Responses APIのStructured Outputs adapter（object envelope、単発request、暗黙retryなし）
 - 完了済みTurnだけから組み立てる、公開範囲を限定した複数Turn Context
-- Campaign／Actorを指定してTurnを送信し、判定と描写を確認できる最小プレイ画面
+- Campaignの正本versionと最新Turnを再読込し、通信断後も同じrequestを追跡できる最小プレイ画面
 - 登録済み参照だけを使う攻撃、HP下限／上限、回復ポーションと在庫消費
 - Campaign event sequenceをcursorにしたSSEと、接続失敗時のGET polling fallback
 - PostgreSQL migrationとSQLAlchemy 2の型付きmodel／query
@@ -91,7 +91,7 @@ flowchart LR
 .\.venv\Scripts\uv.exe build
 ```
 
-2026-09-17時点で、実PostgreSQLを指定した全スイートは`221 passed`です。
+2026-09-18時点で、実PostgreSQLを指定した全スイートは`232 passed`です。変更時は下記の専用DBで全件を再実行してください。
 
 PostgreSQL統合テストには、名前が`ai_rpg_test`で始まる専用の空DBを指定します。fixtureは既存テーブルがあるDBを拒否します。
 Alembicは空DBだけでなく、既存revisionからheadへの更新もテストします。
@@ -161,7 +161,16 @@ $env:AIRPG_DATABASE_URL = "postgresql+psycopg://airpg:airpg@localhost/airpg"
 
 Turnを投入し、返された`turn_id`をGETすると進行状態と描写を確認できます。
 
-ブラウザでは`http://127.0.0.1:8000/`を開き、Campaign IDとActor IDを入力すれば同じ一往復を試せます。開発fixtureには`hero`、`goblin`、`iron_sword`、`healing_potion`が登録されているため、「周囲を注意深く観察する」「鉄の剣でゴブリンを攻撃する」「回復ポーションを飲む」を試せます。画面はSSEを優先し、接続できない場合はGET pollingで終端状態まで追跡します。送信中の二重送信を防ぎ、開発用principalを指定せずAPIを起動した場合は401の案内を表示して認証を暗黙に迂回しません。
+ブラウザでは`http://127.0.0.1:8000/`を開き、Campaign IDとActor IDを入力すれば同じ一往復を試せます。開発fixtureには`hero`、`goblin`、`iron_sword`、`healing_potion`が登録されているため、「周囲を注意深く観察する」「鉄の剣でゴブリンを攻撃する」「回復ポーションを飲む」を試せます。
+
+画面は`GET /campaigns/{campaign_id}/state`から正本のstate versionと最新Turnを取得し、Campaign切替、別タブ更新、reload後に状態を同期します。409時は古い行動を新versionで自動実行せず、再確認を促します。POSTの受付結果が通信断で不明な場合はrequest IDとbodyを保存し、同じ内容だけを再送します。受付済みの`turn_id`が分かっている場合はPOSTせずGET／SSE追跡を再開します。SSEへ接続できない場合はGET pollingへ切り替えます。開発用principalを指定せずAPIを起動した場合は401を表示し、認証を暗黙に迂回しません。
+
+依存なしのブラウザ状態ロジックはNode標準runnerでも確認できます。
+
+```powershell
+node tests\browser\play_state.test.cjs
+node tests\browser\play_screen.test.cjs
+```
 
 ```powershell
 $requestId = [guid]::NewGuid()
@@ -194,7 +203,9 @@ $env:AIRPG_QUALITY_MODEL = "gpt-5.4"
 .\.venv\Scripts\ai-rpg.exe narration-worker
 ```
 
-API keyは実provider選択時だけ検証され、Fake実行には不要です。各物理requestの直前にDBのTurn予算を予約し、timeout、拒否、不正JSON、Schema不一致、描写の事実逸脱も消費済みとして扱います。Mechanical描写は、保存済み結果にない数値、Canonical UUID、未登録の明示`@ref`を保存前に拒否します。
+API keyは実provider選択時だけ検証され、Fake実行には不要です。Pydanticのdiscriminated unionはprovider境界でobject envelopeへ変換し、ネストした`oneOf`／`discriminator`も対応する`anyOf`へ正規化してから送信します。応答はenvelopeから取り出した後、元の型付き契約で再検証します。
+
+各物理requestの直前にDBのTurn予算を予約し、timeout、拒否、不正JSON、Schema不一致、描写の事実逸脱も消費済みとして扱います。Mechanical描写は、プレイヤー入力を確定値の根拠にせず、保存済みEngine結果と認可済み公開状態にない数値、Canonical UUID、未登録の明示`@ref`を保存前に拒否します。
 
 ## SSEでTurn更新を受け取る
 

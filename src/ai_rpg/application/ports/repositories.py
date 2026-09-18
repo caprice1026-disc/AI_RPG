@@ -7,7 +7,7 @@ from datetime import datetime
 from typing import Literal, Protocol, TypeAlias
 from uuid import UUID
 
-from ai_rpg.contracts import PlayerTurnInput, PublicEvent, TurnResponse
+from ai_rpg.contracts import CampaignStateResponse, PlayerTurnInput, PublicEvent, TurnResponse
 from ai_rpg.contracts.responses import MechanicalNarrationInput
 from ai_rpg.domain.commands import Command
 from ai_rpg.domain.events import RNGMetadata
@@ -180,6 +180,10 @@ class TurnRepository(Protocol):
     async def get_response(
         self, campaign_id: UUID, turn_id: UUID
     ) -> TurnResponse | None: ...
+
+    async def get_campaign_state(
+        self, campaign_id: UUID
+    ) -> CampaignStateResponse: ...
 
     async def accept_pending(
         self,

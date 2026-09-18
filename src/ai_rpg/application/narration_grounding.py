@@ -49,7 +49,6 @@ def validate_mechanical_narration(
     """未知の数値、明示ref、Canonical UUIDを含む描写を拒否する。"""
 
     allowed_numbers: set[str] = set()
-    _collect_numbers(source.player_text, allowed_numbers)
     _collect_numbers(source.resolved_actions, allowed_numbers)
     _collect_numbers([fragment.content for fragment in source.public_state_after], allowed_numbers)
 

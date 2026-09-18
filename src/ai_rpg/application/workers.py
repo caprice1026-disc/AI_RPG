@@ -841,7 +841,11 @@ class SkillCheckResolutionWorker:
                         kind="not_applicable", reason="resource_unavailable"
                     )
                 elif actor.current_hp >= actor.max_hp:
-                    raise ResolutionInputError("HPが満タンのため回復itemを使用できません")
+                    if initial_hp[work.actor_id] >= actor.max_hp:
+                        raise ResolutionInputError("HPが満タンのため回復itemを使用できません")
+                    result = NotApplicableResult(
+                        kind="not_applicable", reason="rule_precondition"
+                    )
                 else:
                     try:
                         result = self._ruleset.resolve_use_item(

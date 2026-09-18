@@ -93,3 +93,13 @@
 | 4 OpenAI adapter | 完了 | 完了 | HTTP contract・拒否・事実逸脱を含む`200 passed`（2026-09-17） |
 | 5 最小プレイ画面 | 完了 | 完了 | `201 passed`、実browserで送信・終端・401・390px表示を確認（2026-09-17） |
 | 6 攻撃・回復item・SSE | 完了 | 完了 | `221 passed`、型付きAction、公開event、実browserのSSE／polling fallbackを確認（2026-09-17） |
+| 7 provider互換・再開可能UI | 完了 | 完了 | `232 passed`、Ruff、mypy、build、実Chromeで通信断再送・reload・Campaign切替を確認（2026-09-18） |
+
+## チェックポイント7: 実provider互換と再開可能なプレイ画面
+
+- [x] 実workerの3種のSchemaをOpenAI対応object envelopeへ変換し、内部の型検証へ戻す。
+- [x] 先行回復で満タン・在庫切れになった後続Actionだけを`not_applicable`として確定する。
+- [x] Campaignごとの現versionと最新Turnを認可済みAPIから読み、409時は自動再実行せず再確認を促す。
+- [x] 受付結果が不明なPOSTを同じrequest ID・payloadで再送し、reload後は既存Turnを追跡する。
+- [x] Mechanical描写の許可数値からplayer inputを除外し、再試行／fallbackを維持する。
+- [x] PostgreSQL全suite、Ruff、mypy、build、実browserで確認する。実providerの有料smokeはAPI keyと別途承認がないため実行せず、実worker 3種のHTTP contractで境界を確認した。
