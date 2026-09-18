@@ -16,7 +16,7 @@
 - 対称鍵algorithm、`none`、token headerまたはDiscoveryだけを根拠にしたalgorithm追加を禁止する。
 - 必須claimは`iss`、`aud`、`sub`、`exp`とし、`nbf`と`iat`は存在する場合に検証する。
 - JWTのrole、email、nameをCampaign認可または`auth_context`へコピーしない。
-- token、Authorization header、subject、全claimをDBまたはログへ保存しない。
+- subjectは`principal_identities`のidentity対応キーとしてのみDBに保存する。token、Authorization header、subject、全claimをログ・イベント・ゲームデータ・HTTPエラーへ出さない。
 - 未登録identityと無効identityは外部から区別できない同一401にする。
 - `--dev-principal`は明示された開発APIだけで有効にし、workerや通常API起動へ暗黙適用しない。
 - identityの付け替え、削除、再有効化は実装しない。
