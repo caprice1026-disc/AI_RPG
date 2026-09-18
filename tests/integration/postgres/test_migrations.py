@@ -857,6 +857,8 @@ def test_empty_database_upgrades_and_downgrades(empty_database_url: str) -> None
             "events",
             "mvp_inventory",
             "mvp_scene_skill_checks",
+            "principals",
+            "principal_identities",
         } <= _public_tables(engine)
     finally:
         engine.dispose()
@@ -868,6 +870,102 @@ def test_empty_database_upgrades_and_downgrades(empty_database_url: str) -> None
         assert _public_functions(engine) == set()
     finally:
         engine.dispose()
+
+
+def test_principal_identity_lifecycle_is_pre_registered_and_immutable(
+    database: Engine,
+) -> None:
+    from ai_rpg.infrastructure.database import create_session_factory
+    from ai_rpg.infrastructure.postgres import (
+        IdentityRegistrationConflict,
+        PostgresIdentityStore,
+    )
+
+    principal_id = uuid4()
+    store = PostgresIdentityStore(
+        create_session_factory(database.url.render_as_string(hide_password=False))
+    )
+
+    async def exercise() -> tuple[object, object, object]:
+        first = await store.register("https://idp.example.com/", "player-1", principal_id)
+        repeated = await store.register(
+            "https://idp.example.com/", "player-1", principal_id
+        )
+        assert await store.resolve("https://idp.example.com/", "player-1") == principal_id
+        with pytest.raises(IdentityRegistrationConflict):
+            await store.register("https://idp.example.com/", "player-1", uuid4())
+        disabled = await store.disable("https://idp.example.com/", "player-1")
+        assert await store.disable("https://idp.example.com/", "player-1") == disabled
+        assert await store.resolve("https://idp.example.com/", "player-1") is None
+        return first, repeated, disabled
+
+    with asyncio.Runner(loop_factory=asyncio.SelectorEventLoop) as runner:
+        first, repeated, disabled = runner.run(exercise())
+
+    assert first == repeated
+    assert disabled.disabled_at is not None
+    with pytest.raises(DBAPIError), database.begin() as connection:
+        connection.execute(
+            text(
+                "DELETE FROM principal_identities "
+                "WHERE issuer=:issuer AND subject=:subject"
+            ),
+            {"issuer": "https://idp.example.com/", "subject": "player-1"},
+        )
+    with pytest.raises(DBAPIError), database.begin() as connection:
+        connection.execute(
+            text(
+                "UPDATE principal_identities SET subject='player-2' "
+                "WHERE issuer=:issuer AND subject=:subject"
+            ),
+            {"issuer": "https://idp.example.com/", "subject": "player-1"},
+        )
+
+
+def test_principal_identity_registration_generates_id_and_missing_disable_fails(
+    database: Engine,
+) -> None:
+    from ai_rpg.infrastructure.database import create_session_factory
+    from ai_rpg.infrastructure.postgres import IdentityNotFound, PostgresIdentityStore
+
+    store = PostgresIdentityStore(
+        create_session_factory(database.url.render_as_string(hide_password=False))
+    )
+
+    async def exercise() -> None:
+        registered = await store.register("https://idp.example.com/", "generated")
+        assert await store.resolve("https://idp.example.com/", "generated") == (
+            registered.principal_id
+        )
+        with pytest.raises(IdentityNotFound):
+            await store.disable("https://idp.example.com/", "missing")
+
+    with asyncio.Runner(loop_factory=asyncio.SelectorEventLoop) as runner:
+        runner.run(exercise())
+
+
+def test_principal_identity_concurrent_registration_uses_canonical_winner(
+    database: Engine,
+) -> None:
+    from ai_rpg.infrastructure.database import create_session_factory
+    from ai_rpg.infrastructure.postgres import PostgresIdentityStore
+
+    store = PostgresIdentityStore(
+        create_session_factory(database.url.render_as_string(hide_password=False))
+    )
+
+    async def exercise() -> None:
+        first, second = await asyncio.gather(
+            store.register("https://idp.example.com/", "concurrent"),
+            store.register("https://idp.example.com/", "concurrent"),
+        )
+        assert first == second
+        assert await store.resolve("https://idp.example.com/", "concurrent") == (
+            first.principal_id
+        )
+
+    with asyncio.Runner(loop_factory=asyncio.SelectorEventLoop) as runner:
+        runner.run(exercise())
 
 
 def test_existing_revision_upgrades_with_worker_control_defaults(

@@ -63,6 +63,39 @@ class CampaignMemberModel(Base):
     __table_args__ = (CheckConstraint("role IN ('player','gm')"),)
 
 
+class PrincipalModel(Base):
+    __tablename__ = "principals"
+
+    id: Mapped[UUID] = mapped_column(PG_UUID(as_uuid=True), primary_key=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=text("now()")
+    )
+
+
+class PrincipalIdentityModel(Base):
+    __tablename__ = "principal_identities"
+
+    issuer: Mapped[str] = mapped_column(Text, primary_key=True)
+    subject: Mapped[str] = mapped_column(Text, primary_key=True)
+    principal_id: Mapped[UUID] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("principals.id"), nullable=False
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=text("now()")
+    )
+    disabled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+    __table_args__ = (
+        CheckConstraint("length(issuer)>0", name="principal_identity_issuer_nonempty"),
+        CheckConstraint("length(subject)>0", name="principal_identity_subject_nonempty"),
+        CheckConstraint(
+            "disabled_at IS NULL OR disabled_at>=created_at",
+            name="principal_identity_disabled_after_created",
+        ),
+        Index("principal_identities_principal", "principal_id"),
+    )
+
+
 class EntityModel(Base):
     __tablename__ = "entities"
 

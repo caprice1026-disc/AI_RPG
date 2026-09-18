@@ -1,12 +1,19 @@
 """Infrastructure限定ORM mappingのschema coverage。"""
 
-from ai_rpg.infrastructure.postgres.models import Base, EntityModel, TurnModel
+from ai_rpg.infrastructure.postgres.models import (
+    Base,
+    EntityModel,
+    PrincipalIdentityModel,
+    TurnModel,
+)
 
 
 def test_metadata_contains_contract_tables_and_worker_control_columns() -> None:
     assert {
         "campaigns",
         "campaign_members",
+        "principals",
+        "principal_identities",
         "entities",
         "scenes",
         "turns",
@@ -33,6 +40,13 @@ def test_metadata_contains_contract_tables_and_worker_control_columns() -> None:
         "narration_deadline",
     } <= set(TurnModel.__table__.columns.keys())
     assert {"ref", "label"} <= set(EntityModel.__table__.columns.keys())
+    assert {
+        "issuer",
+        "subject",
+        "principal_id",
+        "created_at",
+        "disabled_at",
+    } == set(PrincipalIdentityModel.__table__.columns.keys())
 
 
 def test_metadata_preserves_open_turn_partial_unique_index() -> None:
