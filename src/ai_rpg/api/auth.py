@@ -95,7 +95,12 @@ class OidcJwtVerifier:
             )
         except jwt.PyJWKClientConnectionError as error:
             raise AuthenticationUnavailableError("JWKSを取得できません") from error
-        except (jwt.InvalidTokenError, jwt.PyJWKClientError) as error:
+        except (
+            jwt.InvalidTokenError,
+            jwt.PyJWKClientError,
+            TypeError,
+            OverflowError,
+        ) as error:
             raise InvalidCredentialError("Bearer tokenが不正です") from error
 
         subject = claims.get("sub")

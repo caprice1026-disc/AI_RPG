@@ -1,11 +1,14 @@
 """OIDC DiscoveryとBearer JWT検証のUnit Test。"""
 
-from dataclasses import fields
+from dataclasses import dataclass, fields
 from datetime import UTC, datetime, timedelta
 from unittest.mock import Mock
 
 import httpx
 import jwt
+import jwt.api_jwk as jwt_api_jwk
+import jwt.jwk_set_cache as jwt_jwk_set_cache
+import jwt.jwks_client as jwt_jwks_client
 import pytest
 from cryptography.hazmat.primitives.asymmetric import rsa
 
@@ -19,6 +22,26 @@ from ai_rpg.api.auth import (
 
 ISSUER = "https://idp.example.com/"
 AUDIENCE = "ai-rpg-api"
+
+
+@dataclass
+class _MonotonicClock:
+    value: float = 1_000.0
+
+    def monotonic(self) -> float:
+        return self.value
+
+    def advance(self, seconds: float) -> None:
+        self.value += seconds
+
+
+@pytest.fixture
+def jwks_clock(monkeypatch: pytest.MonkeyPatch) -> _MonotonicClock:
+    clock = _MonotonicClock()
+    monkeypatch.setattr(jwt_api_jwk, "time", clock)
+    monkeypatch.setattr(jwt_jwk_set_cache, "time", clock)
+    monkeypatch.setattr(jwt_jwks_client, "time", clock)
+    return clock
 
 
 @pytest.mark.asyncio
@@ -138,7 +161,7 @@ def _jwks_client(
         "https://idp.example.com/keys",
         lifespan=300,
         timeout=5,
-        cooldown_duration=0,
+        cooldown_duration=30,
     )
     call_index = 0
 
@@ -148,6 +171,7 @@ def _jwks_client(
         call_index += 1
         if client.jwk_set_cache is not None:
             client.jwk_set_cache.put(payload)
+        client._last_successful_fetch = jwt_jwks_client.time.monotonic()
         return payload
 
     fetch = Mock(side_effect=fetch_data)
@@ -271,6 +295,50 @@ async def test_verifier_rejects_invalid_claims(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("claim", "value"),
+    [
+        ("exp", ["private-exp-value"]),
+        ("exp", {"private-exp-value": 1}),
+        ("exp", float("inf")),
+        ("exp", float("nan")),
+        ("iat", None),
+        ("iat", float("inf")),
+        ("iat", float("nan")),
+        ("nbf", None),
+        ("nbf", float("inf")),
+        ("nbf", float("nan")),
+    ],
+    ids=[
+        "exp-list",
+        "exp-object",
+        "exp-infinity",
+        "exp-nan",
+        "iat-null",
+        "iat-infinity",
+        "iat-nan",
+        "nbf-null",
+        "nbf-infinity",
+        "nbf-nan",
+    ],
+)
+async def test_verifier_maps_malformed_numeric_dates_without_exposing_claims(
+    signing_key: rsa.RSAPrivateKey,
+    claim: str,
+    value: object,
+) -> None:
+    client, _ = _jwks_client({"keys": [_public_jwk(signing_key, "key-1")]})
+    token = _token(signing_key, _claims(**{claim: value}))
+
+    with pytest.raises(InvalidCredentialError) as error:
+        await _verifier(client).verify(token)
+
+    assert str(error.value) == "Bearer tokenが不正です"
+    assert token not in str(error.value)
+    assert "private-exp-value" not in str(error.value)
+
+
+@pytest.mark.asyncio
 async def test_verifier_rejects_disallowed_algorithm(
     signing_key: rsa.RSAPrivateKey,
 ) -> None:
@@ -299,8 +367,9 @@ async def test_verifier_maps_jwks_connection_failure_without_details(
 
 
 @pytest.mark.asyncio
-async def test_verifier_rejects_unknown_kid_after_refresh(
+async def test_verifier_refreshes_unknown_kid_only_after_cooldown(
     signing_key: rsa.RSAPrivateKey,
+    jwks_clock: _MonotonicClock,
 ) -> None:
     jwks = {"keys": [_public_jwk(signing_key, "key-1")]}
     client, fetch = _jwks_client(jwks, jwks)
@@ -309,27 +378,44 @@ async def test_verifier_rejects_unknown_kid_after_refresh(
     with pytest.raises(InvalidCredentialError):
         await _verifier(client).verify(token)
 
+    assert fetch.call_count == 1
+
+    jwks_clock.advance(30)
+
+    with pytest.raises(InvalidCredentialError):
+        await _verifier(client).verify(token)
+
     assert fetch.call_count == 2
 
 
 @pytest.mark.asyncio
-async def test_verifier_reuses_cached_jwks_for_known_kid(
+async def test_verifier_reuses_cached_jwks_until_lifespan_expires(
     signing_key: rsa.RSAPrivateKey,
+    jwks_clock: _MonotonicClock,
 ) -> None:
-    client, fetch = _jwks_client({"keys": [_public_jwk(signing_key, "key-1")]})
+    jwks = {"keys": [_public_jwk(signing_key, "key-1")]}
+    client, fetch = _jwks_client(jwks, jwks)
     verifier = _verifier(client)
     token = _token(signing_key, _claims())
 
     first = await verifier.verify(token)
+    jwks_clock.advance(300)
     second = await verifier.verify(token)
 
     assert first.subject == second.subject == "player-1"
     assert fetch.call_count == 1
 
+    jwks_clock.advance(0.001)
+    third = await verifier.verify(token)
+
+    assert third.subject == "player-1"
+    assert fetch.call_count == 2
+
 
 @pytest.mark.asyncio
 async def test_verifier_accepts_rotated_key_after_jwks_refresh(
     signing_key: rsa.RSAPrivateKey,
+    jwks_clock: _MonotonicClock,
 ) -> None:
     rotated_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
     initial_jwks = {"keys": [_public_jwk(signing_key, "key-1")]}
@@ -343,7 +429,15 @@ async def test_verifier_accepts_rotated_key_after_jwks_refresh(
     verifier = _verifier(client)
 
     await verifier.verify(_token(signing_key, _claims()))
-    identity = await verifier.verify(_token(rotated_key, _claims(), kid="key-2"))
+    rotated_token = _token(rotated_key, _claims(), kid="key-2")
+
+    with pytest.raises(InvalidCredentialError):
+        await verifier.verify(rotated_token)
+
+    assert fetch.call_count == 1
+
+    jwks_clock.advance(30)
+    identity = await verifier.verify(rotated_token)
 
     assert identity.subject == "player-1"
     assert fetch.call_count == 2
