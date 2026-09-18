@@ -1,7 +1,8 @@
 """HTTP adapterのIntegration Test。"""
 
-from datetime import UTC, datetime
-from unittest.mock import AsyncMock
+from dataclasses import replace
+from datetime import UTC, datetime, timedelta
+from unittest.mock import AsyncMock, Mock
 from uuid import UUID
 
 import pytest
@@ -119,6 +120,7 @@ async def test_turn_endpoint_requires_configured_authenticator() -> None:
 
     assert response.status_code == 401
     assert response.json() == {"detail": {"code": "UNAUTHENTICATED"}}
+    assert response.headers["www-authenticate"] == "Bearer"
 
 
 @pytest.mark.integration
@@ -305,6 +307,77 @@ async def test_sse_emits_heartbeat_and_closes_after_membership_revocation() -> N
     assert response.status_code == 200
     assert response.text == ": heartbeat\n\n"
     assert event_stream.poll.await_count == 3
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_sse_closes_when_authenticated_credential_expires() -> None:
+    authenticated_at = datetime(2026, 9, 18, tzinfo=UTC)
+    expires_at = authenticated_at + timedelta(seconds=1)
+    principal = replace(
+        _principal(),
+        authenticated_at=authenticated_at,
+        credential_expires_at=expires_at,
+    )
+
+    async def authenticated() -> AuthenticatedPrincipal:
+        return principal
+
+    event_stream = AsyncMock()
+    event_stream.poll.return_value = ()
+    app = create_app(
+        turn_service=AsyncMock(),
+        turn_query_service=AsyncMock(),
+        event_stream_service=event_stream,
+        principal_provider=authenticated,
+        event_poll_seconds=0,
+        utc_now=lambda: expires_at,
+    )
+
+    async with AsyncClient(
+        transport=ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        response = await client.get(f"/campaigns/{CAMPAIGN_ID}/events")
+
+    assert response.status_code == 200
+    assert response.text == ""
+    assert event_stream.poll.await_count == 1
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_sse_rechecks_credential_expiry_before_emitting_event() -> None:
+    authenticated_at = datetime(2026, 9, 18, tzinfo=UTC)
+    expires_at = authenticated_at + timedelta(seconds=1)
+    principal = replace(
+        _principal(),
+        authenticated_at=authenticated_at,
+        credential_expires_at=expires_at,
+    )
+
+    async def authenticated() -> AuthenticatedPrincipal:
+        return principal
+
+    utc_now = Mock(side_effect=[authenticated_at, expires_at, expires_at])
+    event_stream = AsyncMock()
+    event_stream.poll.return_value = (_public_event(1),)
+    app = create_app(
+        turn_service=AsyncMock(),
+        turn_query_service=AsyncMock(),
+        event_stream_service=event_stream,
+        principal_provider=authenticated,
+        event_poll_seconds=0,
+        utc_now=utc_now,
+    )
+
+    async with AsyncClient(
+        transport=ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        response = await client.get(f"/campaigns/{CAMPAIGN_ID}/events")
+
+    assert response.status_code == 200
+    assert response.text == ""
+    assert event_stream.poll.await_count == 1
 
 
 @pytest.mark.integration

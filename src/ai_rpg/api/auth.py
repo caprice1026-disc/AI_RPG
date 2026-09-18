@@ -1,12 +1,25 @@
 """OIDC DiscoveryとBearer JWT検証のHTTP境界。"""
 
 import asyncio
+import logging
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from typing import Annotated
 from urllib.parse import urlsplit
+from uuid import UUID
 
 import httpx
 import jwt
+from fastapi import Header, HTTPException, status
+from sqlalchemy.exc import SQLAlchemyError
+
+from ai_rpg.application import AuthenticatedPrincipal
+from ai_rpg.config import Settings
+from ai_rpg.infrastructure.database import create_session_factory
+from ai_rpg.infrastructure.postgres import PostgresIdentityStore
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True, slots=True)
@@ -121,3 +134,103 @@ class OidcJwtVerifier:
             authenticated_at=authenticated_at,
             expires_at=expires_at,
         )
+
+
+IdentityResolver = Callable[[str, str], Awaitable[UUID | None]]
+
+
+class OidcBearerAuthenticator:
+    def __init__(
+        self,
+        verifier: OidcJwtVerifier,
+        resolve_identity: IdentityResolver,
+    ) -> None:
+        self._verifier = verifier
+        self._resolve_identity = resolve_identity
+
+    async def __call__(
+        self,
+        authorization: Annotated[str | None, Header()] = None,
+    ) -> AuthenticatedPrincipal:
+        try:
+            token = _bearer_token(authorization)
+        except HTTPException:
+            logger.warning("oidc_credential_rejected")
+            raise
+        validated = await self._verify_or_http_error(token)
+        try:
+            principal_id = await self._resolve_identity(
+                validated.issuer,
+                validated.subject,
+            )
+        except SQLAlchemyError as error:
+            logger.warning("oidc_identity_store_unavailable")
+            raise _authentication_unavailable() from error
+        if principal_id is None:
+            logger.warning("oidc_identity_unavailable")
+            raise _unauthenticated()
+        logger.info(
+            "oidc_authentication_succeeded issuer=%s principal_id=%s",
+            validated.issuer,
+            principal_id,
+        )
+        return AuthenticatedPrincipal(
+            principal_id=principal_id,
+            issuer=validated.issuer,
+            subject=validated.subject,
+            authenticated_at=validated.authenticated_at,
+            auth_context=frozenset(),
+            credential_expires_at=validated.expires_at,
+        )
+
+    async def _verify_or_http_error(self, token: str) -> ValidatedOidcIdentity:
+        try:
+            return await self._verifier.verify(token)
+        except InvalidCredentialError as error:
+            logger.warning("oidc_credential_rejected")
+            raise _unauthenticated() from error
+        except AuthenticationUnavailableError as error:
+            logger.warning("oidc_provider_unavailable")
+            raise _authentication_unavailable() from error
+
+
+def _bearer_token(authorization: str | None) -> str:
+    parts = authorization.split() if authorization is not None else []
+    if len(parts) != 2 or parts[0].casefold() != "bearer":
+        raise _unauthenticated()
+    return parts[1]
+
+
+def _unauthenticated() -> HTTPException:
+    return HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail={"code": "UNAUTHENTICATED"},
+        headers={"WWW-Authenticate": "Bearer"},
+    )
+
+
+def _authentication_unavailable() -> HTTPException:
+    return HTTPException(
+        status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+        detail={"code": "AUTHENTICATION_UNAVAILABLE"},
+    )
+
+
+async def build_oidc_authenticator(settings: Settings) -> OidcBearerAuthenticator:
+    issuer, audience, algorithms = settings.require_oidc()
+    async with httpx.AsyncClient(timeout=5.0) as client:
+        configuration = await discover_oidc(issuer, client)
+    jwks = jwt.PyJWKClient(
+        configuration.jwks_uri,
+        lifespan=300,
+        timeout=5,
+        cooldown_duration=30,
+    )
+    verifier = OidcJwtVerifier(
+        issuer=issuer,
+        audience=audience,
+        algorithms=algorithms,
+        jwks=jwks,
+    )
+    store = PostgresIdentityStore(create_session_factory(settings.database_url))
+    return OidcBearerAuthenticator(verifier, store.resolve)

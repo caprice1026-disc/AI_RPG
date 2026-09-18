@@ -2,6 +2,7 @@
 
 import asyncio
 from collections.abc import AsyncIterator, Awaitable, Callable
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Annotated
 from uuid import UUID
@@ -28,7 +29,7 @@ from ai_rpg.contracts import CampaignStateResponse, PlayerTurnInput, TurnRespons
 from ai_rpg.infrastructure.database import create_session_factory
 from ai_rpg.infrastructure.postgres import PostgresAuthorizationPolicy, PostgresUnitOfWork
 
-PrincipalProvider = Callable[[], Awaitable[AuthenticatedPrincipal]]
+PrincipalProvider = Callable[..., Awaitable[AuthenticatedPrincipal]]
 ApplicationError = (
     AuthorizationError
     | ChoiceNotAvailableError
@@ -80,6 +81,7 @@ async def _unconfigured_principal() -> AuthenticatedPrincipal:
     raise HTTPException(
         status_code=status.HTTP_401_UNAUTHORIZED,
         detail={"code": "UNAUTHENTICATED"},
+        headers={"WWW-Authenticate": "Bearer"},
     )
 
 
@@ -102,6 +104,7 @@ def create_app(
     event_poll_seconds: float = 0.5,
     event_heartbeat_seconds: float = 15.0,
     event_send_timeout_seconds: float = 5.0,
+    utc_now: Callable[[], datetime] = lambda: datetime.now(UTC),
 ) -> FastAPI:
     """DB接続をrequest時まで遅延したHTTP applicationを構築する。"""
 
@@ -238,7 +241,14 @@ def create_app(
             pending = initial
             loop = asyncio.get_running_loop()
             heartbeat_at = loop.time() + event_heartbeat_seconds
-            while not await request.is_disconnected():
+
+            def credential_expired() -> bool:
+                expires_at = principal.credential_expires_at
+                return expires_at is not None and utc_now() >= expires_at
+
+            while True:
+                if credential_expired() or await request.is_disconnected():
+                    return
                 events = pending
                 pending = ()
                 if not events:
@@ -250,7 +260,7 @@ def create_app(
                         return
                 emitted = False
                 for event in events:
-                    if await request.is_disconnected():
+                    if credential_expired() or await request.is_disconnected():
                         return
                     if event.id <= cursor:
                         continue
