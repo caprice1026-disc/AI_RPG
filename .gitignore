@@ -206,6 +206,9 @@ tempCodeRunnerFile.py
 # Ruff stuff:
 .ruff_cache/
 
+# Local Git worktrees used by agentic development
+.worktrees/
+
 # PyPI configuration file
 .pypirc
 
