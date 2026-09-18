@@ -968,6 +968,80 @@ def test_principal_identity_concurrent_registration_uses_canonical_winner(
         runner.run(exercise())
 
 
+def test_identity_cli_register_disable_lifecycle(database: Engine) -> None:
+    url = database.url.render_as_string(hide_password=False)
+    issuer = "https://idp.example.com/"
+    subject = "player-1"
+    env = {
+        **os.environ,
+        "AIRPG_DATABASE_URL": url,
+        "AIRPG_AUTH_ISSUER": issuer,
+        "PYTHONPATH": str(ROOT / "src"),
+    }
+
+    def run(*arguments: str, check: bool = True) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            [sys.executable, "-m", "ai_rpg.cli", "auth", *arguments],
+            cwd=ROOT,
+            env=env,
+            check=check,
+            capture_output=True,
+            text=True,
+        )
+
+    register_arguments = (
+        "register",
+        "--subject",
+        subject,
+        "--principal-id",
+        PRINCIPAL_A,
+    )
+    expected_active = {
+        "issuer": issuer,
+        "subject": subject,
+        "principal_id": PRINCIPAL_A,
+        "status": "active",
+    }
+    assert json.loads(run(*register_arguments).stdout) == expected_active
+    assert json.loads(run(*register_arguments).stdout) == expected_active
+
+    expected_disabled = {**expected_active, "status": "disabled"}
+    assert json.loads(run("disable", "--subject", subject).stdout) == expected_disabled
+    with database.connect() as connection:
+        disabled_row = connection.execute(
+            text(
+                "SELECT principal_id,created_at,disabled_at "
+                "FROM principal_identities WHERE issuer=:issuer AND subject=:subject"
+            ),
+            {"issuer": issuer, "subject": subject},
+        ).one()
+    assert disabled_row.disabled_at is not None
+
+    assert json.loads(run("disable", "--subject", subject).stdout) == expected_disabled
+    with database.connect() as connection:
+        repeated_row = connection.execute(
+            text(
+                "SELECT principal_id,created_at,disabled_at "
+                "FROM principal_identities WHERE issuer=:issuer AND subject=:subject"
+            ),
+            {"issuer": issuer, "subject": subject},
+        ).one()
+    assert repeated_row == disabled_row
+
+    rejected = run(*register_arguments, check=False)
+    assert rejected.returncode == 2
+    assert rejected.stdout == ""
+    with database.connect() as connection:
+        row_after_rejection = connection.execute(
+            text(
+                "SELECT principal_id,created_at,disabled_at "
+                "FROM principal_identities WHERE issuer=:issuer AND subject=:subject"
+            ),
+            {"issuer": issuer, "subject": subject},
+        ).one()
+    assert row_after_rejection == disabled_row
+
+
 def test_existing_revision_upgrades_with_worker_control_defaults(
     empty_database_url: str,
 ) -> None:
