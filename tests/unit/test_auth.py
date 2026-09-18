@@ -29,3 +29,31 @@ def test_authenticated_principal_accepts_aware_utc() -> None:
     )
 
     assert principal.auth_context == frozenset({"mfa"})
+
+
+def test_authenticated_principal_accepts_optional_utc_expiry() -> None:
+    authenticated_at = datetime.now(UTC)
+    expires_at = authenticated_at + timedelta(minutes=5)
+
+    principal = AuthenticatedPrincipal(
+        principal_id=uuid4(),
+        issuer="test",
+        subject="player",
+        authenticated_at=authenticated_at,
+        auth_context=frozenset(),
+        credential_expires_at=expires_at,
+    )
+
+    assert principal.credential_expires_at == expires_at
+
+
+def test_credential_expiry_must_be_utc() -> None:
+    with pytest.raises(ValueError, match=r"credential_expires_at.*UTC"):
+        AuthenticatedPrincipal(
+            principal_id=uuid4(),
+            issuer="test",
+            subject="player",
+            authenticated_at=datetime.now(UTC),
+            auth_context=frozenset(),
+            credential_expires_at=datetime.now(timezone(timedelta(hours=9))),
+        )

@@ -72,3 +72,32 @@ def test_openai_api_key_is_read_as_a_secret(
     assert settings.openai_api_key is not None
     assert settings.openai_api_key.get_secret_value() == "test-secret"
     assert "test-secret" not in repr(settings)
+
+
+def test_oidc_settings_parse_explicit_asymmetric_algorithms(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("AIRPG_AUTH_ISSUER", "https://idp.example.com/")
+    monkeypatch.setenv("AIRPG_AUTH_AUDIENCE", "ai-rpg-api")
+    monkeypatch.setenv("AIRPG_AUTH_ALLOWED_ALGORITHMS", "RS256,ES256")
+
+    settings = Settings()
+
+    assert settings.require_oidc() == (
+        "https://idp.example.com/",
+        "ai-rpg-api",
+        ("RS256", "ES256"),
+    )
+
+
+def test_oidc_is_optional_for_non_api_processes() -> None:
+    settings = Settings(auth_issuer=None, auth_audience=None)
+
+    with pytest.raises(ValueError, match="AIRPG_AUTH_ISSUER"):
+        settings.require_oidc()
+
+
+@pytest.mark.parametrize("algorithm", ["HS256", "none", ""])
+def test_oidc_rejects_unsafe_algorithm_allowlist(algorithm: str) -> None:
+    with pytest.raises(ValidationError):
+        Settings(auth_allowed_algorithms=algorithm)

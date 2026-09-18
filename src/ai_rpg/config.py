@@ -2,9 +2,25 @@
 
 from functools import lru_cache
 from typing import Self
+from urllib.parse import urlsplit
 
 from pydantic import Field, SecretStr, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+_ASYMMETRIC_JWT_ALGORITHMS = frozenset(
+    {
+        "RS256",
+        "RS384",
+        "RS512",
+        "PS256",
+        "PS384",
+        "PS512",
+        "ES256",
+        "ES384",
+        "ES512",
+        "EdDSA",
+    }
+)
 
 
 class Settings(BaseSettings):
@@ -31,6 +47,9 @@ class Settings(BaseSettings):
     database_url: str = Field(
         default="postgresql+psycopg://airpg:airpg@localhost/airpg", min_length=1
     )
+    auth_issuer: str | None = None
+    auth_audience: str | None = None
+    auth_allowed_algorithms: str = "RS256"
 
     @model_validator(mode="after")
     def validate_worker_timing(self) -> Self:
@@ -40,7 +59,24 @@ class Settings(BaseSettings):
             raise ValueError("resolution deadlineはworker lease以上である必要があります")
         if self.narration_deadline_seconds < self.worker_lease_seconds:
             raise ValueError("narration deadlineはworker lease以上である必要があります")
+        algorithms = tuple(item.strip() for item in self.auth_allowed_algorithms.split(","))
+        if not algorithms or any(
+            item not in _ASYMMETRIC_JWT_ALGORITHMS for item in algorithms
+        ):
+            raise ValueError("JWT algorithm allowlistには対応する非対称方式だけを指定します")
+        if self.auth_issuer is not None:
+            parsed = urlsplit(self.auth_issuer)
+            if parsed.scheme != "https" or not parsed.netloc or parsed.query or parsed.fragment:
+                raise ValueError("AIRPG_AUTH_ISSUERにはquery/fragmentのないHTTPS URLが必要です")
         return self
+
+    def require_oidc(self) -> tuple[str, str, tuple[str, ...]]:
+        if self.auth_issuer is None:
+            raise ValueError("AIRPG_AUTH_ISSUER is required for production API authentication")
+        if self.auth_audience is None or not self.auth_audience:
+            raise ValueError("AIRPG_AUTH_AUDIENCE is required for production API authentication")
+        algorithms = tuple(item.strip() for item in self.auth_allowed_algorithms.split(","))
+        return self.auth_issuer, self.auth_audience, algorithms
 
 
 @lru_cache
