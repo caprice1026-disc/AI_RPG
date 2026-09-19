@@ -147,9 +147,9 @@ HTTP statusの意味は次のとおりです。
 
 - `401`: tokenなし、不正・期限切れtoken、未登録identity、無効identity。外部から理由を区別せず`UNAUTHENTICATED`を返します。
 - `403`: tokenは有効ですが、現在のCampaign membershipまたはactor権限がありません。
-- `503`: 起動後のJWKS取得・更新障害によりcredentialを検証できません。
+- `503`: 起動後のJWKS接続障害、またはidentity対応表のDB障害により認証処理を完了できません。
 
-Discoveryはprocess起動時に取得します。JWKSは300秒cacheし、未知の`kid`では30秒のcooldownを守って再取得するため、Issuer側の鍵rotationへ追随します。取得済み鍵で検証できずJWKSも利用できない場合はfail closedで503を返します。
+Discoveryはprocess起動時に取得し、失敗した場合はAPIを起動しません。JWKSは300秒cacheし、未知の`kid`では直近取得から30秒のcooldown経過後に再取得してIssuer側の鍵rotationへ追随します。必要なJWKS取得に接続できない場合は503、既知鍵での署名不一致や更新後も鍵を選択できないtokenは、他の不正credentialと同じ401になります。
 
 `ai-rpg api --dev-principal <UUID>`はOIDCを迂回するローカル開発専用の明示的な起動方法です。通常のAPI起動やworkerへ暗黙適用されません。将来のブラウザログイン／server sessionは同じprincipal契約を生成する別adapterとして追加します。それまではbundled play screenからBearer loginはできず、ローカル開発では`--dev-principal`が必要です。
 
