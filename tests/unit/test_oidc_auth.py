@@ -3,6 +3,7 @@
 import logging
 from dataclasses import dataclass, fields
 from datetime import UTC, datetime, timedelta
+from json import JSONDecodeError
 from unittest.mock import AsyncMock, Mock
 from uuid import UUID
 
@@ -163,7 +164,7 @@ def _public_jwk(key: rsa.RSAPrivateKey, kid: str) -> dict[str, object]:
 def _jwks_client(
     *payloads: dict[str, object],
 ) -> tuple[jwt.PyJWKClient, Mock]:
-    client = jwt.PyJWKClient(
+    client = auth_module._ProviderJWKClient(
         "https://idp.example.com/keys",
         lifespan=300,
         timeout=5,
@@ -370,6 +371,58 @@ async def test_verifier_maps_jwks_connection_failure_without_details(
 
     assert "private-provider-detail" not in str(error.value)
     assert token not in str(error.value)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "provider_response",
+    [
+        JSONDecodeError("private-provider-body", "private-provider-body", 0),
+        [],
+        {"keys": []},
+        {"keys": [{"kid": "private-kid", "kty": "private-kty"}]},
+    ],
+    ids=["malformed-json", "non-object", "empty-keys", "unusable-keys"],
+)
+async def test_authenticator_maps_invalid_jwks_document_to_unavailable(
+    signing_key: rsa.RSAPrivateKey,
+    monkeypatch: pytest.MonkeyPatch,
+    provider_response: object,
+) -> None:
+    settings = Mock()
+    settings.require_oidc.return_value = (ISSUER, AUDIENCE, ("RS256",))
+    settings.database_url = "postgresql+psycopg://airpg@database/airpg"
+    discovery = AsyncMock(
+        return_value=auth_module.OidcConfiguration(
+            issuer=ISSUER,
+            jwks_uri="https://idp.example.com/keys",
+        )
+    )
+    resolver = AsyncMock(return_value=PRINCIPAL_ID)
+    store = Mock(resolve=resolver)
+
+    def fetch_data(_: jwt.PyJWKClient) -> object:
+        if isinstance(provider_response, Exception):
+            raise provider_response
+        return provider_response
+
+    monkeypatch.setattr(auth_module, "discover_oidc", discovery)
+    monkeypatch.setattr(auth_module.jwt.PyJWKClient, "fetch_data", fetch_data)
+    monkeypatch.setattr(auth_module, "create_session_factory", Mock())
+    monkeypatch.setattr(auth_module, "PostgresIdentityStore", Mock(return_value=store))
+    authenticator = await auth_module.build_oidc_authenticator(settings)
+    token = _token(signing_key, _claims())
+
+    with pytest.raises(auth_module.HTTPException) as error:
+        await authenticator(f"Bearer {token}")
+
+    assert error.value.status_code == 503
+    assert error.value.detail == {"code": "AUTHENTICATION_UNAVAILABLE"}
+    assert "private-provider-body" not in str(error.value)
+    assert "private-kid" not in str(error.value)
+    assert token not in str(error.value)
+    assert "player-1" not in str(error.value)
+    resolver.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -627,7 +680,7 @@ async def test_build_oidc_authenticator_wires_validated_configuration(
 
     monkeypatch.setattr(auth_module.httpx, "AsyncClient", async_client_factory)
     monkeypatch.setattr(auth_module, "discover_oidc", discovery)
-    monkeypatch.setattr(auth_module.jwt, "PyJWKClient", jwks_factory)
+    monkeypatch.setattr(auth_module, "_ProviderJWKClient", jwks_factory)
     monkeypatch.setattr(auth_module, "create_session_factory", session_factory_builder)
     monkeypatch.setattr(auth_module, "PostgresIdentityStore", store_factory)
     monkeypatch.setattr(auth_module, "OidcJwtVerifier", verifier_factory)

@@ -8,6 +8,7 @@ from unittest.mock import AsyncMock, MagicMock
 from uuid import UUID, uuid4
 
 import pytest
+from sqlalchemy.exc import StatementError
 
 from ai_rpg import cli
 from ai_rpg.api import OidcDiscoveryError
@@ -159,6 +160,38 @@ def test_auth_store_errors_are_cli_errors(
         cli.main(argv)
 
     assert str(error) in capsys.readouterr().err
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["auth", "register", "--subject", "private-subject"],
+        ["auth", "disable", "--subject", "private-subject"],
+    ],
+)
+def test_auth_database_errors_use_fixed_subject_free_cli_error(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    argv: list[str],
+) -> None:
+    subject = "private-subject"
+    error = StatementError(
+        "database operation failed",
+        "SELECT principal_id FROM principal_identities WHERE subject=:subject",
+        {"subject": subject},
+        RuntimeError("driver failure"),
+    )
+    store = MagicMock()
+    store.register = AsyncMock(side_effect=error)
+    store.disable = AsyncMock(side_effect=error)
+    _patch_auth_store(monkeypatch, store)
+
+    with pytest.raises(SystemExit, match="2"):
+        cli.main(argv)
+
+    stderr = capsys.readouterr().err
+    assert "identity database operation failed" in stderr
+    assert subject not in stderr
 
 
 @pytest.mark.parametrize(

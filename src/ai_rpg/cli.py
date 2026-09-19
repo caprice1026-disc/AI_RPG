@@ -8,6 +8,8 @@ from collections.abc import Awaitable, Callable, Sequence
 from datetime import UTC, datetime
 from uuid import UUID
 
+from sqlalchemy.exc import SQLAlchemyError
+
 from ai_rpg.api import OidcDiscoveryError, build_oidc_authenticator, create_app
 from ai_rpg.application import AuthenticatedPrincipal
 from ai_rpg.config import Settings, get_settings
@@ -122,6 +124,8 @@ def main(argv: Sequence[str] | None = None) -> None:
     if args.command == "auth":
         try:
             result = asyncio.run(_run_auth_command(args, settings))
+        except SQLAlchemyError:
+            parser.error("identity database operation failed")
         except (ValueError, IdentityNotFound, IdentityRegistrationConflict) as error:
             parser.error(str(error))
         print(json.dumps(result, ensure_ascii=False))

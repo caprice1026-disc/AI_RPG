@@ -258,6 +258,8 @@ def create_app(
                         )
                     except AuthorizationError:
                         return
+                    if credential_expired():
+                        return
                 emitted = False
                 for event in events:
                     if credential_expired() or await request.is_disconnected():

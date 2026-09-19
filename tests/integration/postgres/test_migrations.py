@@ -1101,6 +1101,34 @@ def test_principal_identity_registration_generates_id_and_missing_disable_fails(
         runner.run(exercise())
 
 
+def test_identity_disable_uses_database_clock_when_application_clock_is_behind(
+    database: Engine,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import ai_rpg.infrastructure.postgres.identities as identities_module
+    from ai_rpg.infrastructure.database import create_session_factory
+    from ai_rpg.infrastructure.postgres import PostgresIdentityStore
+
+    class BehindDatabaseClock(datetime):
+        @classmethod
+        def now(cls, tz: object | None = None) -> datetime:
+            return datetime(2000, 1, 1, tzinfo=UTC)
+
+    monkeypatch.setattr(identities_module, "datetime", BehindDatabaseClock)
+    store = PostgresIdentityStore(
+        create_session_factory(database.url.render_as_string(hide_password=False))
+    )
+
+    async def exercise() -> None:
+        registered = await store.register("https://idp.example.com/", "clock-skew")
+        disabled = await store.disable("https://idp.example.com/", "clock-skew")
+        assert disabled.disabled_at is not None
+        assert disabled.disabled_at >= registered.created_at
+
+    with asyncio.Runner(loop_factory=asyncio.SelectorEventLoop) as runner:
+        runner.run(exercise())
+
+
 def test_principal_identity_concurrent_registration_uses_canonical_winner(
     database: Engine,
 ) -> None:
@@ -1110,6 +1138,8 @@ def test_principal_identity_concurrent_registration_uses_canonical_winner(
     store = PostgresIdentityStore(
         create_session_factory(database.url.render_as_string(hide_password=False))
     )
+    with database.connect() as connection:
+        principal_count_before = connection.scalar(text("SELECT count(*) FROM principals"))
 
     async def exercise() -> None:
         first, second = await asyncio.gather(
@@ -1123,6 +1153,9 @@ def test_principal_identity_concurrent_registration_uses_canonical_winner(
 
     with asyncio.Runner(loop_factory=asyncio.SelectorEventLoop) as runner:
         runner.run(exercise())
+    with database.connect() as connection:
+        principal_count_after = connection.scalar(text("SELECT count(*) FROM principals"))
+    assert principal_count_after == principal_count_before + 1
 
 
 def test_identity_cli_register_disable_lifecycle(database: Engine) -> None:

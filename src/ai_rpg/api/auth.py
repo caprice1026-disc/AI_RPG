@@ -40,6 +40,20 @@ class AuthenticationUnavailableError(RuntimeError):
     """外部認証基盤を一時的に利用できない。"""
 
 
+class _ProviderJWKClient(jwt.PyJWKClient):
+    """Provider JWKS文書の失敗だけを認証基盤障害へ分類する。"""
+
+    def get_jwk_set(self, refresh: bool = False) -> jwt.PyJWKSet:
+        try:
+            return super().get_jwk_set(refresh)
+        except (
+            jwt.PyJWKClientError,
+            jwt.PyJWKSetError,
+            ValueError,
+        ) as error:
+            raise AuthenticationUnavailableError("JWKSを取得できません") from error
+
+
 @dataclass(frozen=True, slots=True)
 class ValidatedOidcIdentity:
     issuer: str
@@ -220,7 +234,7 @@ async def build_oidc_authenticator(settings: Settings) -> OidcBearerAuthenticato
     issuer, audience, algorithms = settings.require_oidc()
     async with httpx.AsyncClient(timeout=5.0) as client:
         configuration = await discover_oidc(issuer, client)
-    jwks = jwt.PyJWKClient(
+    jwks = _ProviderJWKClient(
         configuration.jwks_uri,
         lifespan=300,
         timeout=5,

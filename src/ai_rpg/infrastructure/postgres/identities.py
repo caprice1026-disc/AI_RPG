@@ -1,10 +1,10 @@
 """OIDC identityと内部principalの不変な対応を保存するadapter。"""
 
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import datetime
 from uuid import UUID, uuid4
 
-from sqlalchemy import select
+from sqlalchemy import delete, func, select
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
@@ -57,13 +57,15 @@ class PostgresIdentityStore:
             if identity is not None:
                 return self._registered(identity, principal_id)
 
+            generated_principal = principal_id is None
             selected_principal_id = principal_id or uuid4()
-            await session.execute(
+            principal_result = await session.execute(
                 insert(PrincipalModel)
                 .values(id=selected_principal_id)
                 .on_conflict_do_nothing()
+                .returning(PrincipalModel.id)
             )
-            await session.execute(
+            identity_result = await session.execute(
                 insert(PrincipalIdentityModel)
                 .values(
                     issuer=issuer,
@@ -71,7 +73,18 @@ class PostgresIdentityStore:
                     principal_id=selected_principal_id,
                 )
                 .on_conflict_do_nothing()
+                .returning(PrincipalIdentityModel.principal_id)
             )
+            if (
+                generated_principal
+                and principal_result.scalar_one_or_none() is not None
+                and identity_result.scalar_one_or_none() is None
+            ):
+                await session.execute(
+                    delete(PrincipalModel).where(
+                        PrincipalModel.id == selected_principal_id
+                    )
+                )
 
             identity = await self._find(session, issuer, subject)
             assert identity is not None
@@ -83,7 +96,16 @@ class PostgresIdentityStore:
             if identity is None:
                 raise IdentityNotFound
             if identity.disabled_at is None:
-                identity.disabled_at = datetime.now(UTC)
+                disabled_at = await session.scalar(
+                    select(
+                        func.greatest(
+                            func.current_timestamp(),
+                            identity.created_at,
+                        )
+                    )
+                )
+                assert disabled_at is not None
+                identity.disabled_at = disabled_at
             return self._record(identity)
 
     @staticmethod

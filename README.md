@@ -228,7 +228,7 @@ Invoke-RestMethod `
   -Uri "http://127.0.0.1:8000/campaigns/10000000-0000-0000-0000-000000000001/turns/$($turn.turn_id)"
 ```
 
-`--once`を付けるとworkerは一回だけ取得を試みて終了します。processを停止・再起動しても、Turn、予算、lease、確定済み結果はPostgreSQLから引き継がれます。`--dev-principal`は開発時だけ明示的に有効化する認証差し替えで、通常起動では引き続き401を返します。
+`--once`を付けるとworkerは一回だけ取得を試みて終了します。processを停止・再起動しても、Turn、予算、lease、確定済み結果はPostgreSQLから引き継がれます。`--dev-principal`は開発時だけ明示的に有効化する認証差し替えです。通常起動ではbundled play screenからの未認証requestは引き続き401になりますが、事前登録済みidentityの有効なBearer requestは認証されます。
 
 解決workerへ渡す直近の公開履歴は`AIRPG_RECENT_MESSAGES_LIMIT`で0〜100件に設定でき、既定値は20です。0にすると履歴を渡しません。対象は同じCampaign・Scene・Actorの終端Turnだけで、プレイヤー入力、公開Action結果、保存済み描写を古い順に渡します。
 

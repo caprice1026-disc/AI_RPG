@@ -1,5 +1,6 @@
 """HTTP adapterのIntegration Test。"""
 
+import asyncio
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from unittest.mock import AsyncMock, Mock
@@ -378,6 +379,49 @@ async def test_sse_rechecks_credential_expiry_before_emitting_event() -> None:
     assert response.status_code == 200
     assert response.text == ""
     assert event_stream.poll.await_count == 1
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_sse_does_not_emit_heartbeat_after_expiry_during_empty_poll() -> None:
+    authenticated_at = datetime(2026, 9, 18, tzinfo=UTC)
+    expires_at = authenticated_at + timedelta(seconds=1)
+    principal = replace(
+        _principal(),
+        authenticated_at=authenticated_at,
+        credential_expires_at=expires_at,
+    )
+
+    async def authenticated() -> AuthenticatedPrincipal:
+        return principal
+
+    event_stream = AsyncMock()
+
+    async def empty_poll(*_: object) -> tuple[()]:
+        if event_stream.poll.await_count == 2:
+            await asyncio.sleep(0.001)
+        return ()
+
+    event_stream.poll.side_effect = empty_poll
+    utc_now = Mock(side_effect=[authenticated_at, expires_at])
+    app = create_app(
+        turn_service=AsyncMock(),
+        turn_query_service=AsyncMock(),
+        event_stream_service=event_stream,
+        principal_provider=authenticated,
+        event_poll_seconds=0,
+        event_heartbeat_seconds=0.000001,
+        utc_now=utc_now,
+    )
+
+    async with AsyncClient(
+        transport=ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        response = await client.get(f"/campaigns/{CAMPAIGN_ID}/events")
+
+    assert response.status_code == 200
+    assert response.text == ""
+    assert event_stream.poll.await_count == 2
 
 
 @pytest.mark.integration
