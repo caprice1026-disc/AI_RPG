@@ -289,6 +289,7 @@
     let stateCampaignId = null;
     let trackingGeneration = 0;
     let cancelTracking = null;
+    let workflowGeneration = 0;
     const renderedTurns = new Set();
     localStorage.removeItem("ai-rpg-state-version");
     ui["campaign-id"].value = localStorage.getItem("ai-rpg-campaign") || "";
@@ -327,6 +328,7 @@
     }
 
     function processingMessage() {
+      document.querySelector('[data-role="processing"]')?.remove();
       const wrap = document.createElement("div");
       wrap.className = "notice pending";
       const spinner = document.createElement("span");
@@ -443,9 +445,10 @@
     }
 
     function observeTurn(campaignId, turn) {
-      updateStatus(campaignId, turn);
+      if (!updateStatus(campaignId, turn)) return false;
       const pendingText = document.querySelector('[data-role="processing"] .pending span:last-child');
       if (pendingText) pendingText.textContent = turn.resolution_status === "committed" ? "描写を生成しています…" : "判定を処理しています…";
+      return true;
     }
 
     async function api(path, options = {}) {
@@ -492,7 +495,7 @@
     function waitForTurn(campaignId, turnId) {
       const generation = ++trackingGeneration;
       cancelTracking?.();
-      const active = () => generation === trackingGeneration;
+      const active = () => generation === trackingGeneration && ui["campaign-id"].value.trim() === campaignId;
       return new Promise((resolve, reject) => {
         let settled = false;
         let polling = false;
@@ -531,7 +534,8 @@
         }
 
         function startPolling() {
-          if (!active() || settled || polling) return;
+          if (!active()) return cancel();
+          if (settled || polling) return;
           polling = true;
           clearTimer();
           sseActive = false;
@@ -553,7 +557,8 @@
         events = new EventSource(`/campaigns/${encodeURIComponent(campaignId)}/events`);
         setTimer(setTimeout(startPolling, 1500), null);
         events.addEventListener("turn.updated", event => {
-          if (!active() || !sseActive) return;
+          if (!active()) return cancel();
+          if (!sseActive) return;
           try {
             const turn = JSON.parse(event.data).payload?.turn;
             if (!turn || turn.turn_id !== turnId) return;
@@ -562,33 +567,43 @@
           } catch (_) { /* malformed public event is ignored; polling remains available */ }
         });
         events.onopen = () => {
-          if (!active() || !sseActive) return;
+          if (!active()) return cancel();
+          if (!sseActive) return;
           clearTimer();
           ui["connection-label"].textContent = "SSE接続済み";
         };
         events.onerror = () => {
-          if (!active() || !sseActive) return;
+          if (!active()) return cancel();
+          if (!sseActive) return;
           startPolling();
         };
       });
     }
 
     async function resumeTurn(campaignId, turn) {
+      const workflow = ++workflowGeneration;
+      const ownsWorkflow = () => workflow === workflowGeneration;
+      cancelTracking?.();
       setBusy(true);
       processingMessage();
       try {
         observeTurn(campaignId, turn);
         const completed = terminal(turn) ? turn : await waitForTurn(campaignId, turn.turn_id);
+        if (!ownsWorkflow() || !completed) return;
         renderCompleted(completed);
       } catch (error) {
+        if (!ownsWorkflow()) return;
         document.querySelector('[data-role="processing"]')?.remove();
         showError(error instanceof Error ? error.message : "Turnの追跡に失敗しました。");
       } finally {
-        setBusy(false);
+        if (ownsWorkflow()) setBusy(false);
       }
     }
 
     async function continuePending(pending, showPlayer) {
+      const workflow = ++workflowGeneration;
+      const ownsWorkflow = () => workflow === workflowGeneration;
+      cancelTracking?.();
       setBusy(true);
       if (showPlayer) addMessage("YOU", "player", pending.displayText);
       processingMessage();
@@ -605,21 +620,26 @@
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify(pending.body)
           });
+          if (!ownsWorkflow()) return;
           pending = { ...pending, turnId: accepted.turn_id };
           AiRpgPending.save(localStorage, pending);
         }
+        if (!ownsWorkflow()) return;
         updateStatus(pending.campaignId, accepted);
         const completed = terminal(accepted) ? accepted : await waitForTurn(pending.campaignId, accepted.turn_id);
+        if (!ownsWorkflow() || !completed) return;
         renderCompleted(completed);
         AiRpgPending.clear(localStorage);
         if (pending.body.content.kind === "text") ui["action-text"].value = "";
       } catch (error) {
+        if (!ownsWorkflow()) return;
         document.querySelector('[data-role="processing"]')?.remove();
         const rejected = !pending.turnId && error?.status >= 400 && error.status < 500;
         if (rejected) AiRpgPending.clear(localStorage);
         if (["STATE_VERSION_CONFLICT", "TURN_IN_PROGRESS", "CHOICE_NOT_AVAILABLE", "IDEMPOTENCY_CONFLICT"].includes(error?.code)) {
           AiRpgPending.clear(localStorage);
           try { await refreshCampaignState(pending.campaignId, { resume: error.code === "TURN_IN_PROGRESS" }); } catch (_) { /* original error remains primary */ }
+          if (!ownsWorkflow()) return;
           showError(error.message);
         } else {
           const message = error instanceof Error ? error.message : "Turnの処理に失敗しました。";
@@ -633,8 +653,10 @@
           ui["connection-label"].textContent = "認証が必要";
         }
       } finally {
-        setBusy(false);
-        ui["action-text"].focus();
+        if (ownsWorkflow()) {
+          setBusy(false);
+          ui["action-text"].focus();
+        }
       }
     }
 

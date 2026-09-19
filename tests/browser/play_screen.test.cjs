@@ -446,5 +446,150 @@ test("late polling response from an old generation is ignored", async () => {
 
   resolveOldPoll(response(terminalTurn("turn-old", 0)));
   await oldTracking;
+  await flush();
   assert.equal(app.elements["turn-value"].textContent, "turn-new");
+});
+
+test("replacement resume keeps the new workflow busy", async () => {
+  const events = eventSourceTracker();
+  const app = harness(async path => {
+    if (path === "/health") return response({ status: "ok" });
+    throw new Error(`unexpected request: ${path}`);
+  }, [], null, events);
+  app.elements["campaign-id"].value = "campaign-a";
+
+  const oldWorkflow = app.context.resumeTurn("campaign-a", pendingTurn("turn-old"));
+  await flush();
+  const newWorkflow = app.context.resumeTurn("campaign-a", pendingTurn("turn-new"));
+  await flush();
+  await oldWorkflow;
+
+  assert.equal(app.elements["send-action"].disabled, true);
+  assert.equal(find(app.elements.timeline, node => node.className === "notice error"), null);
+
+  events.instances[1].emit("turn.updated", terminalTurn("turn-new", 0));
+  await newWorkflow;
+  assert.equal(app.elements["send-action"].disabled, false);
+});
+
+test("replacement pending workflow keeps the newer pending operation", async () => {
+  const events = eventSourceTracker();
+  const app = harness(async (path, options = {}) => {
+    if (path === "/health") return response({ status: "ok" });
+    if (options.method === "POST") {
+      const body = JSON.parse(options.body);
+      return response(pendingTurn(body.content.text === "old" ? "turn-old" : "turn-new"), 202);
+    }
+    throw new Error(`unexpected request: ${path}`);
+  }, ["request-old", "request-new"], null, events);
+  app.elements["campaign-id"].value = "campaign-a";
+  const oldPending = AiRpgPending.create({
+    campaignId: "campaign-a", actorId: "actor-a", displayText: "old",
+    content: { kind: "text", text: "old" }, stateVersion: 0, requestId: "request-old",
+  });
+  const newPending = AiRpgPending.create({
+    campaignId: "campaign-a", actorId: "actor-a", displayText: "new",
+    content: { kind: "text", text: "new" }, stateVersion: 0, requestId: "request-new",
+  });
+
+  const oldWorkflow = app.context.continuePending(oldPending, false);
+  await flush();
+  const newWorkflow = app.context.continuePending(newPending, false);
+  await flush();
+  await oldWorkflow;
+
+  assert.equal(AiRpgPending.load(app.storage).turnId, "turn-new");
+  assert.equal(app.elements["send-action"].disabled, true);
+  assert.equal(find(app.elements.timeline, node => node.className === "notice error"), null);
+
+  events.instances[1].emit("turn.updated", terminalTurn("turn-new", 0));
+  await newWorkflow;
+  assert.equal(AiRpgPending.load(app.storage), null);
+});
+
+test("campaign switch makes stale SSE callbacks inert", async () => {
+  const events = eventSourceTracker();
+  const app = harness(async (path, options = {}) => {
+    if (path === "/health") return response({ status: "ok" });
+    if (path.endsWith("/state")) return response({ state_version: 0, latest_turn: null });
+    if (options.method === "POST") return response(pendingTurn("turn-old"), 202);
+    throw new Error(`unexpected request: ${path}`);
+  }, ["request-old"], null, events);
+  app.elements["campaign-id"].value = "campaign-a";
+  app.elements["actor-id"].value = "actor-a";
+  app.elements["action-text"].value = "進む";
+
+  await app.elements.composer.dispatch("submit", { preventDefault() {} });
+  await flush();
+  const pendingText = find(app.elements.timeline, node => node.className === "notice pending").children.at(-1);
+  app.elements["campaign-id"].value = "campaign-b";
+  app.elements["connection-label"].textContent = "Campaign B";
+  pendingText.textContent = "Campaign B pending";
+  events.instances[0].emit("turn.updated", pendingTurn("turn-old"));
+  events.instances[0].emit("open");
+  await flush();
+
+  assert.equal(pendingText.textContent, "Campaign B pending");
+  assert.equal(app.elements["connection-label"].textContent, "Campaign B");
+});
+
+test("campaign switch blocks stale fallback UI", async () => {
+  const events = eventSourceTracker();
+  const timers = timerTracker();
+  let turnGets = 0;
+  const app = harness(async (path, options = {}) => {
+    if (path === "/health") return response({ status: "ok" });
+    if (path.endsWith("/state")) return response({ state_version: 0, latest_turn: null });
+    if (options.method === "POST") return response(pendingTurn("turn-old"), 202);
+    if (path.endsWith("/turns/turn-old")) {
+      turnGets += 1;
+      return response(terminalTurn("turn-old", 0));
+    }
+    throw new Error(`unexpected request: ${path}`);
+  }, ["request-old"], null, { ...events, ...timers });
+  app.elements["campaign-id"].value = "campaign-a";
+  app.elements["actor-id"].value = "actor-a";
+  app.elements["action-text"].value = "進む";
+
+  await app.elements.composer.dispatch("submit", { preventDefault() {} });
+  await flush();
+  const pendingText = find(app.elements.timeline, node => node.className === "notice pending").children.at(-1);
+  app.elements["campaign-id"].value = "campaign-b";
+  app.elements["connection-label"].textContent = "Campaign B";
+  pendingText.textContent = "Campaign B pending";
+  await timers.runAll();
+  await flush();
+
+  assert.equal(app.elements["connection-label"].textContent, "Campaign B");
+  assert.equal(turnGets, 0);
+  assert.equal(pendingText.textContent, "Campaign B pending");
+  assert.equal(app.elements["connection-label"].textContent, "Campaign B");
+});
+
+test("campaign switch ignores a delayed polling response", async () => {
+  const events = eventSourceTracker();
+  const timers = timerTracker();
+  let resolveOldPoll;
+  const oldPoll = new Promise(resolve => { resolveOldPoll = resolve; });
+  const app = harness(async path => {
+    if (path === "/health") return response({ status: "ok" });
+    if (path.endsWith("/turns/turn-old")) return oldPoll;
+    throw new Error(`unexpected request: ${path}`);
+  }, [], null, { ...events, ...timers });
+  app.elements["campaign-id"].value = "campaign-a";
+  app.context.processingMessage();
+  const tracking = app.context.waitForTurn("campaign-a", "turn-old");
+  await timers.runAll();
+  await flush();
+  const pendingText = find(app.elements.timeline, node => node.className === "notice pending").children.at(-1);
+  app.elements["campaign-id"].value = "campaign-b";
+  app.elements["connection-label"].textContent = "Campaign B";
+  pendingText.textContent = "Campaign B pending";
+
+  resolveOldPoll(response(terminalTurn("turn-old", 0)));
+  await flush();
+  await tracking;
+
+  assert.equal(pendingText.textContent, "Campaign B pending");
+  assert.equal(app.elements["connection-label"].textContent, "Campaign B");
 });
