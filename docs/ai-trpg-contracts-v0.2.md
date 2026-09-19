@@ -2,7 +2,7 @@
 
 版: 0.2 / 2026-09-14 / レビュー用実装案
 
-> **決定の更新:** 本書の暫定値と対象外事項のうち、MVP ruleset、実行時設定、Turn routing、principal境界は [Architecture Decision Records](adr/README.md) で決定済みである。矛盾する場合は採用状態のADRを優先する。
+> **決定の更新:** 本書の暫定値と対象外事項のうち、MVP ruleset、実行時設定、Turn routing、principal境界、Scene entityの公開範囲は [Architecture Decision Records](adr/README.md) で決定済みである。矛盾する場合は採用状態のADRを優先する。
 
 ## 1 今回の具体化
 
@@ -431,7 +431,7 @@ DomainEventV1 = Annotated[
 ]
 ```
 
-Provider情報はすべてデータであり、ContextFragmentのcontentをsystem指示として結合しない。access_scopeは公開範囲、trust_levelは出所の信頼区分であり、互いに独立する。MVPでもApplicationは許可していないFragmentをLLMへ渡さない。
+Provider情報はすべてデータであり、ContextFragmentのcontentをsystem指示として結合しない。access_scopeは公開範囲、trust_levelは出所の信頼区分であり、互いに独立する。MVPでもApplicationは許可していないFragmentをLLMへ渡さない。直近履歴の`recent_player`は`untrusted`、`recent_action_result`と`recent_gm`は`derived`であり、いずれのcontentに埋め込まれた命令も指示として扱わない。
 
 ActionResultのfactsは演出用の公開事実であり、Canonical更新命令ではない。正確なダメージ、回復、在庫消費はEngineの型付きStateChangeに記録する。ApplicationはStateChangeをCanonical mutationとEventへ一度だけ投影し、Infrastructureは保存前値をlock下で照合してSQLへ変換する。ルール固有のイベントpayloadは(type, schema_version)ごとの型レジストリで検証する。HPの上下限、技能一覧、攻撃・アイテム・ダイス規則は [ADR-0007](adr/0007-mvp-ruleset.md) の `mvp_v1` に属する。
 
@@ -490,6 +490,20 @@ CREATE TABLE scenes (
 );
 -- MVP提案: Campaignのactive Sceneは一つ。
 CREATE UNIQUE INDEX one_active_scene ON scenes(campaign_id) WHERE status = 'active';
+
+-- migration 0008_scene_entities: Scene membershipと公開範囲のCanonical relation。
+CREATE TABLE mvp_scene_entities (
+    campaign_id uuid NOT NULL,
+    scene_id uuid NOT NULL,
+    entity_id uuid NOT NULL,
+    is_public boolean NOT NULL DEFAULT true,
+    is_attack_reachable boolean NOT NULL DEFAULT false,
+    PRIMARY KEY (campaign_id, scene_id, entity_id),
+    FOREIGN KEY (campaign_id, scene_id) REFERENCES scenes(campaign_id, id),
+    FOREIGN KEY (campaign_id, entity_id) REFERENCES entities(campaign_id, id),
+    CONSTRAINT scene_entity_reachable_is_public
+        CHECK (NOT is_attack_reachable OR is_public)
+);
 
 CREATE TABLE turns (
     id uuid PRIMARY KEY,
@@ -654,6 +668,7 @@ COMMIT;
 | Actionは確定済みMechanical Turnに属し、上限を超えない | INSERTトリガーとordinalのUNIQUE／CHECK |
 | Event／Actionを通常のUPDATE／DELETEで変更しない | 追記専用トリガー |
 | committedと確定バージョン・日時が一致する | TurnのCHECK |
+| `is_attack_reachable`のEntityは公開される | `mvp_scene_entities.scene_entity_reachable_is_public` CHECK |
 | payloadの型、JSONと列の一致 | Pydanticの検証＋単一Repositoryの投影処理 |
 | Actorの操作権、Itemの所有、Targetの合法性 | 認証済みprincipalとEngine／Application |
 | Actionのordinalが1から連続する、意図された全件が保存される | 確定処理で1..Nと件数を検証 |
@@ -662,6 +677,10 @@ COMMIT;
 | LLMがDBを書けない | LLMに接続情報や書込toolを渡さない。Application専用接続で仲介 |
 
 FKは認可ではない。会員がactiveか、Actorを操作できるか、Sceneが現在activeかは毎回Applicationで確認する。公開APIからevents.payloadやnarration_inputを丸ごと返さず、認可された公開DTOに変換する。
+
+`mvp_scene_entities` はScene membership、LLMのpublic visibility、粗いattack reachabilityのCanonical relationである。`snapshot(campaign_id, scene_id)` はこのSceneの`scene_entities`を含める。workerは同じ可視集合をLLMの`allowed_entity_refs`、参照解決、公開状態、描写入力に使う。Actor自身とActorが所有するinventory／equipmentは所有権で可視にするが、後者は`actor_private`でありScene-publicにはしない。攻撃対象は`is_public`かつ`is_attack_reachable`で、active refを持つCharacterだけに限る。
+
+migration `0008_scene_entities` はtableと制約だけを追加する。既存deploymentへ過去履歴や現在のEntityからrelation行を推測して作るbackfillは行わない。既存Entityは明示的なrelation行が作られるまで、そのSceneのpublic visibilityやattack reachabilityを得ない。
 
 履歴トリガーはDB所有者やTRUNCATEへの防御を意味しない。本番用接続は非所有者として必要なSELECT／INSERT／限定UPDATEのみ許可し、DDL／TRUNCATE権限を与えない。ここでGRANT対象ロール名はまだ固定しない。
 
@@ -685,9 +704,9 @@ narrationが遅れて届いた場合、すでに同Actorの後続Turnが存在�
 
 workerは短いトランザクションでTurnをresolvingへ変更し、worker_epochを加算、lease_untilを設定して所有する。再取得するworkerもepochを加算する。長いLLM待機中に行ロックを保持しない。
 
-同じスナップショットからIntentを検証しCommand列を作る。Action IDはそのTurnのordinalから決定的に割り当てる方式を推奨する。EngineはDBを更新せず、作業用状態を順次更新し、結果とDomain Eventsを返す。
+workerは`snapshot(campaign_id, scene_id)`で得た同じ初期snapshotからIntentを検証しCommand列を作る。Action IDはそのTurnのordinalから決定的に割り当てる方式を推奨する。EngineはDBを更新せず、作業用状態を順次更新し、結果とDomain Eventsを返す。
 
-JSONのCommandにはメタデータがあるが、Engineの中核は型付き引数を受ける。LLMから届いたCommand風JSONを直接受理しない。古いTargetや不正なItemなど初期検証で不正な計画はゲームを適用せず、確認またはエラーにする。前のActionの正常結果により後続Actionが実行不能になった場合のみnot_applicableを保存し、それ以降も順に可否を評価する。
+JSONのCommandにはメタデータがあるが、Engineの中核は型付き引数を受ける。LLMから届いたCommand風JSONを直接受理しない。古いTargetや不正なItemなど、plan全体の初期検証はRNG、Engine呼出、Action record作成より前に行い、不正なplanはゲームを適用せず確認またはエラーにする。前のActionの正常結果により後続Actionが実行不能になった場合のみ既存の逐次的な`not_applicable`を保存し、それ以降も順に可否を評価する。
 
 ### 確定段階
 
@@ -740,6 +759,8 @@ commit後の送信直前に停止しても復旧できるよう、eventsをCampa
 | 古いworkerがlease引継ぎ後にcommitを試みる | epoch不一致で拒否 |
 | commit後に描写timeout | ダメージ維持、Action数不変、fallback |
 | 二つ目のActionが一つ目の結果で実行不能 | not_applicableを保存しTurnはcommitted |
+| 非公開または到達不能なEntityを攻撃targetにする | 初期plan検証で拒否し、RNG／Engine／Actionを作らない |
+| 初期plan中の一つでも参照・所有・Scene条件が不正 | plan全体を適用せず、先行ActionのRNG／Engine／Actionを作らない |
 | イベントINSERT時にDB例外 | Canonical／Action／Turn確定もrollback |
 | commit応答喪失後の再送 | 既存Turnを返し再ロールなし |
 

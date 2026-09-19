@@ -14,6 +14,7 @@
 | [0008](0008-runtime-defaults.md) | 実行時初期設定 |
 | [0009](0009-turn-routing.md) | Turnルーティング |
 | [0010](0010-authenticated-principal.md) | 認証済みprincipal境界 |
+| [0011](0011-scene-entity-scope.md) | Scene entityの公開範囲と攻撃到達可能性 |
 
 ## 共通方針
 

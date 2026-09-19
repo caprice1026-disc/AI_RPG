@@ -39,6 +39,7 @@ AI_RPGは、LLMにゲーム状態を直接変更させないAI TRPGバックエ�
 | Worker | 解決と描写で独立したlease／epochを持ち、stale workerの保存を拒否する |
 | 予算と復旧 | LLM呼出回数、試行回数、deadlineをDBに残し、再起動後も引き継ぐ |
 | セキュリティ | 受付時、LLM呼出前、確定直前にCampaign membershipとActor操作権を再確認する |
+| Scene scope | 公開Entityと粗い攻撃到達可能性をSceneごとに固定し、Actorの所持品はprivateに保つ |
 
 ### 現在できること
 
@@ -202,9 +203,9 @@ $env:AIRPG_DATABASE_URL = "postgresql+psycopg://airpg:airpg@localhost/airpg"
 
 Turnを投入し、返された`turn_id`をGETすると進行状態と描写を確認できます。
 
-ブラウザでは`http://127.0.0.1:8000/`を開き、Campaign IDとActor IDを入力すれば同じ一往復を試せます。開発fixtureには`hero`、`goblin`、`iron_sword`、`healing_potion`が登録されているため、「周囲を注意深く観察する」「鉄の剣でゴブリンを攻撃する」「回復ポーションを飲む」を試せます。
+ブラウザでは`http://127.0.0.1:8000/`を開き、Campaign IDとActor IDを入力すれば同じ一往復を試せます。開発fixtureは一つのSceneで`hero`を公開し、`goblin`を公開かつ攻撃到達可能として明示します。`iron_sword`と`healing_potion`はhero所有のprivate inventoryです。「周囲を注意深く観察する」「鉄の剣でゴブリンを攻撃する」「回復ポーションを飲む」を試せます。
 
-画面は`GET /campaigns/{campaign_id}/state`から正本のstate versionと最新Turnを取得し、Campaign切替、別タブ更新、reload後に状態を同期します。409時は古い行動を新versionで自動実行せず、再確認を促します。POSTの受付結果が通信断で不明な場合はrequest IDとbodyを保存し、同じ内容だけを再送します。受付済みの`turn_id`が分かっている場合はPOSTせずGET／SSE追跡を再開します。SSEへ接続できない場合はGET pollingへ切り替えます。開発用principalを指定せずAPIを起動した場合は401を表示し、認証を暗黙に迂回しません。
+画面は`GET /campaigns/{campaign_id}/state`から正本のstate versionと最新Turnを取得し、Campaign切替、別タブ更新、reload後に状態を同期します。409時は古い行動を新versionで自動実行せず、再確認を促します。turn ID発行前の確定的な4xx入力エラーではpendingを消し、修正後は新しいrequest IDで送信します。通信断・不明なPOST結果・5xx・turn ID発行後の失敗では、同じrequest IDとbodyを保持して同じ内容だけを再送します。受付済みの`turn_id`が分かっている場合はPOSTせずGET／SSE追跡を再開します。SSEが失敗またはtimeoutした場合はSSEを閉じてGET Pollingだけへ引き継ぎ、古いCampaignや世代の更新は表示しません。開発用principalを指定せずAPIを起動した場合は401を表示し、認証を暗黙に迂回しません。
 
 依存なしのブラウザ状態ロジックはNode標準runnerでも確認できます。
 
@@ -230,7 +231,7 @@ Invoke-RestMethod `
 
 `--once`を付けるとworkerは一回だけ取得を試みて終了します。processを停止・再起動しても、Turn、予算、lease、確定済み結果はPostgreSQLから引き継がれます。`--dev-principal`は開発時だけ明示的に有効化する認証差し替えです。通常起動ではbundled play screenからの未認証requestは引き続き401になりますが、事前登録済みidentityの有効なBearer requestは認証されます。
 
-解決workerへ渡す直近の公開履歴は`AIRPG_RECENT_MESSAGES_LIMIT`で0〜100件に設定でき、既定値は20です。0にすると履歴を渡しません。対象は同じCampaign・Scene・Actorの終端Turnだけで、プレイヤー入力、公開Action結果、保存済み描写を古い順に渡します。
+解決workerへ渡す直近の公開履歴は`AIRPG_RECENT_MESSAGES_LIMIT`で0〜100件に設定でき、既定値は20です。0にすると履歴を渡しません。対象は同じCampaign・Scene・Actorの終端Turnだけで、プレイヤー入力、公開Action結果、保存済み描写を古い順に渡します。プレイヤー入力はuntrusted、Action結果とGM履歴はderived dataであり、履歴中の命令はworkerへの指示になりません。
 
 ### OpenAI adapterを使う
 
