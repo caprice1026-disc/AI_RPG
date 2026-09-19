@@ -287,6 +287,8 @@
     let busy = false;
     let stateVersion = null;
     let stateCampaignId = null;
+    let trackingGeneration = 0;
+    let cancelTracking = null;
     const renderedTurns = new Set();
     localStorage.removeItem("ai-rpg-state-version");
     ui["campaign-id"].value = localStorage.getItem("ai-rpg-campaign") || "";
@@ -470,53 +472,102 @@
       return state;
     }
 
-    async function pollTurn(campaignId, turnId) {
+    async function pollTurn(campaignId, turnId, active, setTimer) {
       while (true) {
+        if (!active()) return null;
         const turn = await api(`/campaigns/${encodeURIComponent(campaignId)}/turns/${encodeURIComponent(turnId)}`);
+        if (!active()) return null;
         observeTurn(campaignId, turn);
         if (terminal(turn)) return turn;
-        await new Promise(resolve => setTimeout(resolve, 750));
+        await new Promise(resolve => {
+          const timer = setTimeout(() => {
+            setTimer(null, null);
+            resolve();
+          }, 750);
+          setTimer(timer, resolve);
+        });
       }
     }
 
     function waitForTurn(campaignId, turnId) {
-      if (!("EventSource" in window)) return pollTurn(campaignId, turnId);
+      const generation = ++trackingGeneration;
+      cancelTracking?.();
+      const active = () => generation === trackingGeneration;
       return new Promise((resolve, reject) => {
         let settled = false;
         let polling = false;
-        const events = new EventSource(`/campaigns/${encodeURIComponent(campaignId)}/events`);
-        const fallbackTimer = setTimeout(startPolling, 1500);
+        let sseActive = false;
+        let events = null;
+        let timer = null;
+        let resumeTimer = null;
 
-        function finish(turn) {
+        function setTimer(nextTimer, nextResume) {
+          timer = nextTimer;
+          resumeTimer = nextResume;
+        }
+
+        function clearTimer() {
+          if (timer !== null) clearTimeout(timer);
+          timer = null;
+          const resume = resumeTimer;
+          resumeTimer = null;
+          resume?.();
+        }
+
+        function settle(turn, error) {
           if (settled) return;
           settled = true;
-          clearTimeout(fallbackTimer);
-          events.close();
-          resolve(turn);
+          if (active()) trackingGeneration += 1;
+          sseActive = false;
+          clearTimer();
+          events?.close();
+          events = null;
+          if (cancelTracking === cancel) cancelTracking = null;
+          if (error) reject(error); else resolve(turn);
         }
 
-        async function startPolling() {
-          if (settled || polling) return;
+        function cancel() {
+          settle(null);
+        }
+
+        function startPolling() {
+          if (!active() || settled || polling) return;
           polling = true;
+          clearTimer();
+          sseActive = false;
+          events?.close();
+          events = null;
           ui["connection-label"].textContent = "Pollingで追跡";
-          try {
-            finish(await pollTurn(campaignId, turnId));
-          } catch (error) {
-            if (!settled) reject(error);
-          }
+          pollTurn(campaignId, turnId, active, setTimer).then(
+            turn => settle(turn),
+            error => settle(null, error)
+          );
         }
 
+        cancelTracking = cancel;
+        if (!("EventSource" in window)) {
+          startPolling();
+          return;
+        }
+        sseActive = true;
+        events = new EventSource(`/campaigns/${encodeURIComponent(campaignId)}/events`);
+        setTimer(setTimeout(startPolling, 1500), null);
         events.addEventListener("turn.updated", event => {
+          if (!active() || !sseActive) return;
           try {
             const turn = JSON.parse(event.data).payload?.turn;
             if (!turn || turn.turn_id !== turnId) return;
             observeTurn(campaignId, turn);
-            if (terminal(turn)) finish(turn);
+            if (terminal(turn)) settle(turn);
           } catch (_) { /* malformed public event is ignored; polling remains available */ }
         });
-        events.onopen = () => { ui["connection-label"].textContent = "SSE接続済み"; };
+        events.onopen = () => {
+          if (!active() || !sseActive) return;
+          clearTimer();
+          ui["connection-label"].textContent = "SSE接続済み";
+        };
         events.onerror = () => {
-          events.close();
+          if (!active() || !sseActive) return;
           startPolling();
         };
       });

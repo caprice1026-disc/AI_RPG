@@ -87,7 +87,60 @@ function response(body, status = 200) {
   return { ok: status >= 200 && status < 300, status, async json() { return body; } };
 }
 
-function harness(fetch, ids = ["request-1"], initialPending = null) {
+function pendingTurn(turnId) {
+  return {
+    ...terminalTurn(turnId, 0),
+    resolution_status: "resolving",
+    narration_status: "generating",
+    narration: null,
+  };
+}
+
+function eventSourceTracker() {
+  const instances = [];
+  class EventSource {
+    constructor(url) {
+      this.url = url;
+      this.listeners = {};
+      this.closed = 0;
+      instances.push(this);
+    }
+    addEventListener(type, listener) { this.listeners[type] = listener; }
+    close() { this.closed += 1; }
+    emit(type, turn) {
+      if (type === "open") return this.onopen?.();
+      if (type === "error") return this.onerror?.();
+      return this.listeners[type]?.({ data: JSON.stringify({ payload: { turn } }) });
+    }
+  }
+  return { EventSource, instances };
+}
+
+function timerTracker() {
+  const callbacks = new Map();
+  let nextId = 0;
+  return {
+    setTimeout(callback) {
+      const id = ++nextId;
+      callbacks.set(id, callback);
+      return id;
+    },
+    clearTimeout(id) { callbacks.delete(id); },
+    async runAll() {
+      for (const [id, callback] of [...callbacks]) {
+        callbacks.delete(id);
+        await callback();
+      }
+    },
+  };
+}
+
+function harness(fetch, ids = ["request-1"], initialPending = null, options = {}) {
+  const {
+    EventSource,
+    setTimeout: schedule = setTimeout,
+    clearTimeout: cancel = clearTimeout,
+  } = options;
   const elementIds = [
     "campaign-id", "actor-id", "action-text", "send-action", "composer", "timeline",
     "empty-state", "connection", "connection-label", "route-value", "resolution-value",
@@ -119,14 +172,15 @@ function harness(fetch, ids = ["request-1"], initialPending = null) {
     localStorage: storage,
     crypto: { randomUUID() { return uuidValues.shift(); } },
     fetch,
-    window: {},
+    window: EventSource ? { EventSource } : {},
+    EventSource,
     console,
-    setTimeout,
-    clearTimeout,
+    setTimeout: schedule,
+    clearTimeout: cancel,
     Error,
   });
   new vm.Script(inlineScript).runInContext(context);
-  return { elements, storage };
+  return { context, elements, storage };
 }
 
 async function flush() {
@@ -318,4 +372,79 @@ test("reload tracks an accepted turn by GET without another POST", async () => {
   assert.ok(calls.some(([path]) => path.endsWith("/turns/turn-known")));
   assert.equal(calls.filter(([, method]) => method === "POST").length, 0);
   assert.equal(AiRpgPending.load(app.storage), null);
+});
+
+test("healthy SSE does not start polling", async () => {
+  const calls = [];
+  const events = eventSourceTracker();
+  const timers = timerTracker();
+  const app = harness(async (path, options = {}) => {
+    calls.push([path, options.method ?? "GET"]);
+    if (path === "/health") return response({ status: "ok" });
+    if (path.endsWith("/state")) return response({ state_version: 0, latest_turn: null });
+    if (options.method === "POST") return response(pendingTurn("turn-1"), 202);
+    if (path.endsWith("/turns/turn-1")) return response(terminalTurn("turn-1", 0));
+    throw new Error(`unexpected request: ${path}`);
+  }, ["request-1"], null, { ...events, ...timers });
+  app.elements["campaign-id"].value = "campaign-a";
+  app.elements["actor-id"].value = "actor-a";
+  app.elements["action-text"].value = "進む";
+
+  await app.elements.composer.dispatch("submit", { preventDefault() {} });
+  await flush();
+  events.instances[0].emit("open");
+  await timers.runAll();
+  await flush();
+
+  assert.equal(calls.filter(([path]) => path.endsWith("/turns/turn-1")).length, 0);
+});
+
+test("poll failure closes SSE and stale events cannot update status", async () => {
+  const events = eventSourceTracker();
+  const timers = timerTracker();
+  const app = harness(async (path, options = {}) => {
+    if (path === "/health") return response({ status: "ok" });
+    if (path.endsWith("/state")) return response({ state_version: 0, latest_turn: null });
+    if (options.method === "POST") return response(pendingTurn("turn-1"), 202);
+    if (path.endsWith("/turns/turn-1")) throw new Error("poll failed");
+    throw new Error(`unexpected request: ${path}`);
+  }, ["request-1"], null, { ...events, ...timers });
+  app.elements["campaign-id"].value = "campaign-a";
+  app.elements["actor-id"].value = "actor-a";
+  app.elements["action-text"].value = "進む";
+
+  await app.elements.composer.dispatch("submit", { preventDefault() {} });
+  await flush();
+  events.instances[0].emit("error");
+  await flush();
+  assert.equal(events.instances[0].closed, 1);
+
+  app.elements["turn-value"].textContent = "newer-turn";
+  events.instances[0].emit("turn.updated", pendingTurn("turn-1"));
+  await flush();
+
+  assert.equal(app.elements["turn-value"].textContent, "newer-turn");
+});
+
+test("late polling response from an old generation is ignored", async () => {
+  const events = eventSourceTracker();
+  let resolveOldPoll;
+  const oldPoll = new Promise(resolve => { resolveOldPoll = resolve; });
+  const app = harness(async path => {
+    if (path === "/health") return response({ status: "ok" });
+    if (path.endsWith("/turns/turn-old")) return oldPoll;
+    throw new Error(`unexpected request: ${path}`);
+  }, [], null, events);
+  app.elements["campaign-id"].value = "campaign-a";
+
+  const oldTracking = app.context.waitForTurn("campaign-a", "turn-old");
+  events.instances[0].emit("error");
+  await flush();
+  const newTracking = app.context.waitForTurn("campaign-a", "turn-new");
+  events.instances[1].emit("turn.updated", terminalTurn("turn-new", 0));
+  await newTracking;
+
+  resolveOldPoll(response(terminalTurn("turn-old", 0)));
+  await oldTracking;
+  assert.equal(app.elements["turn-value"].textContent, "turn-new");
 });
