@@ -382,20 +382,19 @@
       stateVersion = null;
     }
 
-    function updateStatus(turn) {
+    function updateStatus(campaignId, turn) {
+      if (ui["campaign-id"].value.trim() !== campaignId) return false;
       ui["route-value"].textContent = labels[turn.route] || "—";
       ui["resolution-value"].textContent = labels[turn.resolution_status] || turn.resolution_status;
       ui["narration-value"].textContent = labels[turn.narration_status] || turn.narration_status;
       ui["turn-value"].textContent = turn.turn_id;
-      if (turn.committed_state_version !== null) {
-        setStateVersion(ui["campaign-id"].value.trim(), turn.committed_state_version);
-      }
       if (turn.recovery?.fallback) {
         ui.recovery.hidden = false;
         ui.recovery.textContent = `自動復旧: ${turn.recovery.reason}`;
       } else {
         ui.recovery.hidden = true;
       }
+      return true;
     }
 
     function renderCompleted(turn) {
@@ -441,8 +440,8 @@
         ["committed", "not_applied", "failed"].includes(turn.resolution_status);
     }
 
-    function observeTurn(turn) {
-      updateStatus(turn);
+    function observeTurn(campaignId, turn) {
+      updateStatus(campaignId, turn);
       const pendingText = document.querySelector('[data-role="processing"] .pending span:last-child');
       if (pendingText) pendingText.textContent = turn.resolution_status === "committed" ? "描写を生成しています…" : "判定を処理しています…";
     }
@@ -465,7 +464,7 @@
       if (ui["campaign-id"].value.trim() !== campaignId) return state;
       setStateVersion(campaignId, state.state_version);
       if (state.latest_turn) {
-        updateStatus(state.latest_turn);
+        updateStatus(campaignId, state.latest_turn);
         if (resume) await resumeTurn(campaignId, state.latest_turn);
       }
       return state;
@@ -474,7 +473,7 @@
     async function pollTurn(campaignId, turnId) {
       while (true) {
         const turn = await api(`/campaigns/${encodeURIComponent(campaignId)}/turns/${encodeURIComponent(turnId)}`);
-        observeTurn(turn);
+        observeTurn(campaignId, turn);
         if (terminal(turn)) return turn;
         await new Promise(resolve => setTimeout(resolve, 750));
       }
@@ -511,7 +510,7 @@
           try {
             const turn = JSON.parse(event.data).payload?.turn;
             if (!turn || turn.turn_id !== turnId) return;
-            observeTurn(turn);
+            observeTurn(campaignId, turn);
             if (terminal(turn)) finish(turn);
           } catch (_) { /* malformed public event is ignored; polling remains available */ }
         });
@@ -527,7 +526,7 @@
       setBusy(true);
       processingMessage();
       try {
-        observeTurn(turn);
+        observeTurn(campaignId, turn);
         const completed = terminal(turn) ? turn : await waitForTurn(campaignId, turn.turn_id);
         renderCompleted(completed);
       } catch (error) {
@@ -558,13 +557,15 @@
           pending = { ...pending, turnId: accepted.turn_id };
           AiRpgPending.save(localStorage, pending);
         }
-        updateStatus(accepted);
+        updateStatus(pending.campaignId, accepted);
         const completed = terminal(accepted) ? accepted : await waitForTurn(pending.campaignId, accepted.turn_id);
         renderCompleted(completed);
         AiRpgPending.clear(localStorage);
         if (pending.body.content.kind === "text") ui["action-text"].value = "";
       } catch (error) {
         document.querySelector('[data-role="processing"]')?.remove();
+        const rejected = !pending.turnId && error?.status >= 400 && error.status < 500;
+        if (rejected) AiRpgPending.clear(localStorage);
         if (["STATE_VERSION_CONFLICT", "TURN_IN_PROGRESS", "CHOICE_NOT_AVAILABLE", "IDEMPOTENCY_CONFLICT"].includes(error?.code)) {
           AiRpgPending.clear(localStorage);
           try { await refreshCampaignState(pending.campaignId, { resume: error.code === "TURN_IN_PROGRESS" }); } catch (_) { /* original error remains primary */ }

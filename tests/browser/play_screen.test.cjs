@@ -164,6 +164,96 @@ test("response loss retries the exact same request id and body", async () => {
   assert.equal(AiRpgPending.load(app.storage), null);
 });
 
+test("422 clears pending and corrected input uses a new request id", async () => {
+  const posts = [];
+  const app = harness(async (path, options = {}) => {
+    if (path === "/health") return response({ status: "ok" });
+    if (path.endsWith("/state")) return response({ state_version: 0, latest_turn: null });
+    if (options.method === "POST") {
+      posts.push(JSON.parse(options.body));
+      if (posts.length === 1) return response({ detail: { code: "UNKNOWN" } }, 422);
+      return response(terminalTurn("turn-2", 0), 202);
+    }
+    throw new Error(`unexpected request: ${path}`);
+  }, ["request-1", "request-2"]);
+  app.elements["campaign-id"].value = "campaign-a";
+  app.elements["actor-id"].value = "actor-a";
+  app.elements["action-text"].value = "進む";
+
+  await app.elements.composer.dispatch("submit", { preventDefault() {} });
+  await flush();
+  assert.equal(AiRpgPending.load(app.storage), null);
+
+  app.elements["action-text"].value = "引き返す";
+  await app.elements.composer.dispatch("submit", { preventDefault() {} });
+  await flush();
+
+  assert.equal(posts.length, 2);
+  assert.equal(posts[1].request_id, "request-2");
+  assert.equal(posts[1].content.text, "引き返す");
+});
+
+test("latest turn version never overwrites current campaign version", async () => {
+  const posts = [];
+  const app = harness(async (path, options = {}) => {
+    if (path === "/health") return response({ status: "ok" });
+    if (path.endsWith("/state")) {
+      return response({ state_version: 2, latest_turn: terminalTurn("turn-before", 1) });
+    }
+    if (options.method === "POST") {
+      posts.push(JSON.parse(options.body));
+      return response(terminalTurn("turn-2", 2), 202);
+    }
+    throw new Error(`unexpected request: ${path}`);
+  }, ["request-2"]);
+  app.elements["campaign-id"].value = "campaign-a";
+  await app.elements["campaign-id"].dispatch("change");
+  app.elements["actor-id"].value = "actor-a";
+  app.elements["action-text"].value = "進む";
+
+  await app.elements.composer.dispatch("submit", { preventDefault() {} });
+  await flush();
+
+  assert.equal(posts.length, 1);
+  assert.equal(posts[0].expected_state_version, 2);
+  assert.equal(app.elements["version-value"].textContent, "2");
+});
+
+test("state conflict refreshes version without replaying the rejected action", async () => {
+  const posts = [];
+  let stateVersion = 2;
+  const app = harness(async (path, options = {}) => {
+    if (path === "/health") return response({ status: "ok" });
+    if (path.endsWith("/state")) return response({ state_version: stateVersion, latest_turn: null });
+    if (options.method === "POST") {
+      posts.push(JSON.parse(options.body));
+      if (posts.length === 1) {
+        stateVersion = 3;
+        return response({ detail: { code: "STATE_VERSION_CONFLICT" } }, 409);
+      }
+      return response(terminalTurn("turn-2", 3), 202);
+    }
+    throw new Error(`unexpected request: ${path}`);
+  }, ["request-1", "request-2"]);
+  app.elements["campaign-id"].value = "campaign-a";
+  app.elements["actor-id"].value = "actor-a";
+  app.elements["action-text"].value = "進む";
+
+  await app.elements.composer.dispatch("submit", { preventDefault() {} });
+  await flush();
+
+  assert.equal(posts.length, 1);
+  assert.equal(AiRpgPending.load(app.storage), null);
+  assert.equal(app.elements["version-value"].textContent, "3");
+
+  await app.elements.composer.dispatch("submit", { preventDefault() {} });
+  await flush();
+
+  assert.equal(posts.length, 2);
+  assert.equal(posts[1].expected_state_version, 3);
+  assert.equal(posts[1].request_id, "request-2");
+});
+
 test("campaign switch reads its own version and stale action is not auto-submitted", async () => {
   const posts = [];
   let campaignBVersion = 0;
