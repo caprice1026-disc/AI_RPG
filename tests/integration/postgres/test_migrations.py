@@ -862,6 +862,7 @@ def test_empty_database_upgrades_and_downgrades(empty_database_url: str) -> None
             "events",
             "mvp_inventory",
             "mvp_scene_skill_checks",
+            "mvp_scene_entities",
             "principals",
             "principal_identities",
         } <= _public_tables(engine)
@@ -873,6 +874,112 @@ def test_empty_database_upgrades_and_downgrades(empty_database_url: str) -> None
     try:
         assert _public_tables(engine) == {"alembic_version"}
         assert _public_functions(engine) == set()
+    finally:
+        engine.dispose()
+
+
+@pytest.mark.parametrize(
+    ("campaign", "scene", "entity", "public", "reachable", "sqlstate"),
+    [
+        (CAMPAIGN_A, SCENE_A, ACTOR_A, True, False, None),
+        (CAMPAIGN_A, SCENE_A, ACTOR_A, True, True, None),
+        (CAMPAIGN_A, SCENE_A, ACTOR_A, False, False, None),
+        (CAMPAIGN_A, SCENE_A, ACTOR_A, False, True, "23514"),
+        (CAMPAIGN_A, SCENE_A, ACTOR_B, True, False, "23503"),
+        (CAMPAIGN_B, SCENE_A, ACTOR_B, True, False, "23503"),
+        (CAMPAIGN_A, SCENE_A, ACTOR_A, None, False, "23502"),
+        (CAMPAIGN_A, SCENE_A, ACTOR_A, True, None, "23502"),
+    ],
+)
+def test_scene_entity_constraints(
+    database: Engine,
+    campaign: str,
+    scene: str,
+    entity: str,
+    public: bool | None,
+    reachable: bool | None,
+    sqlstate: str | None,
+) -> None:
+    assert "mvp_scene_entities" in _public_tables(database)
+    with database.begin() as connection:
+        _seed_members_entities_and_scene(connection)
+    statement = text(
+        "INSERT INTO mvp_scene_entities "
+        "(campaign_id,scene_id,entity_id,is_public,is_attack_reachable) "
+        "VALUES (:campaign,:scene,:entity,:public,:reachable)"
+    )
+    parameters = {
+        "campaign": campaign, "scene": scene, "entity": entity,
+        "public": public, "reachable": reachable,
+    }
+    if sqlstate is None:
+        with database.begin() as connection:
+            connection.execute(statement, parameters)
+            assert connection.execute(
+                text("SELECT is_public,is_attack_reachable FROM mvp_scene_entities")
+            ).one() == (public, reachable)
+    else:
+        with pytest.raises(IntegrityError) as error, database.begin() as connection:
+            connection.execute(statement, parameters)
+        _assert_sqlstate(error.value, sqlstate)
+        if sqlstate == "23514":
+            assert error.value.orig.diag.constraint_name == "scene_entity_reachable_is_public"
+
+
+def test_scene_entity_defaults_and_composite_primary_key(database: Engine) -> None:
+    assert "mvp_scene_entities" in _public_tables(database)
+    statement = text(
+        "INSERT INTO mvp_scene_entities(campaign_id,scene_id,entity_id) "
+        "VALUES (:campaign,:scene,:entity)"
+    )
+    parameters = {"campaign": CAMPAIGN_A, "scene": SCENE_A, "entity": ACTOR_A}
+    with database.begin() as connection:
+        _seed_members_entities_and_scene(connection)
+        connection.execute(statement, parameters)
+        assert connection.execute(
+            text("SELECT is_public,is_attack_reachable FROM mvp_scene_entities")
+        ).one() == (True, False)
+        connection.execute(
+            text(
+                "INSERT INTO scenes(id,campaign_id,sequence,status) "
+                "VALUES (:scene,:campaign,2,'planned')"
+            ),
+            {"scene": SCENE_B, "campaign": CAMPAIGN_A},
+        )
+        connection.execute(statement, {**parameters, "scene": SCENE_B})
+    with pytest.raises(IntegrityError) as error, database.begin() as connection:
+        connection.execute(statement, parameters)
+    _assert_sqlstate(error.value, "23505")
+
+
+def test_scene_entity_upgrade_has_no_backfill_and_rollback_preserves_data(
+    empty_database_url: str,
+) -> None:
+    _run_alembic(empty_database_url, "upgrade", "0007_oidc_identities")
+    engine = create_engine(empty_database_url)
+    try:
+        with engine.begin() as connection:
+            _seed_members_entities_and_scene(connection)
+        original_tables = _public_tables(engine)
+        _run_alembic(empty_database_url, "upgrade", "head")
+        assert _public_tables(engine) == original_tables | {"mvp_scene_entities"}
+        with engine.begin() as connection:
+            assert connection.scalar(text("SELECT count(*) FROM mvp_scene_entities")) == 0
+            connection.execute(
+                text(
+                    "INSERT INTO mvp_scene_entities(campaign_id,scene_id,entity_id) "
+                    "VALUES (:campaign,:scene,:entity)"
+                ),
+                {"campaign": CAMPAIGN_A, "scene": SCENE_A, "entity": ACTOR_A},
+            )
+        _run_alembic(empty_database_url, "downgrade", "0007_oidc_identities")
+        assert _public_tables(engine) == original_tables
+        with engine.connect() as connection:
+            assert connection.scalar(text("SELECT count(*) FROM entities")) == 2
+            assert connection.scalar(text("SELECT count(*) FROM scenes")) == 1
+        _run_alembic(empty_database_url, "upgrade", "head")
+        with engine.connect() as connection:
+            assert connection.scalar(text("SELECT count(*) FROM mvp_scene_entities")) == 0
     finally:
         engine.dispose()
 
@@ -1648,6 +1755,64 @@ def test_resolution_lease_attempts_share_a_fixed_deadline(database: Engine) -> N
         ) == 2
 
 
+@pytest.mark.parametrize(
+    ("campaign", "scene", "flags"),
+    [
+        (CAMPAIGN_A, SCENE_A, (True, True)),
+        (CAMPAIGN_A, SCENE_B, (False, False)),
+        (CAMPAIGN_B, SCENE_A, None),
+        (CAMPAIGN_A, str(UUID(int=999)), None),
+    ],
+)
+def test_canonical_snapshot_scene_entities_filter_campaign_and_scene(
+    database: Engine,
+    campaign: str,
+    scene: str,
+    flags: tuple[bool, bool] | None,
+) -> None:
+    with database.begin() as connection:
+        _seed_members_entities_and_scene(connection)
+        connection.execute(
+            text(
+                "INSERT INTO scenes(id,campaign_id,sequence,status) "
+                "VALUES (:scene,:campaign,2,'planned')"
+            ),
+            {"scene": SCENE_B, "campaign": CAMPAIGN_A},
+        )
+        connection.execute(
+            text(
+                "INSERT INTO mvp_scene_entities "
+                "(campaign_id,scene_id,entity_id,is_public,is_attack_reachable) "
+                "VALUES (:campaign,:scene_a,:actor,true,true),"
+                "(:campaign,:scene_b,:actor,false,false)"
+            ),
+            {
+                "campaign": CAMPAIGN_A, "scene_a": SCENE_A,
+                "scene_b": SCENE_B, "actor": ACTOR_A,
+            },
+        )
+
+    async def read() -> CanonicalSnapshot:
+        url = database.url.render_as_string(hide_password=False)
+        async with _postgres_sessions(url) as factory, factory() as session:
+            return await PostgresCanonicalRepository(session).snapshot(
+                UUID(campaign), UUID(scene)
+            )
+
+    with asyncio.Runner(loop_factory=asyncio.SelectorEventLoop) as runner:
+        snapshot = runner.run(read())
+    if flags is None:
+        assert snapshot.scene_entities == ()
+    else:
+        assert snapshot.scene_entities == ({
+            "campaign_id": UUID(campaign),
+            "scene_id": UUID(scene),
+            "entity_id": UUID(ACTOR_A),
+            "is_public": flags[0],
+            "is_attack_reachable": flags[1],
+        },)
+
+
 def test_canonical_snapshot_locks_campaign_before_typed_reads(database: Engine) -> None:
     with database.begin() as connection:
         _seed_resolution_state(connection)
@@ -1681,7 +1846,9 @@ def test_canonical_snapshot_locks_campaign_before_typed_reads(database: Engine) 
         try:
             factory = async_sessionmaker(engine, expire_on_commit=False)
             async with factory() as session:
-                value = await PostgresCanonicalRepository(session).snapshot(UUID(CAMPAIGN_A))
+                value = await PostgresCanonicalRepository(session).snapshot(
+                    UUID(CAMPAIGN_A), UUID(SCENE_A)
+                )
                 await session.commit()
                 return value, statements
         finally:
@@ -1705,6 +1872,7 @@ def test_canonical_snapshot_locks_campaign_before_typed_reads(database: Engine) 
     assert "from campaigns" in statements[0]
     assert "for update" in statements[0]
     assert any("from mvp_characters" in statement for statement in statements[1:])
+    assert any("from mvp_scene_entities" in statement for statement in statements[1:])
 
 
 def test_canonical_snapshot_waits_for_campaign_update_and_reads_one_version(
@@ -1737,7 +1905,7 @@ def test_canonical_snapshot_waits_for_campaign_update_and_reads_one_version(
                 factory = async_sessionmaker(engine, expire_on_commit=False)
                 async with factory() as session:
                     value = await PostgresCanonicalRepository(session).snapshot(
-                        UUID(CAMPAIGN_A)
+                        UUID(CAMPAIGN_A), UUID(SCENE_A)
                     )
                     await session.commit()
                     return value
@@ -5775,6 +5943,17 @@ def test_development_fixture_is_idempotent(database: Engine) -> None:
 
     assert second == first
     with database.connect() as connection:
+        assert set(
+            connection.execute(
+                text(
+                    "SELECT campaign_id,scene_id,entity_id,is_public,is_attack_reachable "
+                    "FROM mvp_scene_entities"
+                )
+            )
+        ) == {
+            (first.campaign_id, first.scene_id, first.actor_id, True, False),
+            (first.campaign_id, first.scene_id, first.target_id, True, True),
+        }
         assert connection.scalar(
             text("SELECT count(*) FROM campaigns WHERE id=:id"),
             {"id": first.campaign_id},

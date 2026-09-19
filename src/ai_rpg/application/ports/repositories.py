@@ -125,6 +125,7 @@ class CanonicalSnapshot:
     inventory: tuple[Mapping[str, object], ...]
     skill_checks: tuple[Mapping[str, object], ...]
     entities: tuple[Mapping[str, object], ...]
+    scene_entities: tuple[Mapping[str, object], ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -233,7 +234,7 @@ class TurnRepository(Protocol):
 
 
 class CanonicalRepository(Protocol):
-    async def snapshot(self, campaign_id: UUID) -> CanonicalSnapshot: ...
+    async def snapshot(self, campaign_id: UUID, scene_id: UUID) -> CanonicalSnapshot: ...
 
     async def update_with_campaign_lock(
         self, campaign_id: UUID, update: Callable[[], object]

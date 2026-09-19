@@ -176,7 +176,9 @@ class SkillCheckResolutionWorker:
             return False
 
         async with self._unit_of_work_factory() as unit_of_work:
-            snapshot = await unit_of_work.canonical.snapshot(lease.turn.campaign_id)
+            snapshot = await unit_of_work.canonical.snapshot(
+                lease.turn.campaign_id, lease.turn.scene_id
+            )
             work = await unit_of_work.turns.get_resolution_work(
                 lease.turn.id,
                 lease.turn.worker_epoch,

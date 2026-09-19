@@ -69,6 +69,7 @@ from ai_rpg.infrastructure.postgres.models import (
     EventModel,
     MvpCharacterModel,
     MvpInventoryModel,
+    MvpSceneEntityModel,
     MvpSceneSkillCheckModel,
     MvpSkillModifierModel,
     MvpWeaponModel,
@@ -1265,7 +1266,7 @@ class PostgresCanonicalRepository:
     def __init__(self, session: AsyncSession) -> None:
         self._session = session
 
-    async def snapshot(self, campaign_id: UUID) -> CanonicalSnapshot:
+    async def snapshot(self, campaign_id: UUID, scene_id: UUID) -> CanonicalSnapshot:
         # 呼出側はこの短い読取transactionを終了してからLLMへ進む。
         campaign = (
             await self._session.execute(
@@ -1281,6 +1282,13 @@ class PostgresCanonicalRepository:
             )
             return tuple(dict(row) for row in result.mappings())
 
+        scene_entities = await self._session.execute(
+            select(MvpSceneEntityModel.__table__).where(
+                MvpSceneEntityModel.campaign_id == campaign_id,
+                MvpSceneEntityModel.scene_id == scene_id,
+            )
+        )
+
         return CanonicalSnapshot(
             campaign_id,
             int(campaign[0]),
@@ -1290,6 +1298,7 @@ class PostgresCanonicalRepository:
             await rows(MvpInventoryModel.__table__),
             await rows(MvpSceneSkillCheckModel.__table__),
             await rows(EntityModel.__table__),
+            scene_entities=tuple(dict(row) for row in scene_entities.mappings()),
         )
 
     async def update_with_campaign_lock(

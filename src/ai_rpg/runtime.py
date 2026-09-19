@@ -127,6 +127,21 @@ def seed_development_fixture(database_url: str) -> DevelopmentFixture:
             )
             connection.execute(
                 text(
+                    "INSERT INTO mvp_scene_entities("
+                    "campaign_id,scene_id,entity_id,is_public,is_attack_reachable"
+                    ") VALUES(:campaign,:scene,:actor,true,false),"
+                    "(:campaign,:scene,:target,true,true) "
+                    "ON CONFLICT (campaign_id,scene_id,entity_id) DO NOTHING"
+                ),
+                {
+                    "campaign": fixture.campaign_id,
+                    "scene": fixture.scene_id,
+                    "actor": fixture.actor_id,
+                    "target": fixture.target_id,
+                },
+            )
+            connection.execute(
+                text(
                     "INSERT INTO mvp_characters("
                     "campaign_id,entity_id,current_hp,max_hp,defense,attack_bonus"
                     ") VALUES(:campaign,:actor,6,10,12,2),"

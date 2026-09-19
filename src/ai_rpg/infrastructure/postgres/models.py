@@ -533,6 +533,33 @@ class MvpInventoryModel(Base):
     )
 
 
+class MvpSceneEntityModel(Base):
+    __tablename__ = "mvp_scene_entities"
+
+    campaign_id: Mapped[UUID] = mapped_column(PG_UUID(as_uuid=True), primary_key=True)
+    scene_id: Mapped[UUID] = mapped_column(PG_UUID(as_uuid=True), primary_key=True)
+    entity_id: Mapped[UUID] = mapped_column(PG_UUID(as_uuid=True), primary_key=True)
+    is_public: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, server_default=text("true")
+    )
+    is_attack_reachable: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, server_default=text("false")
+    )
+
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["campaign_id", "scene_id"], ["scenes.campaign_id", "scenes.id"]
+        ),
+        ForeignKeyConstraint(
+            ["campaign_id", "entity_id"], ["entities.campaign_id", "entities.id"]
+        ),
+        CheckConstraint(
+            "NOT is_attack_reachable OR is_public",
+            name="scene_entity_reachable_is_public",
+        ),
+    )
+
+
 class MvpSceneSkillCheckModel(Base):
     __tablename__ = "mvp_scene_skill_checks"
 
