@@ -2,7 +2,7 @@
 
 import asyncio
 import json
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from typing import Literal
 from uuid import UUID, uuid4
@@ -425,7 +425,7 @@ class SkillCheckResolutionWorker:
             committed_state_version=snapshot.state_version + int(state_changed),
             resolved_actions=resolved,
             public_state_after=public_state,
-            allowed_entity_refs=self._allowed_entity_refs(snapshot),
+            allowed_entity_refs=self._allowed_entity_refs(work, snapshot),
             output_limits=OutputLimits(max_actions=work.max_actions, max_choices=5),
         )
         bundle = CommitBundle(
@@ -486,7 +486,7 @@ class SkillCheckResolutionWorker:
             scene_view=scene_view,
             pc_view=pc_view,
             recent_messages=self._recent_context(work),
-            allowed_entity_refs=self._allowed_entity_refs(snapshot),
+            allowed_entity_refs=self._allowed_entity_refs(work, snapshot),
             output_limits=OutputLimits(max_actions=work.max_actions, max_choices=5),
         )
 
@@ -502,7 +502,7 @@ class SkillCheckResolutionWorker:
             }
         )
         supported_actions: list[Literal["attack", "skill_check", "use_item"]] = []
-        if any(row["entity_id"] != work.actor_id for row in snapshot.characters):
+        if self._attackable_entity_ids(work, snapshot):
             supported_actions.append("attack")
         if supported_skills:
             supported_actions.append("skill_check")
@@ -517,14 +517,45 @@ class SkillCheckResolutionWorker:
             scene_view=scene_view,
             pc_view=pc_view,
             recent_messages=self._recent_context(work),
-            allowed_entity_refs=self._allowed_entity_refs(snapshot),
+            allowed_entity_refs=self._allowed_entity_refs(work, snapshot),
             output_limits=OutputLimits(max_actions=work.max_actions, max_choices=5),
             supported_action_types=supported_actions,
             supported_skill_refs=supported_skills,
         )
 
     @staticmethod
-    def _allowed_entity_refs(snapshot: CanonicalSnapshot) -> list[EntityRef]:
+    def _visible_entity_ids(work: ResolutionWorkItem, snapshot: CanonicalSnapshot) -> set[UUID]:
+        scene_public = {
+            UUID(str(row["entity_id"]))
+            for row in snapshot.scene_entities
+            if bool(row["is_public"])
+        }
+        owned = {
+            UUID(str(row["item_id"]))
+            for row in snapshot.inventory
+            if UUID(str(row["owner_id"])) == work.actor_id
+        }
+        return scene_public | owned | {work.actor_id}
+
+    @staticmethod
+    def _attackable_entity_ids(work: ResolutionWorkItem, snapshot: CanonicalSnapshot) -> set[UUID]:
+        reachable = {
+            UUID(str(row["entity_id"]))
+            for row in snapshot.scene_entities
+            if bool(row["is_public"]) and bool(row["is_attack_reachable"])
+        }
+        characters = {UUID(str(row["entity_id"])) for row in snapshot.characters}
+        active_refs = {
+            UUID(str(row["id"]))
+            for row in snapshot.entities
+            if row["ref"] is not None and row["archived_at"] is None
+        }
+        return (reachable & characters & active_refs) - {work.actor_id}
+
+    def _allowed_entity_refs(
+        self, work: ResolutionWorkItem, snapshot: CanonicalSnapshot
+    ) -> list[EntityRef]:
+        visible = self._visible_entity_ids(work, snapshot)
         refs = [
             EntityRef.model_validate(
                 {
@@ -537,6 +568,7 @@ class SkillCheckResolutionWorker:
             if row["ref"] is not None
             and row["label"] is not None
             and row["archived_at"] is None
+            and UUID(str(row["id"])) in visible
         ]
         return sorted(refs, key=lambda entity: entity.ref)
 
@@ -677,14 +709,11 @@ class SkillCheckResolutionWorker:
             raise ResolutionInputError("actorのCanonical状態が存在しません")
         if actor.current_hp == 0:
             raise ResolutionInputError("行動不能なactorです")
-        initial_hp = {
-            entity_id: character.current_hp for entity_id, character in characters.items()
-        }
-
+        allowed_refs = {entity.ref for entity in self._allowed_entity_refs(work, snapshot)}
         ref_rows = {
             str(row["ref"]): UUID(str(row["id"]))
             for row in snapshot.entities
-            if row["ref"] is not None and row["archived_at"] is None
+            if row["ref"] in allowed_refs
         }
         refs = EntityRefMap(ref_rows)
         id_to_ref = {entity_id: ref for ref, entity_id in ref_rows.items()}
@@ -714,16 +743,10 @@ class SkillCheckResolutionWorker:
                 attack_bonus=character.attack_bonus,
             )
 
-        records: list[ActionRecord] = []
-        resolved: list[ResolvedAction] = []
-        public_state: list[ContextFragment] = []
-        draw_index = 0
-        for ordinal, raw_intent in enumerate(intents, start=1):
-            actor = characters[work.actor_id]
-            command: AttackCommand | SkillCheckCommand | UseItemCommand
-            result: AppliedResult | NotApplicableResult
-            check: object | None = None
-
+        # Validate the entire plan against the initial snapshot before any Engine call.
+        attackable = self._attackable_entity_ids(work, snapshot)
+        skill_data: dict[str, tuple[Mapping[str, object], int]] = {}
+        for raw_intent in intents:
             if isinstance(raw_intent, SkillCheckIntent):
                 if raw_intent.target_ref is not None:
                     raise ResolutionInputError("対象付き技能判定はMVPでは扱いません")
@@ -736,7 +759,6 @@ class SkillCheckResolutionWorker:
                 ]
                 if len(checks) != 1:
                     raise ResolutionInputError("登録済みScene技能判定を一意に解決できません")
-                check = checks[0]
                 modifier_row = next(
                     (
                         row
@@ -748,6 +770,54 @@ class SkillCheckResolutionWorker:
                 )
                 if modifier_row is None:
                     raise ResolutionInputError("actorに登録済み技能補正がありません")
+                skill_data[raw_intent.skill_ref] = (
+                    checks[0], _stored_int(modifier_row["modifier"])
+                )
+            elif isinstance(raw_intent, AttackIntent):
+                target_id = resolve_ref(raw_intent.target_ref)
+                if target_id not in attackable:
+                    raise ResolutionInputError("有効な攻撃対象ではありません")
+                if characters[target_id].current_hp == 0:
+                    raise ResolutionInputError("0 HPの対象は攻撃できません")
+                if raw_intent.weapon_ref is not None:
+                    equipped_id = resolve_ref(raw_intent.weapon_ref)
+                    inventory = inventory_rows.get((work.actor_id, equipped_id))
+                    if (
+                        inventory is None
+                        or equipped_id not in weapons
+                        or not bool(inventory["equipped"])
+                        or _stored_int(inventory["quantity"]) < 1
+                    ):
+                        raise ResolutionInputError("所有・装備したweaponではありません")
+            elif isinstance(raw_intent, UseItemIntent):
+                item_id = resolve_ref(raw_intent.item_ref)
+                target_id = (
+                    work.actor_id
+                    if raw_intent.target_ref is None
+                    else resolve_ref(raw_intent.target_ref)
+                )
+                if target_id != work.actor_id or raw_intent.item_ref != "healing_potion":
+                    raise ResolutionInputError("登録済み回復itemの有効な対象ではありません")
+                inventory = inventory_rows.get((work.actor_id, item_id))
+                if inventory is None or _stored_int(inventory["quantity"]) < 1:
+                    raise ResolutionInputError("actorが使用可能なitemを所有していません")
+                if actor.current_hp >= actor.max_hp:
+                    raise ResolutionInputError("HPが満タンのため回復itemを使用できません")
+            else:
+                raise ResolutionInputError("未対応のAction Intentです")
+
+        records: list[ActionRecord] = []
+        resolved: list[ResolvedAction] = []
+        public_state: list[ContextFragment] = []
+        draw_index = 0
+        for ordinal, raw_intent in enumerate(intents, start=1):
+            actor = characters[work.actor_id]
+            command: AttackCommand | SkillCheckCommand | UseItemCommand
+            result: AppliedResult | NotApplicableResult
+            check: Mapping[str, object] | None = None
+
+            if isinstance(raw_intent, SkillCheckIntent):
+                check, modifier = skill_data[raw_intent.skill_ref]
                 try:
                     difficulty_class = self._ruleset.difficulty_class(
                         str(check["difficulty"])
@@ -764,7 +834,7 @@ class SkillCheckResolutionWorker:
                     skill_ref=raw_intent.skill_ref,
                     objective=raw_intent.objective,
                     target_id=None,
-                    modifier=_stored_int(modifier_row["modifier"]),
+                    modifier=modifier,
                     difficulty_class=difficulty_class,
                 )
                 try:
@@ -773,25 +843,13 @@ class SkillCheckResolutionWorker:
                     raise ResolutionInputError(str(error)) from error
             elif isinstance(raw_intent, AttackIntent):
                 target_id = resolve_ref(raw_intent.target_ref)
-                target = characters.get(target_id)
-                if target is None or target_id == work.actor_id:
-                    raise ResolutionInputError("有効な攻撃対象ではありません")
-                if initial_hp[target_id] == 0:
-                    raise ResolutionInputError("0 HPの対象は攻撃できません")
+                target = characters[target_id]
                 weapon_id: UUID | None = None
                 damage_expression = "1d2"
                 damage_bonus = 0
                 if raw_intent.weapon_ref is not None:
                     weapon_id = resolve_ref(raw_intent.weapon_ref)
-                    inventory = inventory_rows.get((work.actor_id, weapon_id))
-                    weapon = weapons.get(weapon_id)
-                    if (
-                        inventory is None
-                        or weapon is None
-                        or not bool(inventory["equipped"])
-                        or _stored_int(inventory["quantity"]) < 1
-                    ):
-                        raise ResolutionInputError("所有・装備したweaponではありません")
+                    weapon = weapons[weapon_id]
                     damage_expression = str(weapon["damage_expression"])
                     damage_bonus = _stored_int(weapon["damage_bonus"])
                 command = AttackCommand(
@@ -823,11 +881,6 @@ class SkillCheckResolutionWorker:
                     if raw_intent.target_ref is None
                     else resolve_ref(raw_intent.target_ref)
                 )
-                if target_id != work.actor_id or raw_intent.item_ref != "healing_potion":
-                    raise ResolutionInputError("登録済み回復itemの有効な対象ではありません")
-                inventory = inventory_rows.get((work.actor_id, item_id))
-                if inventory is None or _stored_int(inventory["quantity"]) < 1:
-                    raise ResolutionInputError("actorが使用可能なitemを所有していません")
                 command = UseItemCommand(
                     kind="use_item",
                     action_id=self._action_id_factory(),
@@ -845,8 +898,6 @@ class SkillCheckResolutionWorker:
                         kind="not_applicable", reason="resource_unavailable"
                     )
                 elif actor.current_hp >= actor.max_hp:
-                    if initial_hp[work.actor_id] >= actor.max_hp:
-                        raise ResolutionInputError("HPが満タンのため回復itemを使用できません")
                     result = NotApplicableResult(
                         kind="not_applicable", reason="rule_precondition"
                     )

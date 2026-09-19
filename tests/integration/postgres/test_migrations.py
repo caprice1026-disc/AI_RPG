@@ -524,6 +524,15 @@ def _seed_resolution_state(connection: Connection) -> None:
     )
     connection.execute(
         text(
+            "INSERT INTO mvp_scene_entities("
+            "campaign_id,scene_id,entity_id,is_public,is_attack_reachable) "
+            "VALUES(:campaign,:scene,:actor,true,false),"
+            "(:campaign,:scene,:target,true,true)"
+        ),
+        {"campaign": CAMPAIGN_A, "scene": SCENE_A, "actor": ACTOR_A, "target": ACTOR_C},
+    )
+    connection.execute(
+        text(
             "INSERT INTO mvp_inventory(campaign_id,owner_id,item_id,quantity,equipped) "
             "VALUES(:campaign,:owner,:item,2,false),"
             "(:campaign,:owner,:weapon,1,true)"
@@ -5400,6 +5409,267 @@ def test_narration_result_after_phase_deadline_becomes_fallback(database: Engine
             "UNKNOWN",
             "判定結果は保存されましたが、描写を生成できませんでした。",
         )
+
+
+def _seed_scope_entities(connection: Connection) -> None:
+    connection.execute(
+        text(
+            "INSERT INTO scenes(id,campaign_id,sequence,status) "
+            "VALUES(:scene,:campaign,2,'closed')"
+        ),
+        {"scene": SCENE_B, "campaign": CAMPAIGN_A},
+    )
+    for ref, scene, public, reachable, kind in [
+        ("other_scene", SCENE_B, True, True, "npc"),
+        ("private", SCENE_A, False, False, "npc"),
+        ("unreachable", SCENE_A, True, False, "npc"),
+        ("absent", None, True, True, "npc"),
+        ("statue", SCENE_A, True, True, "object"),
+        ("archived", SCENE_A, True, True, "npc"),
+        ("other_item", None, True, False, "item"),
+    ]:
+        parameters = {
+            "id": uuid4(), "campaign": CAMPAIGN_A, "ref": ref, "kind": kind,
+            "scene": scene, "public": public, "reachable": reachable,
+        }
+        connection.execute(
+            text(
+                "INSERT INTO entities(id,campaign_id,kind,ref,label,archived_at) "
+                "VALUES(:id,:campaign,:kind,:ref,:ref,"
+                "CASE WHEN :ref='archived' THEN now() ELSE NULL END)"
+            ),
+            parameters,
+        )
+        if kind == "npc":
+            connection.execute(
+                text(
+                    "INSERT INTO mvp_characters("
+                    "campaign_id,entity_id,current_hp,max_hp,defense,attack_bonus) "
+                    "VALUES(:campaign,:id,10,10,11,1)"
+                ),
+                parameters,
+            )
+        if scene is not None:
+            connection.execute(
+                text(
+                    "INSERT INTO mvp_scene_entities("
+                    "campaign_id,scene_id,entity_id,is_public,is_attack_reachable) "
+                    "VALUES(:campaign,:scene,:id,:public,:reachable)"
+                ),
+                parameters,
+            )
+        if kind == "item":
+            connection.execute(
+                text(
+                    "INSERT INTO mvp_inventory(campaign_id,owner_id,item_id,quantity,equipped) "
+                    "VALUES(:campaign,:owner,:id,1,false)"
+                ),
+                {**parameters, "owner": ACTOR_C},
+            )
+
+
+def _assert_plan_rejected_before_rng(
+    database: Engine, intents: list[dict[str, object]], *, narrative: bool = False,
+) -> None:
+    class ForbiddenRandom:
+        calls = 0
+
+        def randint(self, lower: int, upper: int) -> int:
+            self.calls += 1
+            raise AssertionError("invalid plan must not draw RNG")
+
+    random = ForbiddenRandom()
+    ruleset = MagicMock(wraps=MvpV1Ruleset(DiceEngine(random)))
+    tables = (
+        "entities", "mvp_characters", "mvp_inventory", "mvp_weapons",
+        "mvp_scene_entities", "mvp_skill_modifiers", "mvp_scene_skill_checks",
+    )
+    with database.connect() as connection:
+        before = {
+            table: list(connection.execute(text(f"SELECT * FROM {table} ORDER BY 1,2,3")))
+            for table in tables
+        }
+
+    async def resolve() -> None:
+        url = database.url.render_as_string(hide_password=False)
+        async with _postgres_sessions(url) as factory:
+            accepted = await _accept_turn(
+                factory, _player_turn("こんにちは" if narrative else "攻撃する")
+            )
+            worker = SkillCheckResolutionWorker(
+                lambda: PostgresUnitOfWork(factory),
+                ScriptedFakeTransport([{
+                    "kind": "resolution_required" if narrative else "action_plan",
+                    "actions": intents,
+                }]),
+                ruleset,
+                WorkerPhasePolicy(60, 3, 120, "fake-intent"),
+            )
+            assert await worker.run_once(accepted.turn_id)
+
+    with asyncio.Runner(loop_factory=asyncio.SelectorEventLoop) as runner:
+        runner.run(resolve())
+
+    assert random.calls == 0
+    assert ruleset.mock_calls == []
+    with database.connect() as connection:
+        assert connection.scalar(text("SELECT count(*) FROM actions")) == 0
+        assert connection.scalar(text(
+            "SELECT count(*) FROM events WHERE type <> 'GMNarrationGenerated'"
+        )) == 0
+        assert connection.execute(text(
+            "SELECT type,action_id,state_version FROM events"
+        )).all() == [("GMNarrationGenerated", None, 0)]
+        assert connection.scalar(
+            text("SELECT state_version FROM campaigns WHERE id=:campaign"),
+            {"campaign": CAMPAIGN_A},
+        ) == 0
+        assert connection.execute(text(
+            "SELECT resolution_status,committed_state_version,narration_status FROM turns"
+        )).one() == ("not_applied", None, "completed")
+        for table in tables:
+            assert list(connection.execute(
+                text(f"SELECT * FROM {table} ORDER BY 1,2,3")
+            )) == before[table], table
+
+
+@pytest.mark.parametrize("narrative", [False, True])
+@pytest.mark.parametrize("reachable", [False, True])
+def test_context_excludes_other_scene_and_nonpublic_entities(
+    database: Engine, narrative: bool, reachable: bool,
+) -> None:
+    with database.begin() as connection:
+        _seed_resolution_state(connection)
+        _seed_scope_entities(connection)
+        connection.execute(
+            text("UPDATE mvp_scene_entities SET is_attack_reachable=:reachable "
+                 "WHERE entity_id=:target"),
+            {"reachable": reachable, "target": ACTOR_C},
+        )
+        # Even a reachable actor and a public reachable non-Character cannot enable attack.
+        connection.execute(
+            text("UPDATE mvp_scene_entities SET is_attack_reachable=true WHERE entity_id=:actor"),
+            {"actor": ACTOR_A},
+        )
+
+    async def capture() -> dict[str, Any]:
+        url = database.url.render_as_string(hide_password=False)
+        async with _postgres_sessions(url) as factory:
+            accepted = await _accept_turn(
+                factory, _player_turn("こんにちは" if narrative else "攻撃する")
+            )
+            transport = ScriptedFakeTransport([
+                {"kind": "clarification_required", "question": "対象を指定してください。"}
+            ])
+            worker = SkillCheckResolutionWorker(
+                lambda: PostgresUnitOfWork(factory), transport,
+                MvpV1Ruleset(DiceEngine(MagicMock())),
+                WorkerPhasePolicy(60, 3, 120, "fake-intent"),
+            )
+            assert await worker.run_once(accepted.turn_id)
+            assert transport.calls[0].purpose == ("narrative" if narrative else "intent")
+            return json.loads(transport.calls[0].input_data)
+
+    with asyncio.Runner(loop_factory=asyncio.SelectorEventLoop) as runner:
+        llm_input = runner.run(capture())
+    assert {entity["ref"] for entity in llm_input["allowed_entity_refs"]} == {
+        "hero", "goblin", "healing_potion", "iron_sword", "unreachable", "statue",
+    }
+    if not narrative:
+        assert ("attack" in llm_input["supported_action_types"]) is reachable
+
+
+@pytest.mark.parametrize("scope", [
+    "other_scene", "private", "unreachable", "absent", "archived", "statue", "hero",
+])
+def test_worker_rejects_out_of_scope_attack_before_rng(database: Engine, scope: str) -> None:
+    with database.begin() as connection:
+        _seed_resolution_state(connection)
+        _seed_scope_entities(connection)
+    _assert_plan_rejected_before_rng(database, [
+        {"kind": "attack", "target_ref": scope, "weapon_ref": "iron_sword"},
+    ])
+
+
+@pytest.mark.parametrize("narrative", [False, True])
+@pytest.mark.parametrize("scope", ["other_scene", "private", "unreachable"])
+def test_composite_plan_with_late_out_of_scope_attack_draws_no_dice(
+    database: Engine, scope: str, narrative: bool,
+) -> None:
+    with database.begin() as connection:
+        _seed_resolution_state(connection)
+        _seed_scope_entities(connection)
+    _assert_plan_rejected_before_rng(database, [
+        {"kind": "attack", "target_ref": "goblin", "weapon_ref": "iron_sword"},
+        {"kind": "attack", "target_ref": scope, "weapon_ref": "iron_sword"},
+    ], narrative=narrative)
+
+
+@pytest.mark.parametrize("invalid", [
+    "unknown_ref", "weapon_not_owned", "weapon_unequipped", "weapon_empty",
+    "not_a_weapon", "target_zero_hp", "skill_target", "skill_unregistered",
+    "skill_missing_modifier", "item_not_owned", "item_empty", "item_target", "item_full_hp",
+])
+def test_composite_attack_preflights_later_static_constraints(
+    database: Engine, invalid: str,
+) -> None:
+    attack = {"kind": "attack", "target_ref": "goblin", "weapon_ref": None}
+    later: dict[str, object] = dict(attack)
+    with database.begin() as connection:
+        _seed_resolution_state(connection)
+        _seed_scope_entities(connection)
+        if invalid.startswith("weapon_"):
+            later["weapon_ref"] = "iron_sword"
+            mutation = {
+                "weapon_not_owned": "owner_id=:target",
+                "weapon_unequipped": "equipped=false",
+                "weapon_empty": "quantity=0",
+            }[invalid]
+            connection.execute(
+                text(f"UPDATE mvp_inventory SET {mutation} WHERE item_id=:weapon"),
+                {"weapon": WEAPON_A, "target": ACTOR_C},
+            )
+        elif invalid == "not_a_weapon":
+            later["weapon_ref"] = "healing_potion"
+        elif invalid == "unknown_ref":
+            later["target_ref"] = "unknown"
+        elif invalid == "target_zero_hp":
+            connection.execute(text(
+                "UPDATE mvp_characters SET current_hp=0 WHERE entity_id IN "
+                "(SELECT id FROM entities WHERE ref='unreachable')"
+            ))
+            connection.execute(text(
+                "UPDATE mvp_scene_entities SET is_attack_reachable=true WHERE entity_id IN "
+                "(SELECT id FROM entities WHERE ref='unreachable')"
+            ))
+            later["target_ref"] = "unreachable"
+        elif invalid.startswith("skill_"):
+            later = {
+                "kind": "skill_check", "skill_ref": "perception", "objective": "調べる",
+                "target_ref": "goblin" if invalid == "skill_target" else None,
+            }
+            if invalid == "skill_missing_modifier":
+                connection.execute(text(
+                    "INSERT INTO mvp_scene_skill_checks "
+                    "(campaign_id,scene_id,check_ref,skill_ref,difficulty,public_description) "
+                    "VALUES(:campaign,:scene,'observe','perception','normal','痕跡')"
+                ), {"campaign": CAMPAIGN_A, "scene": SCENE_A})
+        elif invalid.startswith("item_"):
+            later = {
+                "kind": "use_item", "item_ref": "healing_potion",
+                "target_ref": "goblin" if invalid == "item_target" else None,
+            }
+            if invalid != "item_full_hp":
+                connection.execute(text(
+                    "UPDATE mvp_characters SET current_hp=5 WHERE entity_id=:actor"
+                ), {"actor": ACTOR_A})
+            if invalid in ("item_not_owned", "item_empty"):
+                mutation = "owner_id=:target" if invalid == "item_not_owned" else "quantity=0"
+                connection.execute(
+                    text(f"UPDATE mvp_inventory SET {mutation} WHERE item_id=:item"),
+                    {"item": ITEM_A, "target": ACTOR_C},
+                )
+    _assert_plan_rejected_before_rng(database, [attack, later])
 
 
 @pytest.mark.parametrize(
