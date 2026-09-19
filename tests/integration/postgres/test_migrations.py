@@ -11,14 +11,17 @@ from collections.abc import AsyncIterator, Callable, Generator, Iterator
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from dataclasses import replace
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from threading import Event
 from typing import Any
 from unittest.mock import MagicMock
 from uuid import UUID, uuid4
 
+import httpx
+import jwt
 import pytest
+from cryptography.hazmat.primitives.asymmetric import rsa
 from httpx import ASGITransport, AsyncClient, Client
 from sqlalchemy import Connection, Engine, RowMapping, create_engine, event, text
 from sqlalchemy.engine import make_url
@@ -26,10 +29,12 @@ from sqlalchemy.exc import DBAPIError, IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
 from ai_rpg.api import create_app
+from ai_rpg.api.auth import OidcBearerAuthenticator, OidcJwtVerifier, discover_oidc
 from ai_rpg.application import (
     AuthenticatedPrincipal,
     AuthorizationError,
     ChoiceNotAvailableError,
+    EventStreamService,
     IdempotencyConflictError,
     InvalidCommitBundleError,
     NarrationWorker,
@@ -920,6 +925,158 @@ def test_principal_identity_lifecycle_is_pre_registered_and_immutable(
             ),
             {"issuer": "https://idp.example.com/", "subject": "player-1"},
         )
+
+
+def test_oidc_bearer_round_trip_uses_registered_identity_and_campaign_membership(
+    database: Engine,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    from ai_rpg.infrastructure.database import create_session_factory
+    from ai_rpg.infrastructure.postgres import PostgresIdentityStore
+
+    issuer = "https://idp.example.com/"
+    audience = "ai-rpg-api"
+    registered_subject = "registered-player"
+    unregistered_subject = "unregistered-player"
+    nonmember_subject = "registered-nonmember"
+    signing_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    public_jwk: dict[str, object] = jwt.algorithms.RSAAlgorithm.to_jwk(
+        signing_key.public_key(), as_dict=True
+    )
+    public_jwk.update({"kid": "acceptance-key", "use": "sig", "alg": "RS256"})
+    jwks_payload = {"keys": [public_jwk]}
+
+    with database.begin() as connection:
+        _seed_members_entities_and_scene(connection)
+
+    async def exercise() -> tuple[object, object, object, object, tuple[str, ...]]:
+        async def discovery_handler(request: httpx.Request) -> httpx.Response:
+            assert request.url == httpx.URL(
+                "https://idp.example.com/.well-known/openid-configuration"
+            )
+            return httpx.Response(
+                200,
+                json={
+                    "issuer": issuer,
+                    "jwks_uri": "https://idp.example.com/keys",
+                },
+            )
+
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(discovery_handler)
+        ) as discovery_client:
+            configuration = await discover_oidc(issuer, discovery_client)
+
+        jwks = jwt.PyJWKClient(
+            configuration.jwks_uri,
+            lifespan=300,
+            timeout=5,
+            cooldown_duration=30,
+        )
+        monkeypatch.setattr(jwks, "fetch_data", lambda: jwks_payload)
+        sessions = create_session_factory(
+            database.url.render_as_string(hide_password=False)
+        )
+        identities = PostgresIdentityStore(sessions)
+        await identities.register(issuer, registered_subject, UUID(PRINCIPAL_A))
+        await identities.register(issuer, nonmember_subject, UUID(PRINCIPAL_B))
+
+        authorization = PostgresAuthorizationPolicy(sessions)
+
+        def unit_of_work_factory() -> PostgresUnitOfWork:
+            return PostgresUnitOfWork(sessions)
+
+        principal_provider = OidcBearerAuthenticator(
+            OidcJwtVerifier(issuer, audience, ("RS256",), jwks),
+            identities.resolve,
+        )
+        app = create_app(
+            turn_service=TurnService(
+                authorization,
+                unit_of_work_factory,
+                RuntimePolicy(3, 1, 3),
+            ),
+            turn_query_service=TurnQueryService(
+                authorization,
+                unit_of_work_factory,
+            ),
+            event_stream_service=EventStreamService(
+                authorization,
+                unit_of_work_factory,
+            ),
+            principal_provider=principal_provider,
+        )
+        now = datetime.now(UTC)
+
+        def token(subject: str) -> str:
+            return jwt.encode(
+                {
+                    "iss": issuer,
+                    "aud": audience,
+                    "sub": subject,
+                    "exp": now + timedelta(minutes=5),
+                    "iat": now,
+                    "nbf": now - timedelta(seconds=1),
+                },
+                signing_key,
+                algorithm="RS256",
+                headers={"kid": "acceptance-key"},
+            )
+
+        registered_token = token(registered_subject)
+        unregistered_token = token(unregistered_subject)
+        nonmember_token = token(nonmember_subject)
+
+        transport = ASGITransport(app=app)
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            registered = await client.get(
+                f"/campaigns/{CAMPAIGN_A}/state",
+                headers={"Authorization": f"Bearer {registered_token}"},
+            )
+            unregistered = await client.get(
+                f"/campaigns/{CAMPAIGN_A}/state",
+                headers={"Authorization": f"Bearer {unregistered_token}"},
+            )
+            await identities.disable(issuer, registered_subject)
+            disabled = await client.get(
+                f"/campaigns/{CAMPAIGN_A}/state",
+                headers={"Authorization": f"Bearer {registered_token}"},
+            )
+            nonmember = await client.get(
+                f"/campaigns/{CAMPAIGN_A}/state",
+                headers={"Authorization": f"Bearer {nonmember_token}"},
+            )
+        return (
+            registered,
+            unregistered,
+            disabled,
+            nonmember,
+            (registered_token, unregistered_token, nonmember_token),
+        )
+
+    caplog.set_level("INFO", logger="ai_rpg.api.auth")
+    with asyncio.Runner(loop_factory=asyncio.SelectorEventLoop) as runner:
+        registered, unregistered, disabled, nonmember, tokens = runner.run(exercise())
+
+    assert registered.status_code == 200
+    assert registered.json() == {"state_version": 0, "latest_turn": None}
+    for response in (unregistered, disabled):
+        assert response.status_code == 401
+        assert response.json() == {"detail": {"code": "UNAUTHENTICATED"}}
+        assert response.headers["WWW-Authenticate"] == "Bearer"
+    assert nonmember.status_code == 403
+    assert nonmember.json() == {"detail": {"code": "FORBIDDEN"}}
+    for sensitive in (
+        *tokens,
+        registered_subject,
+        unregistered_subject,
+        nonmember_subject,
+    ):
+        assert sensitive not in caplog.text
+        assert sensitive not in unregistered.text
+        assert sensitive not in disabled.text
+        assert sensitive not in nonmember.text
 
 
 def test_principal_identity_registration_generates_id_and_missing_disable_fails(

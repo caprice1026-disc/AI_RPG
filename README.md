@@ -26,7 +26,7 @@ AI_RPGは、LLMにゲーム状態を直接変更させないAI TRPGバックエ�
 ```
 
 > [!IMPORTANT]
-> 現在は基盤機能を検証するMVPです。開発用のプレイ画面、攻撃・回復アイテム、SSEは利用できますが、本番認証adapterはまだ接続していません。
+> 現在は基盤機能を検証するMVPです。本番APIはOIDC Bearer JWT認証に対応していますが、ブラウザログインは未実装です。bundled play screenは引き続き開発用principalで利用します。
 
 ## 特徴
 
@@ -111,6 +111,47 @@ $env:AIRPG_TEST_DATABASE_URL = "postgresql+psycopg://postgres:postgres@localhost
 .\.venv\Scripts\python.exe -m pytest tests\integration\postgres -q -p no:cacheprovider
 docker stop ai-rpg-test-postgres
 ```
+
+## 本番APIのOIDC認証
+
+本番APIは、`AIRPG_AUTH_ISSUER`で指定した単一のOIDC Issuerが発行するBearer JWTを検証します。先に`AIRPG_DATABASE_URL`を設定し、最新migrationを適用してください。identity登録とAPI起動より前に`principal_identities`を含むschemaが必要です。
+
+```powershell
+.\.venv\Scripts\python.exe -m alembic upgrade head
+```
+
+Issuer、必須Audience、許可する非対称署名algorithmを設定し、IdPのsubjectを内部の安定した`principal_id`へ事前登録してからAPIを起動します。
+
+```powershell
+$env:AIRPG_AUTH_ISSUER = "https://idp.example.com/"
+$env:AIRPG_AUTH_AUDIENCE = "ai-rpg-api"
+$env:AIRPG_AUTH_ALLOWED_ALGORITHMS = "RS256"
+
+.\.venv\Scripts\ai-rpg.exe auth register `
+  --subject "oidc-subject-from-provider" `
+  --principal-id "00000000-0000-0000-0000-000000000021"
+
+.\.venv\Scripts\ai-rpg.exe api --host 127.0.0.1 --port 8000
+```
+
+API requestは`Authorization: Bearer <token>` headerを付けます。JWTのrole、email、name claimはCampaign認可に使用せず、`auth_context`、event、ゲームデータへコピーしません。Campaign membershipとactor権限は、token検証後もPostgreSQLの最新状態で判定します。subjectはidentity対応キーとして`principal_identities`だけに保存し、明示的に実行した`auth register`／`auth disable`の管理CLI JSON以外では、ログ、event、ゲームデータ、HTTPエラーへ出力しません。
+
+identityを無効化すると、以後のrequestは同じsubjectのtokenでも認証されません。このreleaseでは付け替え、削除、再有効化は行いません。
+
+```powershell
+.\.venv\Scripts\ai-rpg.exe auth disable `
+  --subject "oidc-subject-from-provider"
+```
+
+HTTP statusの意味は次のとおりです。
+
+- `401`: tokenなし、不正・期限切れtoken、未登録identity、無効identity。外部から理由を区別せず`UNAUTHENTICATED`を返します。
+- `403`: tokenは有効ですが、現在のCampaign membershipまたはactor権限がありません。
+- `503`: 起動後のJWKS取得・更新障害によりcredentialを検証できません。
+
+Discoveryはprocess起動時に取得します。JWKSは300秒cacheし、未知の`kid`では30秒のcooldownを守って再取得するため、Issuer側の鍵rotationへ追随します。取得済み鍵で検証できずJWKSも利用できない場合はfail closedで503を返します。
+
+`ai-rpg api --dev-principal <UUID>`はOIDCを迂回するローカル開発専用の明示的な起動方法です。通常のAPI起動やworkerへ暗黙適用されません。将来のブラウザログイン／server sessionは同じprincipal契約を生成する別adapterとして追加します。それまではbundled play screenからBearer loginはできず、ローカル開発では`--dev-principal`が必要です。
 
 ## Fake LLMで一往復を試す
 
@@ -227,7 +268,7 @@ data: {"id":12,"type":"turn.updated","schema_version":1,"payload":{"turn":{...}}
 - [x] 開発用の独立API／worker runner
 - [x] 公開範囲を限定した複数Turn Context
 - [x] OpenAI Responses API adapter
-- [ ] 本番認証adapter
+- [x] 本番認証adapter
 - [x] 最小のプレイヤー向け画面
 - [x] 攻撃・回復・アイテム使用のAPI経路
 - [x] SSEによるリアルタイム更新
