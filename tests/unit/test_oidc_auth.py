@@ -380,9 +380,16 @@ async def test_verifier_maps_jwks_connection_failure_without_details(
         JSONDecodeError("private-provider-body", "private-provider-body", 0),
         [],
         {"keys": []},
+        {"keys": [None]},
         {"keys": [{"kid": "private-kid", "kty": "private-kty"}]},
     ],
-    ids=["malformed-json", "non-object", "empty-keys", "unusable-keys"],
+    ids=[
+        "malformed-json",
+        "non-object",
+        "empty-keys",
+        "non-object-key",
+        "unusable-keys",
+    ],
 )
 async def test_authenticator_maps_invalid_jwks_document_to_unavailable(
     signing_key: rsa.RSAPrivateKey,

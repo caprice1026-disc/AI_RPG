@@ -49,6 +49,8 @@ class _ProviderJWKClient(jwt.PyJWKClient):
         except (
             jwt.PyJWKClientError,
             jwt.PyJWKSetError,
+            AttributeError,
+            TypeError,
             ValueError,
         ) as error:
             raise AuthenticationUnavailableError("JWKSを取得できません") from error
