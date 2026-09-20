@@ -100,6 +100,17 @@ class WorkerPhasePolicy:
             raise ValueError("phase deadlineはlease以上である必要があります")
 
 
+@dataclass(frozen=True, slots=True)
+class _ActionPreflight:
+    scenario_bindings: list[ScenarioActionBinding | None]
+    characters: dict[UUID, CharacterState]
+    refs: EntityRefMap
+    id_to_ref: dict[UUID, str]
+    weapons: dict[UUID, Mapping[str, object]]
+    quantities: dict[tuple[UUID, UUID], int]
+    skill_data: dict[str, tuple[Mapping[str, object], int]]
+
+
 UnitOfWorkFactory = Callable[[], UnitOfWork]
 
 
@@ -363,7 +374,7 @@ class SkillCheckResolutionWorker:
             )
 
         try:
-            self._scenario_bindings(snapshot, decision.actions)
+            preflight = self._preflight_actions(work, snapshot, decision.actions)
         except ResolutionInputError:
             return await self._finalize_not_applied(
                 work,
@@ -381,7 +392,7 @@ class SkillCheckResolutionWorker:
             await unit_of_work.commit()
         try:
             records, resolved, public_state, scenario_update = self._resolve_actions(
-                work, snapshot, decision.actions
+                work, snapshot, decision.actions, preflight=preflight
             )
         except ResolutionInputError:
             return await self._finalize_not_applied(
@@ -756,17 +767,12 @@ class SkillCheckResolutionWorker:
             await unit_of_work.commit()
         return True
 
-    def _resolve_actions(
+    def _preflight_actions(
         self,
         work: ResolutionWorkItem,
         snapshot: CanonicalSnapshot,
         intents: list[object],
-    ) -> tuple[
-        tuple[ActionRecord, ...],
-        list[ResolvedAction],
-        list[ContextFragment],
-        ScenarioProgressUpdate | None,
-    ]:
+    ) -> _ActionPreflight:
         scenario_bindings = self._scenario_bindings(snapshot, intents)
         characters = {
             UUID(str(row["entity_id"])): CharacterState(
@@ -807,15 +813,6 @@ class SkillCheckResolutionWorker:
                 return refs.resolve(ref)
             except ValueError as error:
                 raise ResolutionInputError(str(error)) from error
-
-        def character_with_hp(character: CharacterState, hp: int) -> CharacterState:
-            return CharacterState(
-                id=character.id,
-                current_hp=hp,
-                max_hp=character.max_hp,
-                defense=character.defense,
-                attack_bonus=character.attack_bonus,
-            )
 
         # Validate the entire plan against the initial snapshot before any Engine call.
         attackable = self._attackable_entity_ids(work, snapshot)
@@ -881,6 +878,53 @@ class SkillCheckResolutionWorker:
                     raise ResolutionInputError("HPが満タンのため回復itemを使用できません")
             else:
                 raise ResolutionInputError("未対応のAction Intentです")
+
+        return _ActionPreflight(
+            scenario_bindings=scenario_bindings,
+            characters=characters,
+            refs=refs,
+            id_to_ref=id_to_ref,
+            weapons=weapons,
+            quantities=quantities,
+            skill_data=skill_data,
+        )
+
+    def _resolve_actions(
+        self,
+        work: ResolutionWorkItem,
+        snapshot: CanonicalSnapshot,
+        intents: list[object],
+        *,
+        preflight: _ActionPreflight | None = None,
+    ) -> tuple[
+        tuple[ActionRecord, ...],
+        list[ResolvedAction],
+        list[ContextFragment],
+        ScenarioProgressUpdate | None,
+    ]:
+        plan = preflight or self._preflight_actions(work, snapshot, intents)
+        scenario_bindings = plan.scenario_bindings
+        characters = plan.characters
+        refs = plan.refs
+        id_to_ref = plan.id_to_ref
+        weapons = plan.weapons
+        quantities = plan.quantities
+        skill_data = plan.skill_data
+
+        def resolve_ref(ref: str) -> UUID:
+            try:
+                return refs.resolve(ref)
+            except ValueError as error:
+                raise ResolutionInputError(str(error)) from error
+
+        def character_with_hp(character: CharacterState, hp: int) -> CharacterState:
+            return CharacterState(
+                id=character.id,
+                current_hp=hp,
+                max_hp=character.max_hp,
+                defense=character.defense,
+                attack_bonus=character.attack_bonus,
+            )
 
         records: list[ActionRecord] = []
         resolved: list[ResolvedAction] = []

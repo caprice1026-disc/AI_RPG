@@ -6470,6 +6470,154 @@ def test_scenario_worker_preflights_narrative_escalation_before_route_write(
 
 
 @pytest.mark.parametrize(
+    "invalid_plan",
+    ["unreachable-attack-target", "unowned-item"],
+)
+def test_scenario_worker_preflights_all_narrative_actions_before_route_write(
+    database: Engine,
+    invalid_plan: str,
+) -> None:
+    with database.begin() as connection:
+        _seed_scenario_worker_state(connection, active_sequence=3)
+        if invalid_plan == "unreachable-attack-target":
+            connection.execute(
+                text(
+                    "UPDATE mvp_scene_entities SET is_attack_reachable=false "
+                    "WHERE campaign_id=:campaign AND scene_id=:scene "
+                    "AND entity_id=:target"
+                ),
+                {
+                    "campaign": CAMPAIGN_A,
+                    "scene": SCENE_C,
+                    "target": ACTOR_C,
+                },
+            )
+            action = {"kind": "attack", "target_ref": "goblin", "weapon_ref": None}
+        else:
+            connection.execute(
+                text(
+                    "UPDATE mvp_inventory SET owner_id=:other "
+                    "WHERE campaign_id=:campaign AND item_id=:item"
+                ),
+                {
+                    "campaign": CAMPAIGN_A,
+                    "other": ACTOR_C,
+                    "item": ITEM_A,
+                },
+            )
+            connection.execute(
+                text(
+                    "INSERT INTO mvp_scene_entities("
+                    "campaign_id,scene_id,entity_id,is_public,is_attack_reachable"
+                    ") VALUES(:campaign,:scene,:item,true,false)"
+                ),
+                {
+                    "campaign": CAMPAIGN_A,
+                    "scene": SCENE_C,
+                    "item": ITEM_A,
+                },
+            )
+            action = {
+                "kind": "use_item",
+                "item_ref": "healing_potion",
+                "target_ref": None,
+            }
+        gameplay_before = {
+            "characters": list(
+                connection.execute(
+                    text(
+                        "SELECT entity_id,current_hp FROM mvp_characters "
+                        "ORDER BY entity_id"
+                    )
+                )
+            ),
+            "inventory": list(
+                connection.execute(
+                    text(
+                        "SELECT owner_id,item_id,quantity,equipped FROM mvp_inventory "
+                        "ORDER BY owner_id,item_id"
+                    )
+                )
+            ),
+        }
+        progress_before = {
+            "run": connection.execute(
+                text("SELECT status,ending_ref FROM mvp_scenario_runs")
+            ).one(),
+            "scenes": list(
+                connection.execute(
+                    text("SELECT sequence,status FROM scenes ORDER BY sequence")
+                )
+            ),
+            "flags": list(
+                connection.execute(
+                    text("SELECT flag_ref FROM mvp_scenario_flags ORDER BY flag_ref")
+                ).scalars()
+            ),
+        }
+    random = _SequenceRandom([])
+
+    turn_id, _llm_input, ruleset = _run_scenario_worker(
+        database,
+        player_text="この場面について話す",
+        decision={"kind": "resolution_required", "actions": [action]},
+        random_source=random,
+    )
+
+    assert random.calls == 0
+    assert ruleset.mock_calls == []
+    with database.connect() as connection:
+        assert connection.execute(
+            text(
+                "SELECT route,resolution_status,committed_state_version,narration_status "
+                "FROM turns WHERE id=:turn"
+            ),
+            {"turn": turn_id},
+        ).one() == ("narrative", "not_applied", None, "completed")
+        assert connection.scalar(text("SELECT count(*) FROM actions")) == 0
+        assert list(connection.execute(text("SELECT type FROM events")).scalars()) == [
+            "GMNarrationGenerated"
+        ]
+        assert connection.scalar(
+            text("SELECT state_version FROM campaigns WHERE id=:campaign"),
+            {"campaign": CAMPAIGN_A},
+        ) == 0
+        assert {
+            "characters": list(
+                connection.execute(
+                    text(
+                        "SELECT entity_id,current_hp FROM mvp_characters "
+                        "ORDER BY entity_id"
+                    )
+                )
+            ),
+            "inventory": list(
+                connection.execute(
+                    text(
+                        "SELECT owner_id,item_id,quantity,equipped FROM mvp_inventory "
+                        "ORDER BY owner_id,item_id"
+                    )
+                )
+            ),
+        } == gameplay_before
+        assert {
+            "run": connection.execute(
+                text("SELECT status,ending_ref FROM mvp_scenario_runs")
+            ).one(),
+            "scenes": list(
+                connection.execute(
+                    text("SELECT sequence,status FROM scenes ORDER BY sequence")
+                )
+            ),
+            "flags": list(
+                connection.execute(
+                    text("SELECT flag_ref FROM mvp_scenario_flags ORDER BY flag_ref")
+                ).scalars()
+            ),
+        } == progress_before
+
+
+@pytest.mark.parametrize(
     (
         "active_sequence",
         "player_text",
