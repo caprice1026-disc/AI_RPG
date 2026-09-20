@@ -9,10 +9,16 @@ from ai_rpg.contracts.common import Contract, PositiveInt, Ref, ShortText
 SUPPORTED_SKILL_REFS = frozenset({"perception", "persuasion", "stealth"})
 
 
+class ScenarioEndingOverride(Contract):
+    requires_flags: tuple[Ref, ...] = Field(min_length=1)
+    ending_ref: Ref
+
+
 class ScenarioEffect(Contract):
     next_scene_ref: Ref | None = None
     ending_ref: Ref | None = None
-    add_flags: list[Ref] = Field(default_factory=list)
+    add_flags: tuple[Ref, ...] = ()
+    overrides: tuple[ScenarioEndingOverride, ...] = ()
 
 
 class DirectScenarioAction(Contract):
@@ -52,7 +58,7 @@ class SceneDefinition(Contract):
     sequence: PositiveInt
     title: ShortText
     description: ShortText
-    actions: list[ScenarioActionDefinition]
+    actions: tuple[ScenarioActionDefinition, ...]
 
 
 class ScenarioFlagDefinition(Contract):
@@ -71,9 +77,9 @@ class ScenarioDefinition(Contract):
     version: PositiveInt
     title: ShortText
     objective: ShortText
-    scenes: list[SceneDefinition]
-    flags: list[ScenarioFlagDefinition]
-    endings: list[EndingDefinition]
+    scenes: tuple[SceneDefinition, ...]
+    flags: tuple[ScenarioFlagDefinition, ...]
+    endings: tuple[EndingDefinition, ...]
 
     @model_validator(mode="after")
     def valid_graph(self) -> Self:
@@ -122,5 +128,12 @@ class ScenarioDefinition(Contract):
                         raise ValueError(f"存在しないEnding参照です: {effect.ending_ref}")
                     if not set(effect.add_flags) <= known_flags:
                         raise ValueError("存在しないFlag参照です")
+                    if effect.overrides and effect.ending_ref is None:
+                        raise ValueError("Ending overrideにはbase Endingが必要です")
+                    for override in effect.overrides:
+                        if not set(override.requires_flags) <= known_flags:
+                            raise ValueError("Ending overrideが存在しないFlagを参照しています")
+                        if override.ending_ref not in known_endings:
+                            raise ValueError("Ending overrideが存在しないEndingを参照しています")
 
         return self

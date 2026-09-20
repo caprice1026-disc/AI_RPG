@@ -63,7 +63,13 @@
           "success": {
             "next_scene_ref": null,
             "ending_ref": "recovered",
-            "add_flags": []
+            "add_flags": [],
+            "overrides": [
+              {
+                "requires_flags": ["alerted"],
+                "ending_ref": "costly_success"
+              }
+            ]
           },
           "failure": {
             "next_scene_ref": null,
@@ -80,7 +86,13 @@
           "success": {
             "next_scene_ref": null,
             "ending_ref": "recovered",
-            "add_flags": []
+            "add_flags": [],
+            "overrides": [
+              {
+                "requires_flags": ["alerted"],
+                "ending_ref": "costly_success"
+              }
+            ]
           },
           "failure": {
             "next_scene_ref": null,
@@ -96,7 +108,13 @@
           "defeated": {
             "next_scene_ref": null,
             "ending_ref": "recovered",
-            "add_flags": []
+            "add_flags": [],
+            "overrides": [
+              {
+                "requires_flags": ["alerted"],
+                "ending_ref": "costly_success"
+              }
+            ]
           }
         },
         {
