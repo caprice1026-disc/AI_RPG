@@ -58,6 +58,84 @@ class DevelopmentFakeTransport:
         if purpose == "intent":
             payload = json.loads(input_data)
             player_text = str(payload.get("player_text", ""))
+            scene_view = payload.get("scene_view")
+            available_actions: set[str] | None = None
+            if isinstance(scene_view, dict):
+                content = scene_view.get("content")
+                if isinstance(content, str):
+                    try:
+                        scene_context = json.loads(content)
+                    except json.JSONDecodeError:
+                        scene_context = None
+                    if isinstance(scene_context, dict) and isinstance(
+                        scene_context.get("available_actions"), list
+                    ):
+                        available_actions = {
+                            str(action["action_ref"])
+                            for action in scene_context["available_actions"]
+                            if isinstance(action, dict) and "action_ref" in action
+                        }
+            if available_actions is not None:
+                candidates = (
+                    (
+                        "enter_chapel",
+                        ("入る",),
+                        {"kind": "scenario_action", "action_ref": "enter_chapel"},
+                    ),
+                    (
+                        "search_hall",
+                        ("調べ", "探索"),
+                        {
+                            "kind": "skill_check",
+                            "skill_ref": "perception",
+                            "objective": "広間を調べる",
+                            "target_ref": None,
+                        },
+                    ),
+                    (
+                        "negotiate_guard",
+                        ("交渉",),
+                        {
+                            "kind": "skill_check",
+                            "skill_ref": "persuasion",
+                            "objective": "守衛と交渉する",
+                            "target_ref": None,
+                        },
+                    ),
+                    (
+                        "sneak_to_relic",
+                        ("隠れる", "隠密", "忍び寄"),
+                        {
+                            "kind": "skill_check",
+                            "skill_ref": "stealth",
+                            "objective": "聖印へ忍び寄る",
+                            "target_ref": None,
+                        },
+                    ),
+                    (
+                        "defeat_guard",
+                        ("攻撃",),
+                        {
+                            "kind": "attack",
+                            "target_ref": "goblin",
+                            "weapon_ref": "iron_sword",
+                        },
+                    ),
+                    (
+                        "retreat",
+                        ("撤退",),
+                        {"kind": "scenario_action", "action_ref": "retreat"},
+                    ),
+                )
+                for action_ref, markers, intent in candidates:
+                    if action_ref in available_actions and any(
+                        marker in player_text for marker in markers
+                    ):
+                        return {"kind": "action_plan", "actions": [intent]}
+                return {
+                    "kind": "clarification_required",
+                    "question": "現在の場面で可能な行動を指定してください。",
+                }
             if "攻撃" in player_text:
                 return {
                     "kind": "action_plan",

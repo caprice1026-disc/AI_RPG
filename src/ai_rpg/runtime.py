@@ -13,7 +13,12 @@ from alembic.config import Config
 from sqlalchemy import create_engine, text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from ai_rpg.application import NarrationWorker, SkillCheckResolutionWorker, WorkerPhasePolicy
+from ai_rpg.application import (
+    NarrationWorker,
+    ScenarioProgressor,
+    SkillCheckResolutionWorker,
+    WorkerPhasePolicy,
+)
 from ai_rpg.application.ports import UnitOfWork
 from ai_rpg.config import Settings
 from ai_rpg.engine import DiceEngine, MvpV1Ruleset, SecureRandomSource, SeededRandomSource
@@ -21,6 +26,7 @@ from ai_rpg.infrastructure.database import create_session_factory
 from ai_rpg.infrastructure.postgres import PostgresUnitOfWork
 from ai_rpg.llm import DevelopmentFakeTransport, OpenAIResponsesTransport
 from ai_rpg.llm.structured import ProviderTransport
+from ai_rpg.scenarios import BUILTIN_SCENARIOS
 
 
 @dataclass(frozen=True, slots=True)
@@ -231,6 +237,7 @@ def build_resolution_worker(
             settings.fast_model,
             settings.llm_timeout_seconds,
         ),
+        scenario_progressor=ScenarioProgressor(BUILTIN_SCENARIOS),
         recent_messages_limit=settings.recent_messages_limit,
         rng_source="seeded_test" if deterministic else "secure",
     )

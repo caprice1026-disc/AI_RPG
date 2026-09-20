@@ -4,9 +4,10 @@ import json
 
 import pytest
 
+from ai_rpg.application import RuleBasedTurnRouter, ScenarioProgressor
 from ai_rpg.config import Settings
 from ai_rpg.llm import DevelopmentFakeTransport, OpenAIResponsesTransport
-from ai_rpg.runtime import build_provider_transport
+from ai_rpg.runtime import build_provider_transport, build_resolution_worker
 
 
 @pytest.mark.asyncio
@@ -63,3 +64,25 @@ def test_real_transport_is_built_from_secret_setting() -> None:
     settings = Settings(openai_api_key="test-secret")
 
     assert isinstance(build_provider_transport(settings, fake=False), OpenAIResponsesTransport)
+
+
+@pytest.mark.parametrize(
+    "player_text",
+    [
+        "礼拝堂に入る",
+        "広間を調べる",
+        "守衛と交渉する",
+        "隠密する",
+        "撤退する",
+    ],
+)
+def test_scenario_state_changing_verbs_route_to_mechanical(player_text: str) -> None:
+    assert RuleBasedTurnRouter().decide(player_text).route == "mechanical"
+
+
+def test_default_resolution_worker_receives_scenario_progressor() -> None:
+    worker = build_resolution_worker(
+        Settings(), DevelopmentFakeTransport(), deterministic=True
+    )
+
+    assert isinstance(worker._scenario_progressor, ScenarioProgressor)

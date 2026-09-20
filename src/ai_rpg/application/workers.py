@@ -26,10 +26,17 @@ from ai_rpg.application.ports import (
     NarrativeCommit,
     PhaseDeadlineExceededError,
     ResolutionWorkItem,
+    ScenarioRunSnapshot,
     StateVersionConflictError,
     UnitOfWork,
 )
+from ai_rpg.application.ports.repositories import ScenarioProgressUpdate
 from ai_rpg.application.routing import RuleBasedTurnRouter, TurnRouter
+from ai_rpg.application.scenarios import (
+    ScenarioActionBinding,
+    ScenarioProgressor,
+    ScenarioPublicContext,
+)
 from ai_rpg.contracts import make_decision_types
 from ai_rpg.contracts.context import (
     ContextFragment,
@@ -38,9 +45,19 @@ from ai_rpg.contracts.context import (
     NarrativeInput,
     OutputLimits,
 )
-from ai_rpg.contracts.llm_decisions import AttackIntent, SkillCheckIntent, UseItemIntent
+from ai_rpg.contracts.llm_decisions import (
+    AttackIntent,
+    ScenarioActionIntent,
+    SkillCheckIntent,
+    UseItemIntent,
+)
 from ai_rpg.contracts.responses import MechanicalNarrationDraft, MechanicalNarrationInput
-from ai_rpg.domain.commands import AttackCommand, SkillCheckCommand, UseItemCommand
+from ai_rpg.domain.commands import (
+    AttackCommand,
+    ScenarioActionCommand,
+    SkillCheckCommand,
+    UseItemCommand,
+)
 from ai_rpg.domain.events import RNGMetadata
 from ai_rpg.domain.models import CharacterState
 from ai_rpg.domain.results import (
@@ -59,6 +76,7 @@ from ai_rpg.llm import (
     ProviderRefusalError,
 )
 from ai_rpg.llm.structured import ProviderTransport, StructuredOutputAdapter, StructuredRequest
+from ai_rpg.scenarios import DirectScenarioAction
 
 
 class ResolutionInputError(ValueError):
@@ -146,6 +164,7 @@ class SkillCheckResolutionWorker:
         action_id_factory: Callable[[], UUID] = uuid4,
         choice_id_factory: Callable[[], UUID] = uuid4,
         router: TurnRouter | None = None,
+        scenario_progressor: ScenarioProgressor | None = None,
         recent_messages_limit: int = 20,
         rng_source: Literal["secure", "seeded_test", "recorded_replay"] = "secure",
         rng_implementation_version: str = "mvp_v1",
@@ -157,6 +176,7 @@ class SkillCheckResolutionWorker:
         self._action_id_factory = action_id_factory
         self._choice_id_factory = choice_id_factory
         self._router = router or RuleBasedTurnRouter()
+        self._scenario_progressor = scenario_progressor
         if not 0 <= recent_messages_limit <= 100:
             raise ValueError("recent_messages_limitは0から100の範囲で指定してください")
         self._recent_messages_limit = recent_messages_limit
@@ -258,7 +278,7 @@ class SkillCheckResolutionWorker:
             if decision.kind != "action_plan":
                 raise ResolutionInputError("ActionPlanが必要です")
 
-            records, resolved, public_state = self._resolve_actions(
+            records, resolved, public_state, scenario_update = self._resolve_actions(
                 work, snapshot, decision.actions
             )
         except TimeoutError:
@@ -280,7 +300,9 @@ class SkillCheckResolutionWorker:
             )
         except Exception:
             return await self._handle_failure(work, "UNKNOWN")
-        return await self._commit_mechanical(work, snapshot, records, resolved, public_state)
+        return await self._commit_mechanical(
+            work, snapshot, records, resolved, public_state, scenario_update
+        )
 
     async def _resolve_narrative(
         self,
@@ -340,6 +362,15 @@ class SkillCheckResolutionWorker:
                 work, snapshot, decision.narration, choices
             )
 
+        try:
+            self._scenario_bindings(snapshot, decision.actions)
+        except ResolutionInputError:
+            return await self._finalize_not_applied(
+                work,
+                "登録済みの行動として解決できません。対象や道具を言い換えてください。",
+            )
+        except Exception:
+            return await self._handle_failure(work, "UNKNOWN")
         async with self._unit_of_work_factory() as unit_of_work:
             promoted = await unit_of_work.turns.promote_to_mechanical(
                 work.turn_id, work.worker_epoch
@@ -349,7 +380,7 @@ class SkillCheckResolutionWorker:
                 return False
             await unit_of_work.commit()
         try:
-            records, resolved, public_state = self._resolve_actions(
+            records, resolved, public_state, scenario_update = self._resolve_actions(
                 work, snapshot, decision.actions
             )
         except ResolutionInputError:
@@ -359,7 +390,9 @@ class SkillCheckResolutionWorker:
             )
         except Exception:
             return await self._handle_failure(work, "UNKNOWN")
-        return await self._commit_mechanical(work, snapshot, records, resolved, public_state)
+        return await self._commit_mechanical(
+            work, snapshot, records, resolved, public_state, scenario_update
+        )
 
     async def _commit_narrative(
         self,
@@ -407,8 +440,9 @@ class SkillCheckResolutionWorker:
         records: tuple[ActionRecord, ...],
         resolved: list[ResolvedAction],
         public_state: list[ContextFragment],
+        scenario_update: ScenarioProgressUpdate | None,
     ) -> bool:
-        state_changed = any(
+        state_changed = scenario_update is not None or any(
             isinstance(action.result, AppliedResult)
             and any(
                 isinstance(change, ItemConsumed)
@@ -436,6 +470,7 @@ class SkillCheckResolutionWorker:
             base_state_version=snapshot.state_version,
             actions=records,
             narration_input=narration_input,
+            scenario_update=scenario_update,
         )
         try:
             async with self._unit_of_work_factory() as unit_of_work:
@@ -501,7 +536,9 @@ class SkillCheckResolutionWorker:
                 if check["scene_id"] == work.scene_id
             }
         )
-        supported_actions: list[Literal["attack", "skill_check", "use_item"]] = []
+        supported_actions: list[
+            Literal["attack", "skill_check", "use_item", "scenario_action"]
+        ] = []
         if self._attackable_entity_ids(work, snapshot):
             supported_actions.append("attack")
         if supported_skills:
@@ -512,6 +549,17 @@ class SkillCheckResolutionWorker:
             for row in snapshot.inventory
         ):
             supported_actions.append("use_item")
+        if snapshot.scenario_run is not None:
+            scenario_context = self._scenario_context(snapshot)
+            if any(
+                self._scenario_progressor is not None
+                and self._scenario_progressor.bind_scenario_action(
+                    snapshot.scenario_run, action_ref
+                )
+                is not None
+                for action_ref, _label in scenario_context.available_actions
+            ):
+                supported_actions.append("scenario_action")
         return MechanicalInput(
             player_text=work.player_text,
             scene_view=scene_view,
@@ -597,13 +645,32 @@ class SkillCheckResolutionWorker:
             for row in snapshot.skills
             if row["character_id"] == work.actor_id
         ]
-        return (
-            ContextFragment(
-                source="active_scene",
-                trust_level="trusted",
-                access_scope="public",
-                content="現在のSceneに公開済みの追加情報はない。",
+        scenario_context = (
+            None if snapshot.scenario_run is None else self._scenario_context(snapshot)
+        )
+        scene_view = ContextFragment(
+            source="active_scene",
+            trust_level="trusted",
+            access_scope="public",
+            content=(
+                "現在のSceneに公開済みの追加情報はない。"
+                if scenario_context is None
+                else _json(
+                    {
+                        "scene_title": scenario_context.scene_title,
+                        "scene_description": scenario_context.scene_description,
+                        "objective": scenario_context.objective,
+                        "discovered_facts": scenario_context.discovered_facts,
+                        "available_actions": [
+                            {"action_ref": action_ref, "label": label}
+                            for action_ref, label in scenario_context.available_actions
+                        ],
+                    }
+                )
             ),
+        )
+        return (
+            scene_view,
             ContextFragment(
                 source="active_pc",
                 trust_level="trusted",
@@ -615,6 +682,11 @@ class SkillCheckResolutionWorker:
                 ),
             ),
         )
+
+    def _scenario_context(self, snapshot: CanonicalSnapshot) -> ScenarioPublicContext:
+        if snapshot.scenario_run is None or self._scenario_progressor is None:
+            raise ResolutionInputError("Scenario進行componentが設定されていません")
+        return self._scenario_progressor.public_context_for(snapshot.scenario_run)
 
     async def _handle_failure(
         self, work: ResolutionWorkItem, failure_code: str
@@ -693,7 +765,9 @@ class SkillCheckResolutionWorker:
         tuple[ActionRecord, ...],
         list[ResolvedAction],
         list[ContextFragment],
+        ScenarioProgressUpdate | None,
     ]:
+        scenario_bindings = self._scenario_bindings(snapshot, intents)
         characters = {
             UUID(str(row["entity_id"])): CharacterState(
                 id=UUID(str(row["entity_id"])),
@@ -747,6 +821,8 @@ class SkillCheckResolutionWorker:
         attackable = self._attackable_entity_ids(work, snapshot)
         skill_data: dict[str, tuple[Mapping[str, object], int]] = {}
         for raw_intent in intents:
+            if isinstance(raw_intent, ScenarioActionIntent):
+                continue
             if isinstance(raw_intent, SkillCheckIntent):
                 if raw_intent.target_ref is not None:
                     raise ResolutionInputError("対象付き技能判定はMVPでは扱いません")
@@ -809,14 +885,36 @@ class SkillCheckResolutionWorker:
         records: list[ActionRecord] = []
         resolved: list[ResolvedAction] = []
         public_state: list[ContextFragment] = []
+        scenario_update: ScenarioProgressUpdate | None = None
         draw_index = 0
         for ordinal, raw_intent in enumerate(intents, start=1):
             actor = characters[work.actor_id]
-            command: AttackCommand | SkillCheckCommand | UseItemCommand
+            command: (
+                AttackCommand | SkillCheckCommand | UseItemCommand | ScenarioActionCommand
+            )
             result: AppliedResult | NotApplicableResult
             check: Mapping[str, object] | None = None
+            binding = scenario_bindings[ordinal - 1]
 
-            if isinstance(raw_intent, SkillCheckIntent):
+            if isinstance(raw_intent, ScenarioActionIntent):
+                assert isinstance(binding, DirectScenarioAction)
+                command = ScenarioActionCommand(
+                    kind="scenario_action",
+                    action_id=self._action_id_factory(),
+                    campaign_id=work.campaign_id,
+                    turn_id=work.turn_id,
+                    actor_id=work.actor_id,
+                    ordinal=ordinal,
+                    action_ref=raw_intent.action_ref,
+                )
+                result = AppliedResult(
+                    kind="applied",
+                    outcome="neutral",
+                    facts=[binding.public_fact],
+                    dice=[],
+                    state_changes=[],
+                )
+            elif isinstance(raw_intent, SkillCheckIntent):
                 check, modifier = skill_data[raw_intent.skill_ref]
                 try:
                     difficulty_class = self._ruleset.difficulty_class(
@@ -979,7 +1077,100 @@ class SkillCheckResolutionWorker:
                         content=str(check["public_description"]),
                     )
                 )
-        return tuple(records), resolved, public_state
+            if (
+                binding is not None
+                and isinstance(result, AppliedResult)
+                and snapshot.scenario_run is not None
+                and self._scenario_progressor is not None
+            ):
+                target_hp_after = (
+                    characters[resolve_ref(raw_intent.target_ref)].current_hp
+                    if isinstance(raw_intent, AttackIntent)
+                    else None
+                )
+                scenario_update = self._scenario_progressor.progress_for(
+                    snapshot.scenario_run,
+                    binding,
+                    result.outcome,
+                    target_hp_after,
+                )
+                if scenario_update is not None:
+                    public_state.append(
+                        self._scenario_public_state_after(
+                            snapshot.scenario_run, scenario_update
+                        )
+                    )
+        return tuple(records), resolved, public_state, scenario_update
+
+    def _scenario_bindings(
+        self,
+        snapshot: CanonicalSnapshot,
+        intents: list[object],
+    ) -> list[ScenarioActionBinding | None]:
+        run = snapshot.scenario_run
+        if run is None:
+            if any(isinstance(intent, ScenarioActionIntent) for intent in intents):
+                raise ResolutionInputError("Scenario runのない直接行動です")
+            return [None] * len(intents)
+        if self._scenario_progressor is None:
+            raise ResolutionInputError("Scenario進行componentが設定されていません")
+
+        bindings: list[ScenarioActionBinding | None] = []
+        for intent in intents:
+            binding: ScenarioActionBinding | None
+            if isinstance(intent, ScenarioActionIntent):
+                binding = self._scenario_progressor.bind_scenario_action(
+                    run, intent.action_ref
+                )
+                if binding is None:
+                    raise ResolutionInputError("登録済みScenario行動ではありません")
+            elif isinstance(intent, SkillCheckIntent):
+                binding = self._scenario_progressor.bind_skill_check(
+                    run, intent.skill_ref
+                )
+            elif isinstance(intent, AttackIntent):
+                binding = self._scenario_progressor.bind_attack(
+                    run, intent.target_ref
+                )
+            else:
+                binding = None
+            bindings.append(binding)
+        if sum(binding is not None for binding in bindings) >= 2:
+            raise ResolutionInputError("一つのplanに複数のScenario進行行動があります")
+        return bindings
+
+    def _scenario_public_state_after(
+        self,
+        run: ScenarioRunSnapshot,
+        update: ScenarioProgressUpdate,
+    ) -> ContextFragment:
+        assert self._scenario_progressor is not None
+        definition = self._scenario_progressor.definition_for(run)
+        if update.to_scene_id is not None:
+            runtime_scene = next(
+                scene for scene in run.scenes if scene.id == update.to_scene_id
+            )
+            scene = next(
+                scene
+                for scene in definition.scenes
+                if scene.sequence == runtime_scene.sequence
+            )
+            source = "scenario_scene"
+            content = f"{scene.title}: {scene.description}"
+        else:
+            ending = next(
+                ending
+                for ending in definition.endings
+                if ending.ending_ref == update.ending_ref
+            )
+            source = "scenario_ending"
+            content = f"{ending.title}: {ending.summary}"
+        return ContextFragment(
+            source=source,
+            trust_level="trusted",
+            access_scope="public",
+            content=content,
+        )
 
 
 class NarrationWorker:

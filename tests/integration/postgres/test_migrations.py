@@ -40,6 +40,7 @@ from ai_rpg.application import (
     InvalidCommitBundleError,
     NarrationWorker,
     RuntimePolicy,
+    ScenarioProgressor,
     SkillCheckResolutionWorker,
     StateVersionConflictError,
     TurnInProgressError,
@@ -85,6 +86,7 @@ from ai_rpg.infrastructure.postgres.repositories import (
     PostgresTurnRepository,
 )
 from ai_rpg.llm import ProviderRefusalError, ScriptedFakeTransport
+from ai_rpg.scenarios import BUILTIN_SCENARIOS
 
 URL = os.getenv("AIRPG_TEST_DATABASE_URL")
 ROOT = Path(__file__).parents[3]
@@ -578,6 +580,93 @@ def _seed_scenario_resolution_state(connection: Connection) -> None:
             ") VALUES(:campaign,'ruined_chapel',1,'active')"
         ),
         {"campaign": CAMPAIGN_A},
+    )
+
+
+def _seed_scenario_worker_state(
+    connection: Connection,
+    *,
+    active_sequence: int,
+    flags: tuple[str, ...] = (),
+) -> None:
+    _seed_resolution_state(connection)
+    connection.execute(
+        text(
+            "INSERT INTO scenes(id,campaign_id,sequence,status) VALUES"
+            "(:hall,:campaign,2,'planned'),(:sanctum,:campaign,3,'planned')"
+        ),
+        {"hall": SCENE_B, "sanctum": SCENE_C, "campaign": CAMPAIGN_A},
+    )
+    connection.execute(
+        text(
+            "UPDATE scenes SET status=CASE WHEN sequence<:active "
+            "THEN 'closed' ELSE 'planned' END "
+            "WHERE campaign_id=:campaign"
+        ),
+        {"active": active_sequence, "campaign": CAMPAIGN_A},
+    )
+    connection.execute(
+        text(
+            "UPDATE scenes SET status='active' "
+            "WHERE campaign_id=:campaign AND sequence=:active"
+        ),
+        {"active": active_sequence, "campaign": CAMPAIGN_A},
+    )
+    connection.execute(
+        text(
+            "INSERT INTO mvp_scenario_runs("
+            "campaign_id,scenario_ref,scenario_version,status"
+            ") VALUES(:campaign,'ruined_chapel',1,'active')"
+        ),
+        {"campaign": CAMPAIGN_A},
+    )
+    for flag in flags:
+        connection.execute(
+            text(
+                "INSERT INTO mvp_scenario_flags(campaign_id,flag_ref) "
+                "VALUES(:campaign,:flag)"
+            ),
+            {"campaign": CAMPAIGN_A, "flag": flag},
+        )
+    connection.execute(
+        text(
+            "INSERT INTO mvp_scene_entities("
+            "campaign_id,scene_id,entity_id,is_public,is_attack_reachable) VALUES"
+            "(:campaign,:hall,:actor,true,false),"
+            "(:campaign,:sanctum,:actor,true,false),"
+            "(:campaign,:sanctum,:target,true,true)"
+        ),
+        {
+            "campaign": CAMPAIGN_A,
+            "hall": SCENE_B,
+            "sanctum": SCENE_C,
+            "actor": ACTOR_A,
+            "target": ACTOR_C,
+        },
+    )
+    connection.execute(
+        text(
+            "INSERT INTO mvp_skill_modifiers("
+            "campaign_id,character_id,skill_ref,modifier) VALUES"
+            "(:campaign,:actor,'perception',2),"
+            "(:campaign,:actor,'persuasion',2),"
+            "(:campaign,:actor,'stealth',2)"
+        ),
+        {"campaign": CAMPAIGN_A, "actor": ACTOR_A},
+    )
+    connection.execute(
+        text(
+            "INSERT INTO mvp_scene_skill_checks("
+            "campaign_id,scene_id,check_ref,skill_ref,difficulty,public_description"
+            ") VALUES"
+            "(:campaign,:hall,'search_hall','perception','normal',"
+            "'広間で聖印へ続く手掛かりを見つけた。'),"
+            "(:campaign,:sanctum,'negotiate_guard','persuasion','normal',"
+            "'守衛との交渉結果が確定した。'),"
+            "(:campaign,:sanctum,'sneak_to_relic','stealth','normal',"
+            "'聖印への接近結果が確定した。')"
+        ),
+        {"campaign": CAMPAIGN_A, "hall": SCENE_B, "sanctum": SCENE_C},
     )
 
 
@@ -6182,6 +6271,407 @@ def _assert_plan_rejected_before_rng(
             assert list(connection.execute(
                 text(f"SELECT * FROM {table} ORDER BY 1,2,3")
             )) == before[table], table
+
+
+class _SequenceRandom:
+    def __init__(self, values: list[int]) -> None:
+        self._values = iter(values)
+        self.calls = 0
+
+    def randint(self, lower: int, upper: int) -> int:
+        self.calls += 1
+        value = next(self._values)
+        assert lower <= value <= upper
+        return value
+
+
+def _run_scenario_worker(
+    database: Engine,
+    *,
+    player_text: str,
+    decision: dict[str, object],
+    random_source: object,
+) -> tuple[UUID, dict[str, Any], MagicMock]:
+    ruleset = MagicMock(wraps=MvpV1Ruleset(DiceEngine(random_source)))
+
+    async def resolve() -> tuple[UUID, dict[str, Any]]:
+        url = database.url.render_as_string(hide_password=False)
+        async with _postgres_sessions(url) as factory:
+            accepted = await _accept_turn(factory, _player_turn(player_text))
+            transport = ScriptedFakeTransport([decision])
+            worker = SkillCheckResolutionWorker(
+                lambda: PostgresUnitOfWork(factory),
+                transport,
+                ruleset,
+                WorkerPhasePolicy(60, 3, 120, "fake-intent"),
+                scenario_progressor=ScenarioProgressor(BUILTIN_SCENARIOS),
+                rng_source="seeded_test",
+            )
+            assert await worker.run_once(accepted.turn_id)
+            return accepted.turn_id, json.loads(transport.calls[0].input_data)
+
+    with asyncio.Runner(loop_factory=asyncio.SelectorEventLoop) as runner:
+        turn_id, llm_input = runner.run(resolve())
+    return turn_id, llm_input, ruleset
+
+
+def test_scenario_worker_context_exposes_only_current_public_data(
+    database: Engine,
+) -> None:
+    with database.begin() as connection:
+        _seed_scenario_worker_state(
+            connection, active_sequence=3, flags=("alerted",)
+        )
+
+    _turn_id, llm_input, _ruleset = _run_scenario_worker(
+        database,
+        player_text="攻撃について確認する",
+        decision={"kind": "clarification_required", "question": "対象を指定してください。"},
+        random_source=_SequenceRandom([]),
+    )
+
+    scene_view = llm_input["scene_view"]
+    assert scene_view["source"] == "active_scene"
+    assert scene_view["trust_level"] == "trusted"
+    assert scene_view["access_scope"] == "public"
+    assert json.loads(scene_view["content"]) == {
+        "scene_title": "奥の部屋",
+        "scene_description": "銀の聖印を守るゴブリンが待ち構えている。",
+        "objective": "廃礼拝堂の奥から銀の聖印を回収する",
+        "discovered_facts": ["礼拝堂の守衛に侵入を警戒されている。"],
+        "available_actions": [
+            {"action_ref": "negotiate_guard", "label": "守衛と交渉する"},
+            {"action_ref": "sneak_to_relic", "label": "聖印へ忍び寄る"},
+            {"action_ref": "defeat_guard", "label": "守衛を倒す"},
+            {"action_ref": "retreat", "label": "撤退する"},
+        ],
+    }
+    serialized = json.dumps(llm_input, ensure_ascii=False)
+    for hidden in (
+        "alerted",
+        "clue_found",
+        "costly_success",
+        "崩れかけた廃礼拝堂の入口に立っている。",
+        "朽ちた長椅子が並ぶ薄暗い広間だ。",
+    ):
+        assert hidden not in serialized
+    assert {"attack", "skill_check", "scenario_action"} <= set(
+        llm_input["supported_action_types"]
+    )
+
+
+def test_scenario_worker_keeps_scenario_free_context_and_actions(
+    database: Engine,
+) -> None:
+    with database.begin() as connection:
+        _seed_resolution_state(connection)
+
+    _turn_id, llm_input, _ruleset = _run_scenario_worker(
+        database,
+        player_text="攻撃する",
+        decision={"kind": "clarification_required", "question": "対象を指定してください。"},
+        random_source=_SequenceRandom([]),
+    )
+
+    assert llm_input["scene_view"] == {
+        "source": "active_scene",
+        "trust_level": "trusted",
+        "access_scope": "public",
+        "content": "現在のSceneに公開済みの追加情報はない。",
+    }
+    assert set(llm_input["supported_action_types"]) == {"attack", "use_item"}
+
+
+@pytest.mark.parametrize(
+    ("active_sequence", "intents"),
+    [
+        (1, [{"kind": "scenario_action", "action_ref": "not_registered"}]),
+        (
+            3,
+            [
+                {"kind": "attack", "target_ref": "goblin", "weapon_ref": None},
+                {"kind": "scenario_action", "action_ref": "retreat"},
+            ],
+        ),
+    ],
+    ids=["unregistered-direct", "two-progression-candidates"],
+)
+def test_scenario_worker_rejects_invalid_progression_plan_before_rng_or_writes(
+    database: Engine,
+    active_sequence: int,
+    intents: list[dict[str, object]],
+) -> None:
+    with database.begin() as connection:
+        _seed_scenario_worker_state(connection, active_sequence=active_sequence)
+    random = _SequenceRandom([])
+
+    _turn_id, _llm_input, ruleset = _run_scenario_worker(
+        database,
+        player_text="攻撃する",
+        decision={"kind": "action_plan", "actions": intents},
+        random_source=random,
+    )
+
+    assert random.calls == 0
+    assert ruleset.mock_calls == []
+    with database.connect() as connection:
+        assert connection.scalar(text("SELECT count(*) FROM actions")) == 0
+        assert list(connection.execute(text("SELECT type FROM events")).scalars()) == [
+            "GMNarrationGenerated"
+        ]
+        assert connection.scalar(
+            text("SELECT state_version FROM campaigns WHERE id=:campaign"),
+            {"campaign": CAMPAIGN_A},
+        ) == 0
+        assert connection.execute(
+            text("SELECT status,ending_ref FROM mvp_scenario_runs")
+        ).one() == ("active", None)
+        expected_statuses = [
+            "closed" if sequence < active_sequence else "active" if sequence == active_sequence else "planned"
+            for sequence in (1, 2, 3)
+        ]
+        assert list(
+            connection.execute(text("SELECT status FROM scenes ORDER BY sequence")).scalars()
+        ) == expected_statuses
+        assert connection.scalar(text("SELECT count(*) FROM mvp_scenario_flags")) == 0
+
+
+def test_scenario_worker_preflights_narrative_escalation_before_route_write(
+    database: Engine,
+) -> None:
+    with database.begin() as connection:
+        _seed_scenario_worker_state(connection, active_sequence=3)
+    random = _SequenceRandom([])
+
+    turn_id, _llm_input, ruleset = _run_scenario_worker(
+        database,
+        player_text="この場面について話す",
+        decision={
+            "kind": "resolution_required",
+            "actions": [
+                {"kind": "attack", "target_ref": "goblin", "weapon_ref": None},
+                {"kind": "scenario_action", "action_ref": "retreat"},
+            ],
+        },
+        random_source=random,
+    )
+
+    assert random.calls == 0
+    assert ruleset.mock_calls == []
+    with database.connect() as connection:
+        assert connection.execute(
+            text("SELECT route,resolution_status FROM turns WHERE id=:turn"),
+            {"turn": turn_id},
+        ).one() == ("narrative", "not_applied")
+        assert connection.scalar(text("SELECT count(*) FROM actions")) == 0
+        assert list(connection.execute(text("SELECT type FROM events")).scalars()) == [
+            "GMNarrationGenerated"
+        ]
+
+
+@pytest.mark.parametrize(
+    (
+        "active_sequence",
+        "player_text",
+        "action_ref",
+        "public_fact",
+        "expected_statuses",
+        "expected_run",
+        "public_title",
+        "public_description",
+    ),
+    [
+        (
+            1,
+            "礼拝堂に入る",
+            "enter_chapel",
+            "廃礼拝堂の中へ入った。",
+            ["closed", "active", "planned"],
+            ("active", None),
+            "広間",
+            "朽ちた長椅子が並ぶ薄暗い広間だ。",
+        ),
+        (
+            3,
+            "撤退する",
+            "retreat",
+            "銀の聖印の回収を断念して撤退した。",
+            ["closed", "closed", "closed"],
+            ("completed", "retreated"),
+            "撤退",
+            "銀の聖印の回収を断念し、廃礼拝堂から撤退した。",
+        ),
+    ],
+)
+def test_scenario_worker_commits_direct_action_without_dice(
+    database: Engine,
+    active_sequence: int,
+    player_text: str,
+    action_ref: str,
+    public_fact: str,
+    expected_statuses: list[str],
+    expected_run: tuple[str, str | None],
+    public_title: str,
+    public_description: str,
+) -> None:
+    with database.begin() as connection:
+        _seed_scenario_worker_state(connection, active_sequence=active_sequence)
+    random = _SequenceRandom([])
+
+    turn_id, _llm_input, _ruleset = _run_scenario_worker(
+        database,
+        player_text=player_text,
+        decision={
+            "kind": "action_plan",
+            "actions": [{"kind": "scenario_action", "action_ref": action_ref}],
+        },
+        random_source=random,
+    )
+
+    assert random.calls == 0
+    with database.connect() as connection:
+        action = connection.execute(
+            text("SELECT command,result FROM actions WHERE turn_id=:turn"),
+            {"turn": turn_id},
+        ).one()
+        assert action.command["action_ref"] == action_ref
+        assert action.result == {
+            "kind": "applied",
+            "outcome": "neutral",
+            "facts": [public_fact],
+            "dice": [],
+            "state_changes": [],
+        }
+        assert list(
+            connection.execute(
+                text("SELECT type FROM events WHERE turn_id=:turn ORDER BY sequence"),
+                {"turn": turn_id},
+            ).scalars()
+        ) == ["ActionResolved", "ScenarioProgressed"]
+        assert list(
+            connection.execute(text("SELECT status FROM scenes ORDER BY sequence")).scalars()
+        ) == expected_statuses
+        assert connection.execute(
+            text("SELECT status,ending_ref FROM mvp_scenario_runs")
+        ).one() == expected_run
+        narration_input = connection.scalar(
+            text("SELECT narration_input FROM turns WHERE id=:turn"), {"turn": turn_id}
+        )
+        assert narration_input["committed_state_version"] == 1
+        public_state = json.dumps(
+            narration_input["public_state_after"], ensure_ascii=False
+        )
+        assert public_title in public_state
+        assert public_description in public_state
+        assert action_ref not in public_state
+
+
+def test_scenario_worker_search_progresses_from_engine_outcome(database: Engine) -> None:
+    with database.begin() as connection:
+        _seed_scenario_worker_state(connection, active_sequence=2)
+    random = _SequenceRandom([20])
+
+    turn_id, _llm_input, _ruleset = _run_scenario_worker(
+        database,
+        player_text="広間を調べる",
+        decision={
+            "kind": "action_plan",
+            "actions": [
+                {
+                    "kind": "skill_check",
+                    "skill_ref": "perception",
+                    "objective": "広間を調べる",
+                    "target_ref": None,
+                }
+            ],
+        },
+        random_source=random,
+    )
+
+    assert random.calls == 1
+    with database.connect() as connection:
+        assert list(
+            connection.execute(text("SELECT status FROM scenes ORDER BY sequence")).scalars()
+        ) == ["closed", "closed", "active"]
+        assert list(
+            connection.execute(text("SELECT flag_ref FROM mvp_scenario_flags")).scalars()
+        ) == ["clue_found"]
+        assert list(
+            connection.execute(
+                text("SELECT type FROM events WHERE turn_id=:turn ORDER BY sequence"),
+                {"turn": turn_id},
+            ).scalars()
+        ) == ["DiceRolled", "ActionResolved", "ScenarioProgressed"]
+        narration_input = connection.scalar(
+            text("SELECT narration_input FROM turns WHERE id=:turn"), {"turn": turn_id}
+        )
+        assert narration_input["committed_state_version"] == 1
+        public_state = json.dumps(
+            narration_input["public_state_after"], ensure_ascii=False
+        )
+        assert "奥の部屋" in public_state
+        assert "銀の聖印を守るゴブリンが待ち構えている。" in public_state
+        assert "clue_found" not in public_state
+        assert "costly_success" not in public_state
+
+
+def test_scenario_worker_attack_ending_increments_version_once(database: Engine) -> None:
+    with database.begin() as connection:
+        _seed_scenario_worker_state(connection, active_sequence=3)
+        connection.execute(
+            text("UPDATE mvp_characters SET current_hp=1 WHERE entity_id=:target"),
+            {"target": ACTOR_C},
+        )
+    random = _SequenceRandom([10, 1])
+
+    turn_id, _llm_input, _ruleset = _run_scenario_worker(
+        database,
+        player_text="ゴブリンを攻撃する",
+        decision={
+            "kind": "action_plan",
+            "actions": [
+                {"kind": "attack", "target_ref": "goblin", "weapon_ref": "iron_sword"}
+            ],
+        },
+        random_source=random,
+    )
+
+    assert random.calls == 2
+    with database.connect() as connection:
+        assert connection.scalar(
+            text("SELECT current_hp FROM mvp_characters WHERE entity_id=:target"),
+            {"target": ACTOR_C},
+        ) == 0
+        assert connection.scalar(
+            text("SELECT state_version FROM campaigns WHERE id=:campaign"),
+            {"campaign": CAMPAIGN_A},
+        ) == 1
+        assert connection.execute(
+            text("SELECT status,ending_ref FROM mvp_scenario_runs")
+        ).one() == ("completed", "recovered")
+        assert list(
+            connection.execute(
+                text("SELECT type FROM events WHERE turn_id=:turn ORDER BY sequence"),
+                {"turn": turn_id},
+            ).scalars()
+        ) == [
+            "DiceRolled",
+            "DiceRolled",
+            "DamageApplied",
+            "ActionResolved",
+            "ScenarioProgressed",
+        ]
+        narration_input = connection.scalar(
+            text("SELECT narration_input FROM turns WHERE id=:turn"), {"turn": turn_id}
+        )
+        assert narration_input["committed_state_version"] == 1
+        public_state = json.dumps(
+            narration_input["public_state_after"], ensure_ascii=False
+        )
+        assert "回収成功" in public_state
+        assert "銀の聖印を無事に回収した。" in public_state
+        assert "recovered" not in public_state
+        assert "costly_success" not in public_state
 
 
 @pytest.mark.parametrize("narrative", [False, True])

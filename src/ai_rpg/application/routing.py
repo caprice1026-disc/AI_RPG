@@ -51,6 +51,10 @@ class RuleBasedTurnRouter:
         r"(?:注意深く.{0,12}観察|周囲.{0,12}観察|調べ(?:る|たい)|探索(?:する|したい)|"
         r"隠密(?:する|したい)|説得(?:する|したい)|跳躍(?:する|したい))"
     )
+    _scenario_state_change = re.compile(
+        r"(?:入(?:る|りたい)|交渉(?:する|したい)|隠れ(?:る|たい)|"
+        r"忍び寄(?:る|りたい)|撤退(?:する|したい))"
+    )
     _item_or_state = re.compile(
         r"(?:(?:ポーション|薬).{0,12}(?:飲|使|消費)|"
         r"(?:飲|使|消費).{0,12}(?:ポーション|薬|アイテム)|"
@@ -73,6 +77,7 @@ class RuleBasedTurnRouter:
             (self._attack, "attack_action"),
             (self._dice_or_check, "dice_or_check"),
             (self._skill_attempt, "skill_attempt"),
+            (self._scenario_state_change, "scenario_state_change"),
             (self._item_or_state, "item_or_state_change"),
         )
         has_explanation = False
