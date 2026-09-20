@@ -30,6 +30,13 @@ class ActionResolvedPayload(Contract):
     result: ActionResult
 
 
+class ScenarioProgressedPayload(Contract):
+    from_scene_id: UUID
+    to_scene_id: UUID | None
+    add_flags: tuple[str, ...]
+    ending_ref: str | None
+
+
 class NarrationGeneratedPayload(Contract):
     narration: NarrationText
     fallback: StrictBool
@@ -85,6 +92,14 @@ class ActionResolvedEvent(ActionEventBase):
     payload: ActionResolvedPayload
 
 
+class ScenarioProgressedEvent(EventBase):
+    type: Literal["ScenarioProgressed"]
+    scene_id: UUID
+    turn_id: UUID
+    action_id: None = None
+    payload: ScenarioProgressedPayload
+
+
 class NarrationGeneratedEvent(EventBase):
     type: Literal["GMNarrationGenerated"]
     scene_id: UUID
@@ -99,6 +114,7 @@ DomainEventV1: TypeAlias = Annotated[
     | HealingAppliedEvent
     | ItemConsumedEvent
     | ActionResolvedEvent
+    | ScenarioProgressedEvent
     | NarrationGeneratedEvent,
     Field(discriminator="type"),
 ]

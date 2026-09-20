@@ -41,5 +41,7 @@ class NarrativeInput(GMInput):
 
 
 class MechanicalInput(GMInput):
-    supported_action_types: list[Literal["attack", "skill_check", "use_item"]]
+    supported_action_types: list[
+        Literal["attack", "skill_check", "use_item", "scenario_action"]
+    ]
     supported_skill_refs: list[Ref]

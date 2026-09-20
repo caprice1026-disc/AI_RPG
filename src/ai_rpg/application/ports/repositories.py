@@ -136,6 +136,14 @@ class ActionRecord:
 
 
 @dataclass(frozen=True, slots=True)
+class ScenarioProgressUpdate:
+    from_scene_id: UUID
+    to_scene_id: UUID | None
+    add_flags: tuple[str, ...]
+    ending_ref: str | None
+
+
+@dataclass(frozen=True, slots=True)
 class CommitBundle:
     campaign_id: UUID
     scene_id: UUID
@@ -144,6 +152,7 @@ class CommitBundle:
     base_state_version: int
     actions: tuple[ActionRecord, ...]
     narration_input: MechanicalNarrationInput
+    scenario_update: ScenarioProgressUpdate | None = None
 
 
 @dataclass(frozen=True, slots=True)

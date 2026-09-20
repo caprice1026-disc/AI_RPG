@@ -7,6 +7,7 @@ from ai_rpg.contracts.llm_decisions import (
     AttackIntent,
     MechanicalDecision,
     NarrativeDecision,
+    ScenarioActionIntent,
     make_decision_types,
 )
 from ai_rpg.contracts.player_turn import ChoiceInput, PlayerTurnInput, TextInput
@@ -25,6 +26,7 @@ __all__ = [
     "PlayerTurnInput",
     "PublicEvent",
     "PublicTurnEventPayload",
+    "ScenarioActionIntent",
     "TextInput",
     "TurnRecovery",
     "TurnResponse",

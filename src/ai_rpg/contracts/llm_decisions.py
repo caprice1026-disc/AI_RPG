@@ -26,8 +26,14 @@ class UseItemIntent(Contract):
     target_ref: Ref | None
 
 
+class ScenarioActionIntent(Contract):
+    kind: Literal["scenario_action"]
+    action_ref: Ref
+
+
 ActionIntent: TypeAlias = Annotated[
-    AttackIntent | SkillCheckIntent | UseItemIntent, Field(discriminator="kind")
+    AttackIntent | SkillCheckIntent | UseItemIntent | ScenarioActionIntent,
+    Field(discriminator="kind"),
 ]
 
 

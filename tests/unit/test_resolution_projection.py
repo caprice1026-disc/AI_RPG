@@ -9,6 +9,7 @@ from ai_rpg.application.ports.repositories import (
     ActionRecord,
     CommitBundle,
     InvalidCommitBundleError,
+    ScenarioProgressUpdate,
 )
 from ai_rpg.application.resolution import (
     CharacterHpMutation,
@@ -18,8 +19,9 @@ from ai_rpg.application.resolution import (
 )
 from ai_rpg.contracts.context import OutputLimits
 from ai_rpg.contracts.responses import MechanicalNarrationInput
+from ai_rpg.domain import ScenarioActionCommand
 from ai_rpg.domain.commands import AttackCommand, UseItemCommand
-from ai_rpg.domain.events import RNGMetadata
+from ai_rpg.domain.events import RNGMetadata, ScenarioProgressedEvent
 from ai_rpg.domain.results import (
     AppliedResult,
     DamageApplied,
@@ -45,6 +47,30 @@ def _narration(action: ActionRecord, version: int) -> MechanicalNarrationInput:
         allowed_entity_refs=[],
         output_limits=OutputLimits(max_actions=3, max_choices=5),
     )
+
+
+def _scenario_action_record(
+    campaign_id: UUID,
+    turn_id: UUID,
+    actor_id: UUID,
+) -> ActionRecord:
+    command = ScenarioActionCommand(
+        action_id=uuid4(),
+        campaign_id=campaign_id,
+        turn_id=turn_id,
+        actor_id=actor_id,
+        ordinal=1,
+        kind="scenario_action",
+        action_ref="enter_chapel",
+    )
+    result = AppliedResult(
+        kind="applied",
+        outcome="success",
+        facts=["礼拝堂に入った"],
+        dice=[],
+        state_changes=[],
+    )
+    return ActionRecord(command=command, result=result)
 
 
 def test_damage_projection_derives_hp_mutation_and_version() -> None:
@@ -89,6 +115,12 @@ def test_damage_projection_derives_hp_mutation_and_version() -> None:
             ),
         ),
     )
+    scenario_update = ScenarioProgressUpdate(
+        from_scene_id=scene_id,
+        to_scene_id=uuid4(),
+        add_flags=(),
+        ending_ref=None,
+    )
     bundle = CommitBundle(
         campaign_id=campaign_id,
         scene_id=scene_id,
@@ -97,6 +129,7 @@ def test_damage_projection_derives_hp_mutation_and_version() -> None:
         base_state_version=4,
         actions=(action,),
         narration_input=_narration(action, 5),
+        scenario_update=scenario_update,
     )
 
     projection = project_resolution(
@@ -109,11 +142,13 @@ def test_damage_projection_derives_hp_mutation_and_version() -> None:
     assert projection.canonical_mutations == (
         CharacterHpMutation(target_id, hp_before=10, hp_after=7, max_hp=None),
     )
-    assert [event.sequence for event in projection.events] == [8, 9, 10]
+    assert projection.scenario_update == scenario_update
+    assert [event.sequence for event in projection.events] == [8, 9, 10, 11]
     assert [event.type for event in projection.events] == [
         "DiceRolled",
         "DamageApplied",
         "ActionResolved",
+        "ScenarioProgressed",
     ]
 
 
@@ -185,6 +220,80 @@ def test_healing_and_item_consumption_are_typed_canonical_mutations() -> None:
         "ItemConsumed",
         "ActionResolved",
     ]
+
+
+def test_scenario_progress_increments_version_and_emits_turn_event_last() -> None:
+    campaign_id, scene_id, next_scene_id, turn_id = uuid4(), uuid4(), uuid4(), uuid4()
+    actor_id = uuid4()
+    action = _scenario_action_record(campaign_id, turn_id, actor_id)
+    scenario_update = ScenarioProgressUpdate(
+        from_scene_id=scene_id,
+        to_scene_id=next_scene_id,
+        add_flags=("entered",),
+        ending_ref=None,
+    )
+    bundle = CommitBundle(
+        campaign_id=campaign_id,
+        scene_id=scene_id,
+        turn_id=turn_id,
+        worker_epoch=1,
+        base_state_version=3,
+        actions=(action,),
+        narration_input=_narration(action, 4),
+        scenario_update=scenario_update,
+    )
+
+    projection = project_resolution(
+        bundle,
+        TurnCommitContext(scene_id=scene_id, actor_id=actor_id, max_actions=3),
+        first_event_sequence=8,
+    )
+
+    assert projection.committed_state_version == 4
+    assert projection.canonical_mutations == ()
+    assert projection.scenario_update == scenario_update
+    assert [event.type for event in projection.events] == [
+        "ActionResolved",
+        "ScenarioProgressed",
+    ]
+    event = projection.events[-1]
+    assert isinstance(event, ScenarioProgressedEvent)
+    assert event.sequence == 9
+    assert event.state_version == 4
+    assert event.scene_id == scene_id
+    assert event.turn_id == turn_id
+    assert event.action_id is None
+    assert event.payload.from_scene_id == scene_id
+    assert event.payload.to_scene_id == next_scene_id
+    assert event.payload.add_flags == ("entered",)
+    assert event.payload.ending_ref is None
+
+
+def test_scenario_progress_rejects_mismatched_narration_version() -> None:
+    campaign_id, scene_id, turn_id, actor_id = uuid4(), uuid4(), uuid4(), uuid4()
+    action = _scenario_action_record(campaign_id, turn_id, actor_id)
+    bundle = CommitBundle(
+        campaign_id=campaign_id,
+        scene_id=scene_id,
+        turn_id=turn_id,
+        worker_epoch=1,
+        base_state_version=3,
+        actions=(action,),
+        narration_input=_narration(action, 3),
+        scenario_update=ScenarioProgressUpdate(
+            from_scene_id=scene_id,
+            to_scene_id=uuid4(),
+            add_flags=(),
+            ending_ref=None,
+        ),
+    )
+
+    with pytest.raises(InvalidCommitBundleError, match="描写入力"):
+        project_resolution(
+            bundle,
+            TurnCommitContext(scene_id=scene_id, actor_id=actor_id, max_actions=3),
+            first_event_sequence=1,
+        )
 
 
 @pytest.mark.parametrize(

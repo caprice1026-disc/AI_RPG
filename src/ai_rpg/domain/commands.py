@@ -41,6 +41,12 @@ class UseItemCommand(CommandBase):
     effect_ref: Ref
 
 
+class ScenarioActionCommand(CommandBase):
+    kind: Literal["scenario_action"]
+    action_ref: Ref
+
+
 Command: TypeAlias = Annotated[
-    AttackCommand | SkillCheckCommand | UseItemCommand, Field(discriminator="kind")
+    AttackCommand | SkillCheckCommand | UseItemCommand | ScenarioActionCommand,
+    Field(discriminator="kind"),
 ]

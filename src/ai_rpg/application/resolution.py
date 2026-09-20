@@ -9,6 +9,7 @@ from ai_rpg.application.ports.repositories import (
     ActionRecord,
     CommitBundle,
     InvalidCommitBundleError,
+    ScenarioProgressUpdate,
 )
 from ai_rpg.contracts.responses import MechanicalNarrationInput
 from ai_rpg.domain.events import (
@@ -20,6 +21,8 @@ from ai_rpg.domain.events import (
     DomainEventV1,
     HealingAppliedEvent,
     ItemConsumedEvent,
+    ScenarioProgressedEvent,
+    ScenarioProgressedPayload,
 )
 from ai_rpg.domain.results import (
     AppliedResult,
@@ -62,6 +65,7 @@ class ResolutionProjection:
     events: tuple[DomainEventV1, ...]
     narration_input: MechanicalNarrationInput
     canonical_mutations: tuple[CanonicalMutation, ...]
+    scenario_update: ScenarioProgressUpdate | None
     committed_state_version: int
 
 
@@ -147,7 +151,7 @@ def _events(
     events: list[DomainEventV1] = []
     event_ids: set[UUID] = set()
 
-    def values(action_id: UUID) -> dict[str, object]:
+    def values(action_id: UUID | None) -> dict[str, object]:
         event_id = event_id_factory()
         if event_id in event_ids:
             raise InvalidCommitBundleError("Event IDが重複しています")
@@ -200,6 +204,20 @@ def _events(
                 **values(action_id),
             )
         )
+    if bundle.scenario_update is not None:
+        update = bundle.scenario_update
+        events.append(
+            ScenarioProgressedEvent(
+                type="ScenarioProgressed",
+                payload=ScenarioProgressedPayload(
+                    from_scene_id=update.from_scene_id,
+                    to_scene_id=update.to_scene_id,
+                    add_flags=update.add_flags,
+                    ending_ref=update.ending_ref,
+                ),
+                **values(None),
+            )
+        )
     return tuple(events)
 
 
@@ -231,7 +249,8 @@ def project_resolution(
             raise InvalidCommitBundleError("Action Commandの親IDが一致しません")
 
     mutations = _canonical_mutations(actions)
-    version = bundle.base_state_version + int(bool(mutations))
+    changed = bool(mutations) or bundle.scenario_update is not None
+    version = bundle.base_state_version + int(changed)
     resolved_actions = [
         ResolvedAction(
             action_id=action.command.action_id,
@@ -255,4 +274,11 @@ def project_resolution(
         state_version=version,
         event_id_factory=event_id_factory,
     )
-    return ResolutionProjection(actions, events, narration, mutations, version)
+    return ResolutionProjection(
+        actions=actions,
+        events=events,
+        narration_input=narration,
+        canonical_mutations=mutations,
+        scenario_update=bundle.scenario_update,
+        committed_state_version=version,
+    )
