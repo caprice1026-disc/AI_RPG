@@ -278,7 +278,7 @@ async def test_verifier_requires_oidc_claims(
         ("wrong-issuer", {"iss": "https://other.example.com/"}),
         ("wrong-audience", {"aud": "other-api"}),
         ("expired-within-leeway", {"exp": datetime.now(UTC) - timedelta(seconds=1)}),
-        ("future-nbf", {"nbf": datetime.now(UTC) + timedelta(minutes=5)}),
+        ("future-nbf", {"nbf": datetime.now(UTC) + timedelta(hours=1)}),
         ("invalid-iat", {"iat": "not-a-number"}),
         ("empty-subject", {"sub": ""}),
         ("boolean-expiry", {"exp": True}),

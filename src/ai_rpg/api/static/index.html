@@ -287,6 +287,7 @@
     let busy = false;
     let stateVersion = null;
     let stateCampaignId = null;
+    const refreshGenerations = new Map();
     let trackingGeneration = 0;
     let cancelTracking = null;
     let workflowGeneration = 0;
@@ -364,9 +365,11 @@
     }
 
     function setStateVersion(campaignId, version) {
+      if (stateCampaignId === campaignId && stateVersion !== null && version < stateVersion) return false;
       stateCampaignId = campaignId;
       stateVersion = version;
       ui["version-value"].textContent = String(version);
+      return true;
     }
 
     function resetView() {
@@ -465,9 +468,11 @@
     }
 
     async function refreshCampaignState(campaignId, { resume = false } = {}) {
+      const generation = (refreshGenerations.get(campaignId) || 0) + 1;
+      refreshGenerations.set(campaignId, generation);
       const state = await api(`/campaigns/${encodeURIComponent(campaignId)}/state`);
-      if (ui["campaign-id"].value.trim() !== campaignId) return state;
-      setStateVersion(campaignId, state.state_version);
+      if (refreshGenerations.get(campaignId) !== generation || ui["campaign-id"].value.trim() !== campaignId) return state;
+      if (!setStateVersion(campaignId, state.state_version)) return state;
       if (state.latest_turn) {
         updateStatus(campaignId, state.latest_turn);
         if (resume) await resumeTurn(campaignId, state.latest_turn);
@@ -643,10 +648,14 @@
           showError(error.message);
         } else {
           const message = error instanceof Error ? error.message : "Turnの処理に失敗しました。";
-          showRetry(message, () => {
-            const saved = AiRpgPending.load(localStorage);
-            if (saved) continuePending(saved, false);
-          });
+          if (rejected) {
+            showError(message);
+          } else {
+            showRetry(message, () => {
+              const saved = AiRpgPending.load(localStorage);
+              if (saved) continuePending(saved, false);
+            });
+          }
         }
         if (error?.status === 401) {
           ui.connection.dataset.state = "error";

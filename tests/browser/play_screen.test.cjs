@@ -218,6 +218,74 @@ test("response loss retries the exact same request id and body", async () => {
   assert.equal(AiRpgPending.load(app.storage), null);
 });
 
+test("5xx retries the exact same request id and body", async () => {
+  const posts = [];
+  let postCount = 0;
+  const app = harness(async (path, options = {}) => {
+    if (path === "/health") return response({ status: "ok" });
+    if (path.endsWith("/state")) return response({ state_version: 0, latest_turn: null });
+    if (options.method === "POST") {
+      posts.push(JSON.parse(options.body));
+      postCount += 1;
+      if (postCount === 1) return response({ detail: { code: "UNKNOWN" } }, 503);
+      return response(terminalTurn("turn-1", 0), 202);
+    }
+    throw new Error(`unexpected request: ${path}`);
+  });
+  app.elements["campaign-id"].value = "campaign-a";
+  app.elements["actor-id"].value = "actor-a";
+  app.elements["action-text"].value = "調べる";
+
+  await app.elements.composer.dispatch("submit", { preventDefault() {} });
+  await flush();
+  assert.deepEqual(AiRpgPending.load(app.storage).body, posts[0]);
+
+  const retry = find(app.elements.timeline, node => node.textContent === "同じ送信を再試行");
+  assert.ok(retry);
+  await retry.dispatch("click");
+  await flush();
+
+  assert.equal(posts.length, 2);
+  assert.deepEqual(posts[1], posts[0]);
+  assert.equal(posts[0].request_id, "request-1");
+  assert.equal(AiRpgPending.load(app.storage), null);
+});
+
+test("successful POST JSON parse failure retries the exact same request id and body", async () => {
+  const posts = [];
+  let postCount = 0;
+  const app = harness(async (path, options = {}) => {
+    if (path === "/health") return response({ status: "ok" });
+    if (path.endsWith("/state")) return response({ state_version: 0, latest_turn: null });
+    if (options.method === "POST") {
+      posts.push(JSON.parse(options.body));
+      postCount += 1;
+      if (postCount === 1) {
+        return { ok: true, status: 202, async json() { throw new SyntaxError("invalid JSON"); } };
+      }
+      return response(terminalTurn("turn-1", 0), 202);
+    }
+    throw new Error(`unexpected request: ${path}`);
+  });
+  app.elements["campaign-id"].value = "campaign-a";
+  app.elements["actor-id"].value = "actor-a";
+  app.elements["action-text"].value = "調べる";
+
+  await app.elements.composer.dispatch("submit", { preventDefault() {} });
+  await flush();
+  assert.deepEqual(AiRpgPending.load(app.storage).body, posts[0]);
+
+  const retry = find(app.elements.timeline, node => node.textContent === "同じ送信を再試行");
+  assert.ok(retry);
+  await retry.dispatch("click");
+  await flush();
+
+  assert.equal(posts.length, 2);
+  assert.deepEqual(posts[1], posts[0]);
+  assert.equal(posts[0].request_id, "request-1");
+  assert.equal(AiRpgPending.load(app.storage), null);
+});
+
 test("422 clears pending and corrected input uses a new request id", async () => {
   const posts = [];
   const app = harness(async (path, options = {}) => {
@@ -237,6 +305,14 @@ test("422 clears pending and corrected input uses a new request id", async () =>
   await app.elements.composer.dispatch("submit", { preventDefault() {} });
   await flush();
   assert.equal(AiRpgPending.load(app.storage), null);
+  assert.equal(
+    find(app.elements.timeline, node => node.textContent === "同じ送信を再試行"),
+    null,
+  );
+  assert.ok(find(
+    app.elements.timeline,
+    node => node.className === "notice error" && node.textContent === "API error (422)",
+  ));
 
   app.elements["action-text"].value = "引き返す";
   await app.elements.composer.dispatch("submit", { preventDefault() {} });
@@ -271,6 +347,54 @@ test("latest turn version never overwrites current campaign version", async () =
   assert.equal(posts.length, 1);
   assert.equal(posts[0].expected_state_version, 2);
   assert.equal(app.elements["version-value"].textContent, "2");
+});
+
+test("delayed same-campaign state response cannot resume an obsolete turn", async () => {
+  let stateCalls = 0;
+  let resolveFirstState;
+  const firstState = new Promise(resolve => { resolveFirstState = resolve; });
+  const currentTurn = { ...terminalTurn("turn-current", 2), narration: "current" };
+  const obsoleteTurn = { ...terminalTurn("turn-obsolete", 1), narration: "obsolete" };
+  const app = harness(async path => {
+    if (path === "/health") return response({ status: "ok" });
+    if (path.endsWith("/state")) {
+      stateCalls += 1;
+      if (stateCalls === 1) return firstState;
+      return response({ state_version: 2, latest_turn: currentTurn });
+    }
+    throw new Error(`unexpected request: ${path}`);
+  });
+  app.elements["campaign-id"].value = "campaign-a";
+
+  const olderRefresh = app.context.refreshCampaignState("campaign-a", { resume: true });
+  await flush();
+  const newerRefresh = app.context.refreshCampaignState("campaign-a", { resume: true });
+  await newerRefresh;
+  resolveFirstState(response({ state_version: 1, latest_turn: obsoleteTurn }));
+  await olderRefresh;
+
+  assert.equal(app.elements["version-value"].textContent, "2");
+  assert.equal(app.elements["turn-value"].textContent, "turn-current");
+  assert.equal(find(app.elements.timeline, node => node.textContent === "obsolete"), null);
+});
+
+test("lower state version response is ignored before resuming its turn", async () => {
+  const states = [
+    { state_version: 2, latest_turn: terminalTurn("turn-current", 2) },
+    { state_version: 1, latest_turn: terminalTurn("turn-obsolete", 1) },
+  ];
+  const app = harness(async path => {
+    if (path === "/health") return response({ status: "ok" });
+    if (path.endsWith("/state")) return response(states.shift());
+    throw new Error(`unexpected request: ${path}`);
+  });
+  app.elements["campaign-id"].value = "campaign-a";
+
+  await app.context.refreshCampaignState("campaign-a", { resume: true });
+  await app.context.refreshCampaignState("campaign-a", { resume: true });
+
+  assert.equal(app.elements["version-value"].textContent, "2");
+  assert.equal(app.elements["turn-value"].textContent, "turn-current");
 });
 
 test("state conflict refreshes version without replaying the rejected action", async () => {
@@ -371,6 +495,48 @@ test("reload tracks an accepted turn by GET without another POST", async () => {
 
   assert.ok(calls.some(([path]) => path.endsWith("/turns/turn-known")));
   assert.equal(calls.filter(([, method]) => method === "POST").length, 0);
+  assert.equal(AiRpgPending.load(app.storage), null);
+});
+
+test("tracking failure preserves the accepted turn id and exact request body", async () => {
+  const posts = [];
+  let turnGets = 0;
+  const events = eventSourceTracker();
+  const app = harness(async (path, options = {}) => {
+    if (path === "/health") return response({ status: "ok" });
+    if (path.endsWith("/state")) return response({ state_version: 3, latest_turn: null });
+    if (options.method === "POST") {
+      posts.push(JSON.parse(options.body));
+      return response(pendingTurn("turn-known"), 202);
+    }
+    if (path.endsWith("/turns/turn-known")) {
+      turnGets += 1;
+      if (turnGets === 1) throw new Error("tracking failed");
+      return response(terminalTurn("turn-known", 3));
+    }
+    throw new Error(`unexpected request: ${path}`);
+  }, ["request-known"], null, events);
+  app.elements["campaign-id"].value = "campaign-a";
+  app.elements["actor-id"].value = "actor-a";
+  app.elements["action-text"].value = "調べる";
+
+  await app.elements.composer.dispatch("submit", { preventDefault() {} });
+  await flush();
+  events.instances[0].emit("error");
+  await flush();
+
+  const saved = AiRpgPending.load(app.storage);
+  assert.equal(saved.turnId, "turn-known");
+  assert.deepEqual(saved.body, posts[0]);
+  assert.equal(saved.body.request_id, "request-known");
+
+  const retry = find(app.elements.timeline, node => node.textContent === "同じ送信を再試行");
+  assert.ok(retry);
+  await retry.dispatch("click");
+  await flush();
+
+  assert.equal(posts.length, 1);
+  assert.equal(turnGets, 2);
   assert.equal(AiRpgPending.load(app.storage), null);
 });
 

@@ -13,6 +13,8 @@ Mechanical planは、`snapshot(campaign_id, scene_id)` が返す初期snapshot�
 
 migration `0008_scene_entities` はtableと制約だけを追加する。既存deploymentにScene relationを推測してbackfillしないため、既存Entityは明示的に行を作るまで新しいScene可視性や攻撃対象にはならない。
 
+運用上、`0008_scene_entities` のdowngradeはtableを削除し、保存済みのScene–Entity行をすべて失う。後で再度upgradeしても空のtableが再作成されるだけで、削除されたrelationは復元されないため、必要なデータはdowngrade前に退避し、再投入しなければならない。
+
 ## 採用理由
 
 - Sceneごとの公開情報と攻撃可能性を、履歴やLLMの推測ではなく同じCanonical snapshotから決められる。
