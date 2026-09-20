@@ -15,6 +15,12 @@ from ai_rpg.application.ports import (
     UnitOfWork,
 )
 from ai_rpg.application.routing import RouteDecision, RuleBasedTurnRouter, TurnRouter
+from ai_rpg.application.scenarios import (
+    ScenarioActionBinding,
+    ScenarioProgressor,
+    ScenarioPublicContext,
+    ScenarioStateError,
+)
 from ai_rpg.application.turn_queries import TurnNotFoundError, TurnQueryService
 from ai_rpg.application.turns import RuntimePolicy, TurnService
 from ai_rpg.application.workers import (
@@ -38,6 +44,10 @@ __all__ = [
     "RouteDecision",
     "RuleBasedTurnRouter",
     "RuntimePolicy",
+    "ScenarioActionBinding",
+    "ScenarioProgressor",
+    "ScenarioPublicContext",
+    "ScenarioStateError",
     "SkillCheckResolutionWorker",
     "StateVersionConflictError",
     "TurnInProgressError",
