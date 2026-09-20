@@ -216,6 +216,22 @@ def test_binding_rejects_unregistered_or_other_scene_actions() -> None:
     assert progressor.bind_attack(snapshot, "goblin") is None
 
 
+def test_progress_rejects_structurally_equal_non_identical_binding() -> None:
+    snapshot = hall_snapshot()
+    registered = skill_binding(snapshot, "perception")
+    copied = registered.model_copy(deep=True)
+    assert copied == registered
+    assert copied is not registered
+
+    with pytest.raises(ScenarioStateError, match="Action binding"):
+        progressor.progress_for(
+            snapshot,
+            binding=copied,
+            outcome="success",
+            target_hp_after=None,
+        )
+
+
 def test_public_context_maps_flags_without_exposing_hidden_conditions() -> None:
     context = progressor.public_context_for(sanctum_snapshot(flags={"alerted"}))
 

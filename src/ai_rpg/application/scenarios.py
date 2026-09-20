@@ -106,7 +106,7 @@ class ScenarioProgressor:
         target_hp_after: int | None,
     ) -> ScenarioProgressUpdate | None:
         definition, scene, active = self._current_scene(snapshot)
-        if binding not in scene.actions:
+        if not any(action is binding for action in scene.actions):
             raise ScenarioStateError("Action bindingが現在Sceneと一致しません")
 
         effect: ScenarioEffect
