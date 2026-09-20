@@ -6,6 +6,7 @@ from uuid import UUID
 
 from ai_rpg.application.ports.repositories import (
     ActionRecord,
+    AdventureCompletedError,
     AuthorizationError,
     CanonicalRepository,
     CanonicalSnapshot,
@@ -55,6 +56,7 @@ class PublicEventSource(Protocol):
 
 __all__ = [
     "ActionRecord",
+    "AdventureCompletedError",
     "AuthorizationError",
     "AuthorizationPolicy",
     "CanonicalRepository",

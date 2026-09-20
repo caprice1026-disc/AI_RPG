@@ -11,6 +11,7 @@ from httpx import ASGITransport, AsyncClient
 
 from ai_rpg.api import create_app
 from ai_rpg.application import (
+    AdventureCompletedError,
     AuthenticatedPrincipal,
     AuthorizationError,
     IdempotencyConflictError,
@@ -241,6 +242,33 @@ async def test_accept_turn_maps_application_conflicts(
 
     assert response.status_code == status_code
     assert response.json() == {"detail": {"code": code}}
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_accept_turn_maps_adventure_completed_to_409() -> None:
+    turn_service = AsyncMock()
+    turn_service.accept.side_effect = AdventureCompletedError()
+    app = create_app(
+        turn_service=turn_service,
+        turn_query_service=AsyncMock(),
+        principal_provider=_authenticated,
+    )
+
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.post(
+            f"/campaigns/{CAMPAIGN_ID}/turns",
+            json={
+                "request_id": str(REQUEST_ID),
+                "expected_state_version": 0,
+                "actor_id": str(ACTOR_ID),
+                "content": {"kind": "text", "text": "進む"},
+            },
+        )
+
+    assert response.status_code == 409
+    assert response.json() == {"detail": {"code": "ADVENTURE_COMPLETED"}}
 
 
 def _public_event(event_id: int) -> PublicEvent:

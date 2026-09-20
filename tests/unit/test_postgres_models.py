@@ -102,6 +102,19 @@ def test_scenario_progress_metadata_matches_constraints() -> None:
     assert list(flags.primary_key.columns.keys()) == ["campaign_id", "flag_ref"]
 
 
+def test_action_kind_metadata_allows_scenario_action() -> None:
+    check = next(
+        constraint
+        for constraint in models.ActionModel.__table__.constraints
+        if isinstance(constraint, CheckConstraint)
+        and constraint.name == "actions_kind_check"
+    )
+
+    assert str(check.sqltext) == (
+        "kind IN ('attack','skill_check','use_item','scenario_action')"
+    )
+
+
 def test_canonical_snapshot_defaults_scene_entities_for_existing_fixtures() -> None:
     snapshot = CanonicalSnapshot(
         campaign_id=UUID(int=1),

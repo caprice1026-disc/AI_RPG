@@ -3,6 +3,7 @@
 from ai_rpg.application.auth import AuthenticatedPrincipal
 from ai_rpg.application.event_stream import EventStreamService
 from ai_rpg.application.ports import (
+    AdventureCompletedError,
     AuthorizationError,
     AuthorizationPolicy,
     ChoiceNotAvailableError,
@@ -31,6 +32,7 @@ from ai_rpg.application.workers import (
 )
 
 __all__ = [
+    "AdventureCompletedError",
     "AuthenticatedPrincipal",
     "AuthorizationError",
     "AuthorizationPolicy",

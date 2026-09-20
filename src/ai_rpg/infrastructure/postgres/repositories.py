@@ -15,6 +15,7 @@ from sqlalchemy.sql import update as sql_update
 from sqlalchemy.sql.selectable import FromClause
 
 from ai_rpg.application.ports.repositories import (
+    AdventureCompletedError,
     AuthorizationError,
     CanonicalRepository,
     CanonicalSnapshot,
@@ -497,6 +498,15 @@ class PostgresTurnRepository:
             raise AuthorizationError("Campaignを参照する権限がありません")
         if await self._request_row(campaign_id, principal_id, turn.request_id) is not None:
             return None
+        scenario_status = (
+            await self._session.execute(
+                select(MvpScenarioRunModel.status).where(
+                    MvpScenarioRunModel.campaign_id == campaign_id
+                )
+            )
+        ).scalar_one_or_none()
+        if scenario_status == "completed":
+            raise AdventureCompletedError("Adventureは完了しています")
         if campaign["status"] != "active":
             raise AuthorizationError("停止中のCampaignへTurnは追加できません")
         if not await _lock_actor_authorization(
@@ -952,9 +962,6 @@ class PostgresTurnRepository:
         return True
 
     async def commit_resolution(self, bundle: CommitBundle) -> int:
-        if any(isinstance(action.command, ScenarioActionCommand) for action in bundle.actions):
-            raise InvalidCommitBundleError("Scenario Actionの永続化は未対応です")
-
         # デッドロックを避ける不変順序: Campaign、Turn。
         campaign = (
             (
@@ -993,6 +1000,94 @@ class PostgresTurnRepository:
             or int(turn["worker_epoch"]) != bundle.worker_epoch
         ):
             raise RuntimeError("worker leaseが無効です")
+        scenario_update = bundle.scenario_update
+        if scenario_update is not None:
+            run = (
+                (
+                    await self._session.execute(
+                        text(
+                            "SELECT status FROM mvp_scenario_runs "
+                            "WHERE campaign_id=:c FOR UPDATE"
+                        ),
+                        {"c": bundle.campaign_id},
+                    )
+                )
+                .mappings()
+                .one_or_none()
+            )
+            if run is None or run["status"] != "active":
+                raise InvalidCommitBundleError("Scenario runがactiveではありません")
+
+            current_scene_id = (
+                await self._session.execute(
+                    text(
+                        "SELECT id FROM scenes "
+                        "WHERE campaign_id=:c AND id=:s AND status='active' "
+                        "FOR UPDATE"
+                    ),
+                    {
+                        "c": bundle.campaign_id,
+                        "s": scenario_update.from_scene_id,
+                    },
+                )
+            ).scalar_one_or_none()
+            if (
+                current_scene_id is None
+                or scenario_update.from_scene_id != turn["scene_id"]
+            ):
+                raise InvalidCommitBundleError("Scenarioのfrom Sceneが現在地と一致しません")
+
+            if scenario_update.to_scene_id is not None:
+                planned_scene_id = (
+                    await self._session.execute(
+                        text(
+                            "SELECT id FROM scenes "
+                            "WHERE campaign_id=:c AND id=:s AND status='planned'"
+                        ),
+                        {
+                            "c": bundle.campaign_id,
+                            "s": scenario_update.to_scene_id,
+                        },
+                    )
+                ).scalar_one_or_none()
+                if planned_scene_id is None:
+                    raise InvalidCommitBundleError(
+                        "Scenarioのto Sceneが同一Campaignのplanned Sceneではありません"
+                    )
+
+            if (
+                scenario_update.ending_ref is not None
+                and scenario_update.to_scene_id is not None
+            ):
+                raise InvalidCommitBundleError("Scenarioのto SceneとEndingは排他的です")
+
+            other_active_count = int(
+                (
+                    await self._session.execute(
+                        text(
+                            "SELECT count(*) FROM scenes "
+                            "WHERE campaign_id=:c AND status='active' AND id<>:s"
+                        ),
+                        {
+                            "c": bundle.campaign_id,
+                            "s": scenario_update.from_scene_id,
+                        },
+                    )
+                ).scalar_one()
+            )
+            closes_current = (
+                scenario_update.to_scene_id is not None
+                or scenario_update.ending_ref is not None
+            )
+            resulting_active_count = (
+                other_active_count
+                + int(not closes_current)
+                + int(scenario_update.to_scene_id is not None)
+            )
+            if resulting_active_count > 1:
+                raise InvalidCommitBundleError(
+                    "Scenario更新後のactive Sceneが一件を超えます"
+                )
         await _assert_turn_actor_authorized(self._session, turn)
         if int(campaign["state_version"]) != bundle.base_state_version:
             raise StateVersionConflictError("Canonical versionが更新されています")
@@ -1051,6 +1146,64 @@ class PostgresTurnRepository:
                 )
             if updated.scalar_one_or_none() is None:
                 raise InvalidCommitBundleError("Canonical更新対象が消失しました")
+        if scenario_update is not None:
+            for flag_ref in scenario_update.add_flags:
+                await self._session.execute(
+                    text(
+                        "INSERT INTO mvp_scenario_flags(campaign_id,flag_ref) "
+                        "VALUES(:c,:flag)"
+                    ),
+                    {"c": bundle.campaign_id, "flag": flag_ref},
+                )
+            if closes_current:
+                closed_scene_id = (
+                    await self._session.execute(
+                        text(
+                            "UPDATE scenes SET status='closed' "
+                            "WHERE campaign_id=:c AND id=:s AND status='active' "
+                            "RETURNING id"
+                        ),
+                        {
+                            "c": bundle.campaign_id,
+                            "s": scenario_update.from_scene_id,
+                        },
+                    )
+                ).scalar_one_or_none()
+                if closed_scene_id is None:
+                    raise InvalidCommitBundleError("Scenarioのfrom Scene更新に失敗しました")
+            if scenario_update.to_scene_id is not None:
+                activated_scene_id = (
+                    await self._session.execute(
+                        text(
+                            "UPDATE scenes SET status='active' "
+                            "WHERE campaign_id=:c AND id=:s AND status='planned' "
+                            "RETURNING id"
+                        ),
+                        {
+                            "c": bundle.campaign_id,
+                            "s": scenario_update.to_scene_id,
+                        },
+                    )
+                ).scalar_one_or_none()
+                if activated_scene_id is None:
+                    raise InvalidCommitBundleError("Scenarioのto Scene更新に失敗しました")
+            if scenario_update.ending_ref is not None:
+                completed_campaign_id = (
+                    await self._session.execute(
+                        text(
+                            "UPDATE mvp_scenario_runs "
+                            "SET status='completed',ending_ref=:ending "
+                            "WHERE campaign_id=:c AND status='active' "
+                            "RETURNING campaign_id"
+                        ),
+                        {
+                            "c": bundle.campaign_id,
+                            "ending": scenario_update.ending_ref,
+                        },
+                    )
+                ).scalar_one_or_none()
+                if completed_campaign_id is None:
+                    raise InvalidCommitBundleError("Scenario runの完了更新に失敗しました")
         version = projection.committed_state_version
         await self._session.execute(
             text(
@@ -1076,7 +1229,11 @@ class PostgresTurnRepository:
         )
         for action in projection.actions:
             command = action.command
-            assert not isinstance(command, ScenarioActionCommand)
+            target_id = (
+                None
+                if isinstance(command, ScenarioActionCommand)
+                else command.target_id
+            )
             item_id = (
                 command.weapon_id
                 if isinstance(command, AttackCommand)
@@ -1114,7 +1271,7 @@ class PostgresTurnRepository:
                     "o": command.ordinal,
                     "actor": command.actor_id,
                     "kind": command.kind,
-                    "target": command.target_id,
+                    "target": target_id,
                     "item": item_id,
                     "command": _json(command.model_dump(mode="json")),
                     "result": _json(action.result.model_dump(mode="json")),

@@ -379,7 +379,10 @@ class ActionModel(Base):
             ["campaign_id", "item_id"], ["entities.campaign_id", "entities.id"]
         ),
         CheckConstraint("ordinal>0"),
-        CheckConstraint("kind IN ('attack','skill_check','use_item')"),
+        CheckConstraint(
+            "kind IN ('attack','skill_check','use_item','scenario_action')",
+            name="actions_kind_check",
+        ),
         CheckConstraint("schema_version>0"),
         CheckConstraint("jsonb_typeof(command)='object'"),
         CheckConstraint("jsonb_typeof(result)='object'"),

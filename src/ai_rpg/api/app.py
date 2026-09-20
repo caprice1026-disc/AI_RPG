@@ -12,6 +12,7 @@ from fastapi.responses import FileResponse, StreamingResponse
 from starlette.types import Message, Send
 
 from ai_rpg.application import (
+    AdventureCompletedError,
     AuthenticatedPrincipal,
     AuthorizationError,
     ChoiceNotAvailableError,
@@ -31,7 +32,8 @@ from ai_rpg.infrastructure.postgres import PostgresAuthorizationPolicy, Postgres
 
 PrincipalProvider = Callable[..., Awaitable[AuthenticatedPrincipal]]
 ApplicationError = (
-    AuthorizationError
+    AdventureCompletedError
+    | AuthorizationError
     | ChoiceNotAvailableError
     | IdempotencyConflictError
     | StateVersionConflictError
@@ -174,6 +176,7 @@ def create_app(
         try:
             return await turn_service.accept(principal, campaign_id, turn)
         except (
+            AdventureCompletedError,
             AuthorizationError,
             ChoiceNotAvailableError,
             IdempotencyConflictError,

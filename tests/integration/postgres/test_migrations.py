@@ -31,6 +31,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_asyn
 from ai_rpg.api import create_app
 from ai_rpg.api.auth import OidcBearerAuthenticator, OidcJwtVerifier, discover_oidc
 from ai_rpg.application import (
+    AdventureCompletedError,
     AuthenticatedPrincipal,
     AuthorizationError,
     ChoiceNotAvailableError,
@@ -58,7 +59,12 @@ from ai_rpg.application.ports import repositories as repository_ports
 from ai_rpg.contracts import PlayerTurnInput, TurnResponse
 from ai_rpg.contracts.context import OutputLimits
 from ai_rpg.contracts.responses import MechanicalNarrationInput
-from ai_rpg.domain.commands import AttackCommand, SkillCheckCommand, UseItemCommand
+from ai_rpg.domain.commands import (
+    AttackCommand,
+    ScenarioActionCommand,
+    SkillCheckCommand,
+    UseItemCommand,
+)
 from ai_rpg.domain.events import RNGMetadata
 from ai_rpg.domain.results import (
     AppliedResult,
@@ -91,6 +97,7 @@ CAMPAIGN_A = "00000000-0000-0000-0000-000000000001"
 CAMPAIGN_B = "00000000-0000-0000-0000-000000000002"
 SCENE_A = "00000000-0000-0000-0000-000000000011"
 SCENE_B = "00000000-0000-0000-0000-000000000012"
+SCENE_C = "00000000-0000-0000-0000-000000000013"
 PRINCIPAL_A = "00000000-0000-0000-0000-000000000021"
 PRINCIPAL_B = "00000000-0000-0000-0000-000000000022"
 ACTOR_A = "00000000-0000-0000-0000-000000000031"
@@ -555,6 +562,25 @@ def _seed_resolution_state(connection: Connection) -> None:
     )
 
 
+def _seed_scenario_resolution_state(connection: Connection) -> None:
+    _seed_resolution_state(connection)
+    connection.execute(
+        text(
+            "INSERT INTO scenes(id,campaign_id,sequence,status) "
+            "VALUES(:scene,:campaign,2,'planned')"
+        ),
+        {"scene": SCENE_B, "campaign": CAMPAIGN_A},
+    )
+    connection.execute(
+        text(
+            "INSERT INTO mvp_scenario_runs("
+            "campaign_id,scenario_ref,scenario_version,status"
+            ") VALUES(:campaign,'ruined_chapel',1,'active')"
+        ),
+        {"campaign": CAMPAIGN_A},
+    )
+
+
 def _resolution_action(turn_id: UUID, ordinal: int) -> ActionRecord:
     action_id = UUID(int=1000 + ordinal)
     roll = DiceResult(expression="1d20+2", rolls=[10], modifier=2, total=12)
@@ -733,6 +759,51 @@ def _resolution_bundle(
     )
 
 
+def _scenario_action(turn_id: UUID) -> ActionRecord:
+    return ActionRecord(
+        command=ScenarioActionCommand(
+            action_id=UUID(ACTION_A),
+            campaign_id=UUID(CAMPAIGN_A),
+            turn_id=turn_id,
+            actor_id=UUID(ACTOR_A),
+            ordinal=1,
+            kind="scenario_action",
+            action_ref="enter_chapel",
+        ),
+        result=AppliedResult(
+            kind="applied",
+            outcome="success",
+            facts=["礼拝堂に入った"],
+            dice=[],
+            state_changes=[],
+        ),
+    )
+
+
+def _scenario_bundle(
+    turn_id: UUID,
+    *,
+    from_scene_id: str = SCENE_A,
+    to_scene_id: str | None = SCENE_B,
+    add_flags: tuple[str, ...] = ("entered",),
+    ending_ref: str | None = None,
+) -> CommitBundle:
+    bundle = _resolution_bundle(
+        turn_id,
+        narration_version=1,
+        action=_scenario_action(turn_id),
+    )
+    return replace(
+        bundle,
+        scenario_update=repository_ports.ScenarioProgressUpdate(
+            from_scene_id=UUID(from_scene_id),
+            to_scene_id=None if to_scene_id is None else UUID(to_scene_id),
+            add_flags=add_flags,
+            ending_ref=ending_ref,
+        ),
+    )
+
+
 def _event_types(bundle: CommitBundle) -> list[str]:
     event_types: list[str] = []
     for action in bundle.actions:
@@ -813,6 +884,9 @@ def _guard_empty_database(url: str) -> Generator[str, None, None]:
         cleanup_engine = create_engine(url)
         try:
             if "alembic_version" in _public_tables(cleanup_engine):
+                if "actions" in _public_tables(cleanup_engine):
+                    with cleanup_engine.begin() as connection:
+                        connection.execute(text("TRUNCATE TABLE events,actions CASCADE"))
                 cleanup_engine.dispose()
                 _run_alembic(url, "downgrade", "base")
                 cleanup_engine = create_engine(url)
@@ -979,6 +1053,98 @@ def test_scenario_progress_upgrade_has_no_backfill_and_downgrades_in_dependency_
         assert _public_tables(engine) == original_tables
         with engine.connect() as connection:
             assert connection.scalar(text("SELECT count(*) FROM campaigns")) == 2
+    finally:
+        engine.dispose()
+
+
+def test_scenario_commit_action_kind_migration_is_forward_only_with_live_rows(
+    empty_database_url: str,
+) -> None:
+    scenario_action_id = UUID(int=52)
+    _run_alembic(empty_database_url, "upgrade", "0009_scenario_progress")
+    engine = create_engine(empty_database_url)
+    try:
+        with engine.begin() as connection:
+            _seed_history(connection)
+
+        _run_alembic(empty_database_url, "upgrade", "head")
+        with engine.begin() as connection:
+            connection.execute(
+                text(
+                    "INSERT INTO actions("
+                    "id,campaign_id,turn_id,ordinal,actor_id,kind,command,result,"
+                    "result_kind,ruleset_version"
+                    ") VALUES("
+                    ":action,:campaign,:turn,2,:actor,'scenario_action','{}','{}',"
+                    "'applied','mvp_v1'"
+                    ")"
+                ),
+                {
+                    "action": scenario_action_id,
+                    "campaign": CAMPAIGN_A,
+                    "turn": TURN_A,
+                    "actor": ACTOR_A,
+                },
+            )
+
+        env = {**os.environ, "AIRPG_DATABASE_URL": empty_database_url}
+        downgrade = subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "alembic",
+                "-x",
+                f"url={empty_database_url}",
+                "downgrade",
+                "0009_scenario_progress",
+            ],
+            check=False,
+            cwd=ROOT,
+            env=env,
+            capture_output=True,
+            text=True,
+        )
+        assert downgrade.returncode != 0
+        assert "scenario_action rows still exist" in (
+            downgrade.stdout + downgrade.stderr
+        )
+        with engine.connect() as connection:
+            assert connection.scalar(text("SELECT version_num FROM alembic_version")) == (
+                "0010_scenario_action_kind"
+            )
+            assert connection.scalar(
+                text("SELECT kind FROM actions WHERE id=:action"),
+                {"action": scenario_action_id},
+            ) == "scenario_action"
+
+        with engine.begin() as connection:
+            connection.execute(text("ALTER TABLE actions DISABLE TRIGGER immutable_actions"))
+            connection.execute(
+                text("DELETE FROM actions WHERE id=:action"),
+                {"action": scenario_action_id},
+            )
+            connection.execute(text("ALTER TABLE actions ENABLE TRIGGER immutable_actions"))
+        _run_alembic(empty_database_url, "downgrade", "0009_scenario_progress")
+
+        with pytest.raises(IntegrityError) as error, engine.begin() as connection:
+            connection.execute(
+                text(
+                    "INSERT INTO actions("
+                    "id,campaign_id,turn_id,ordinal,actor_id,kind,command,result,"
+                    "result_kind,ruleset_version"
+                    ") VALUES("
+                    ":action,:campaign,:turn,2,:actor,'scenario_action','{}','{}',"
+                    "'applied','mvp_v1'"
+                    ")"
+                ),
+                {
+                    "action": scenario_action_id,
+                    "campaign": CAMPAIGN_A,
+                    "turn": TURN_A,
+                    "actor": ACTOR_A,
+                },
+            )
+        _assert_sqlstate(error.value, "23514")
     finally:
         engine.dispose()
 
@@ -3226,6 +3392,324 @@ def test_commit_resolution_returns_existing_commit_without_duplicate_writes(
         assert connection.scalar(text("SELECT count(*) FROM events")) == len(
             _event_types(bundle)
         )
+
+
+def test_scenario_commit_progresses_once_and_replays_idempotently(
+    database: Engine,
+) -> None:
+    with database.begin() as connection:
+        _seed_scenario_resolution_state(connection)
+    accepted = _accept_from_database(database, _player_turn())
+    _acquire_lease_from_database(database, accepted.turn_id)
+    bundle = _scenario_bundle(accepted.turn_id)
+
+    assert _commit_resolution_from_database(database, bundle) == 1
+    assert _commit_resolution_from_database(database, bundle) == 1
+
+    with database.connect() as connection:
+        assert tuple(
+            connection.execute(
+                text(
+                    "SELECT state_version,event_sequence FROM campaigns "
+                    "WHERE id=:campaign"
+                ),
+                {"campaign": CAMPAIGN_A},
+            ).one()
+        ) == (1, 2)
+        assert tuple(
+            connection.execute(
+                text(
+                    "SELECT resolution_status,committed_state_version "
+                    "FROM turns WHERE id=:turn"
+                ),
+                {"turn": accepted.turn_id},
+            ).one()
+        ) == ("committed", 1)
+        assert list(
+            connection.execute(
+                text(
+                    "SELECT id,status FROM scenes WHERE campaign_id=:campaign "
+                    "ORDER BY sequence"
+                ),
+                {"campaign": CAMPAIGN_A},
+            )
+        ) == [(UUID(SCENE_A), "closed"), (UUID(SCENE_B), "active")]
+        assert tuple(
+            connection.execute(
+                text(
+                    "SELECT status,ending_ref FROM mvp_scenario_runs "
+                    "WHERE campaign_id=:campaign"
+                ),
+                {"campaign": CAMPAIGN_A},
+            ).one()
+        ) == ("active", None)
+        assert list(
+            connection.execute(
+                text(
+                    "SELECT flag_ref FROM mvp_scenario_flags "
+                    "WHERE campaign_id=:campaign"
+                ),
+                {"campaign": CAMPAIGN_A},
+            ).scalars()
+        ) == ["entered"]
+        action = connection.execute(
+            text(
+                "SELECT kind,target_id,item_id,command FROM actions "
+                "WHERE turn_id=:turn"
+            ),
+            {"turn": accepted.turn_id},
+        ).one()
+        assert tuple(action[:3]) == ("scenario_action", None, None)
+        assert action.command["action_ref"] == "enter_chapel"
+        assert list(
+            connection.execute(
+                text(
+                    "SELECT type,action_id FROM events WHERE turn_id=:turn "
+                    "ORDER BY sequence"
+                ),
+                {"turn": accepted.turn_id},
+            )
+        ) == [
+            ("ActionResolved", UUID(ACTION_A)),
+            ("ScenarioProgressed", None),
+        ]
+
+
+def test_scenario_commit_rolls_back_all_progress_when_event_insert_fails(
+    database: Engine,
+) -> None:
+    with database.begin() as connection:
+        _seed_scenario_resolution_state(connection)
+    accepted = _accept_from_database(database, _player_turn())
+    _acquire_lease_from_database(database, accepted.turn_id)
+    bundle = _scenario_bundle(accepted.turn_id)
+    event_ids = (UUID(int=9100), UUID(int=9101))
+    with database.begin() as connection:
+        connection.execute(
+            text(
+                "INSERT INTO events("
+                "id,campaign_id,sequence,state_version,type,schema_version,payload"
+                ") VALUES(:event,:campaign,1,0,'ExistingEvent',1,'{}')"
+            ),
+            {"event": event_ids[0], "campaign": CAMPAIGN_B},
+        )
+
+    with pytest.raises(IntegrityError):
+        _commit_resolution_from_database(database, bundle, event_ids=iter(event_ids))
+
+    with database.connect() as connection:
+        assert tuple(
+            connection.execute(
+                text(
+                    "SELECT state_version,event_sequence FROM campaigns "
+                    "WHERE id=:campaign"
+                ),
+                {"campaign": CAMPAIGN_A},
+            ).one()
+        ) == (0, 0)
+        assert tuple(
+            connection.execute(
+                text(
+                    "SELECT resolution_status,committed_state_version,narration_input "
+                    "FROM turns WHERE id=:turn"
+                ),
+                {"turn": accepted.turn_id},
+            ).one()
+        ) == ("resolving", None, None)
+        assert list(
+            connection.execute(
+                text(
+                    "SELECT status FROM scenes WHERE campaign_id=:campaign "
+                    "ORDER BY sequence"
+                ),
+                {"campaign": CAMPAIGN_A},
+            ).scalars()
+        ) == ["active", "planned"]
+        assert tuple(
+            connection.execute(
+                text(
+                    "SELECT status,ending_ref FROM mvp_scenario_runs "
+                    "WHERE campaign_id=:campaign"
+                ),
+                {"campaign": CAMPAIGN_A},
+            ).one()
+        ) == ("active", None)
+        assert connection.scalar(text("SELECT count(*) FROM mvp_scenario_flags")) == 0
+        assert connection.scalar(text("SELECT count(*) FROM actions")) == 0
+        assert connection.scalar(
+            text("SELECT count(*) FROM events WHERE campaign_id=:campaign"),
+            {"campaign": CAMPAIGN_A},
+        ) == 0
+
+
+@pytest.mark.parametrize(
+    ("invalid_owner", "error_type"),
+    [
+        ("stale-epoch", RuntimeError),
+        ("old-version", StateVersionConflictError),
+        ("from-scene", InvalidCommitBundleError),
+    ],
+)
+def test_scenario_commit_rejects_stale_owner_version_and_from_scene(
+    database: Engine,
+    invalid_owner: str,
+    error_type: type[Exception],
+) -> None:
+    with database.begin() as connection:
+        _seed_scenario_resolution_state(connection)
+    accepted = _accept_from_database(database, _player_turn())
+    _acquire_lease_from_database(database, accepted.turn_id)
+    bundle = _scenario_bundle(accepted.turn_id)
+
+    if invalid_owner == "stale-epoch":
+        bundle = replace(bundle, worker_epoch=0)
+    elif invalid_owner == "old-version":
+        with database.begin() as connection:
+            connection.execute(
+                text(
+                    "UPDATE campaigns SET state_version=1 WHERE id=:campaign"
+                ),
+                {"campaign": CAMPAIGN_A},
+            )
+    else:
+        bundle = replace(
+            bundle,
+            scenario_update=replace(
+                bundle.scenario_update,
+                from_scene_id=UUID(SCENE_C),
+            ),
+        )
+
+    with pytest.raises(error_type):
+        _commit_resolution_from_database(database, bundle)
+
+    with database.connect() as connection:
+        assert connection.scalar(text("SELECT count(*) FROM actions")) == 0
+        assert connection.scalar(text("SELECT count(*) FROM events")) == 0
+        assert connection.scalar(text("SELECT count(*) FROM mvp_scenario_flags")) == 0
+        assert connection.scalar(
+            text("SELECT resolution_status FROM turns WHERE id=:turn"),
+            {"turn": accepted.turn_id},
+        ) == "resolving"
+
+
+@pytest.mark.parametrize(
+    "invalid_progress",
+    [
+        "completed-run",
+        "target-other-campaign",
+        "target-not-planned",
+        "ending-and-target",
+        "multiple-resulting-active-scenes",
+    ],
+)
+def test_scenario_commit_rejects_invalid_progress_state(
+    database: Engine,
+    invalid_progress: str,
+) -> None:
+    with database.begin() as connection:
+        _seed_scenario_resolution_state(connection)
+    accepted = _accept_from_database(database, _player_turn())
+    _acquire_lease_from_database(database, accepted.turn_id)
+    with database.begin() as connection:
+        if invalid_progress == "completed-run":
+            connection.execute(
+                text(
+                    "UPDATE mvp_scenario_runs "
+                    "SET status='completed',ending_ref='retreated' "
+                    "WHERE campaign_id=:campaign"
+                ),
+                {"campaign": CAMPAIGN_A},
+            )
+        elif invalid_progress == "target-other-campaign":
+            connection.execute(
+                text(
+                    "INSERT INTO scenes(id,campaign_id,sequence,status) "
+                    "VALUES(:scene,:campaign,1,'planned')"
+                ),
+                {"scene": SCENE_C, "campaign": CAMPAIGN_B},
+            )
+        elif invalid_progress == "target-not-planned":
+            connection.execute(
+                text("UPDATE scenes SET status='closed' WHERE id=:scene"),
+                {"scene": SCENE_B},
+            )
+        elif invalid_progress == "multiple-resulting-active-scenes":
+            connection.execute(text("DROP INDEX one_active_scene"))
+            connection.execute(
+                text(
+                    "INSERT INTO scenes(id,campaign_id,sequence,status) "
+                    "VALUES(:scene,:campaign,3,'active')"
+                ),
+                {"scene": SCENE_C, "campaign": CAMPAIGN_A},
+            )
+    bundle = _scenario_bundle(accepted.turn_id)
+    if invalid_progress == "target-other-campaign":
+        bundle = _scenario_bundle(accepted.turn_id, to_scene_id=SCENE_C)
+    elif invalid_progress == "ending-and-target":
+        bundle = _scenario_bundle(accepted.turn_id, ending_ref="retreated")
+
+    with pytest.raises(InvalidCommitBundleError):
+        _commit_resolution_from_database(database, bundle)
+
+    with database.connect() as connection:
+        assert connection.scalar(text("SELECT count(*) FROM actions")) == 0
+        assert connection.scalar(text("SELECT count(*) FROM events")) == 0
+        assert connection.scalar(text("SELECT count(*) FROM mvp_scenario_flags")) == 0
+        assert connection.scalar(
+            text("SELECT resolution_status FROM turns WHERE id=:turn"),
+            {"turn": accepted.turn_id},
+        ) == "resolving"
+
+
+def test_completed_adventure_replays_existing_request_and_rejects_new_request(
+    database: Engine,
+) -> None:
+    original = _player_turn()
+    with database.begin() as connection:
+        _seed_scenario_resolution_state(connection)
+    accepted = _accept_from_database(database, original)
+    _acquire_lease_from_database(database, accepted.turn_id)
+    bundle = _scenario_bundle(
+        accepted.turn_id,
+        to_scene_id=None,
+        add_flags=("retreated",),
+        ending_ref="retreated",
+    )
+    assert _commit_resolution_from_database(database, bundle) == 1
+
+    replayed = _accept_from_database(database, original)
+    assert replayed.turn_id == accepted.turn_id
+    assert replayed.resolution_status == "committed"
+    assert replayed.committed_state_version == 1
+
+    with pytest.raises(AdventureCompletedError) as error:
+        _accept_from_database(
+            database,
+            _player_turn(request_id=REQUEST_B, expected_state_version=1),
+        )
+    assert error.value.code == "ADVENTURE_COMPLETED"
+
+    with database.connect() as connection:
+        assert tuple(
+            connection.execute(
+                text(
+                    "SELECT status,ending_ref FROM mvp_scenario_runs "
+                    "WHERE campaign_id=:campaign"
+                ),
+                {"campaign": CAMPAIGN_A},
+            ).one()
+        ) == ("completed", "retreated")
+        assert list(
+            connection.execute(
+                text(
+                    "SELECT status FROM scenes WHERE campaign_id=:campaign "
+                    "ORDER BY sequence"
+                ),
+                {"campaign": CAMPAIGN_A},
+            ).scalars()
+        ) == ["closed", "planned"]
+        assert connection.scalar(text("SELECT count(*) FROM turns")) == 1
 
 
 def test_narration_lease_rejects_old_owner_after_recovery(database: Engine) -> None:

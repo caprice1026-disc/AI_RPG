@@ -8,19 +8,9 @@ import pytest
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ai_rpg.application import AuthenticatedPrincipal, AuthorizationError, AuthorizationPolicy
-from ai_rpg.application.ports.repositories import (
-    ActionRecord,
-    CommitBundle,
-    InvalidCommitBundleError,
-)
 from ai_rpg.application.turns import RuntimePolicy, TurnService
 from ai_rpg.contracts import PlayerTurnInput
-from ai_rpg.contracts.context import OutputLimits
-from ai_rpg.contracts.responses import MechanicalNarrationInput
-from ai_rpg.domain import ScenarioActionCommand
-from ai_rpg.domain.results import AppliedResult, ResolvedAction
 from ai_rpg.infrastructure.postgres.repositories import (
-    PostgresTurnRepository,
     PostgresUnitOfWork,
     _public_recovery_reason,
 )
@@ -34,53 +24,6 @@ def _principal(principal_id: UUID) -> AuthenticatedPrincipal:
         authenticated_at=datetime.now(UTC),
         auth_context=frozenset(),
     )
-
-
-@pytest.mark.asyncio
-async def test_commit_resolution_rejects_scenario_action_before_database_access() -> None:
-    campaign_id, scene_id, turn_id, actor_id, action_id = (uuid4() for _ in range(5))
-    command = ScenarioActionCommand(
-        action_id=action_id,
-        campaign_id=campaign_id,
-        turn_id=turn_id,
-        actor_id=actor_id,
-        ordinal=1,
-        kind="scenario_action",
-        action_ref="enter_chapel",
-    )
-    result = AppliedResult(
-        kind="applied",
-        outcome="success",
-        facts=["礼拝堂に入った"],
-        dice=[],
-        state_changes=[],
-    )
-    action = ActionRecord(command=command, result=result)
-    bundle = CommitBundle(
-        campaign_id=campaign_id,
-        scene_id=scene_id,
-        turn_id=turn_id,
-        worker_epoch=1,
-        base_state_version=0,
-        actions=(action,),
-        narration_input=MechanicalNarrationInput(
-            player_text="礼拝堂に入る",
-            committed_state_version=0,
-            resolved_actions=[
-                ResolvedAction(action_id=action_id, ordinal=1, result=result),
-            ],
-            public_state_after=[],
-            allowed_entity_refs=[],
-            output_limits=OutputLimits(max_actions=3, max_choices=5),
-        ),
-    )
-    session = AsyncMock(spec=AsyncSession)
-    session.execute.side_effect = AssertionError("database accessed")
-
-    with pytest.raises(InvalidCommitBundleError, match="Scenario Action"):
-        await PostgresTurnRepository(session).commit_resolution(bundle)
-
-    session.execute.assert_not_awaited()
 
 
 @pytest.mark.parametrize(
@@ -122,6 +65,8 @@ async def test_accept_preserves_policy_and_returns_valid_pending_response(max_ac
     }
     actor_result = MagicMock()
     actor_result.scalar_one.return_value = True
+    scenario_result = MagicMock()
+    scenario_result.scalar_one_or_none.return_value = None
     scene_result = MagicMock()
     scene_result.scalar_one.return_value = scene_id
     unresolved_result = MagicMock()
@@ -143,6 +88,7 @@ async def test_accept_preserves_policy_and_returns_valid_pending_response(max_ac
         campaign_result,
         access_result,
         existing_result,
+        scenario_result,
         actor_result,
         unresolved_result,
         scene_result,

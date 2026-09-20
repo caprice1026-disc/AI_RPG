@@ -20,6 +20,12 @@ class AuthorizationError(Exception):
     code = "FORBIDDEN"
 
 
+class AdventureCompletedError(Exception):
+    """完了済みScenarioへ新しいTurnを追加しようとした。"""
+
+    code = "ADVENTURE_COMPLETED"
+
+
 class ChoiceNotAvailableError(Exception):
     """指定Choiceが現在のTurn受付には利用できない。"""
 
