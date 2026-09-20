@@ -470,6 +470,73 @@ test("campaign switch reads its own version and stale action is not auto-submitt
   assert.equal(posts[0].request_id, "request-b");
 });
 
+test("stale successful restore refresh does not continue old pending work", async () => {
+  const calls = [];
+  let resolveOldState;
+  const oldState = new Promise(resolve => { resolveOldState = resolve; });
+  const pending = AiRpgPending.create({
+    campaignId: "campaign-a",
+    actorId: "actor-a",
+    displayText: "調べる",
+    content: { kind: "text", text: "調べる" },
+    stateVersion: 3,
+    requestId: "request-old",
+  });
+  const app = harness(async (path, options = {}) => {
+    calls.push([path, options.method ?? "GET"]);
+    if (path === "/health") return response({ status: "ok" });
+    if (path === "/campaigns/campaign-a/state") return oldState;
+    if (path === "/campaigns/campaign-b/state") {
+      return response({ state_version: 4, latest_turn: null });
+    }
+    if (options.method === "POST") return response(terminalTurn("turn-old", 3), 202);
+    throw new Error(`unexpected request: ${path}`);
+  }, [], pending);
+  await flush();
+
+  app.elements["campaign-id"].value = "campaign-b";
+  await app.elements["campaign-id"].dispatch("change");
+  resolveOldState(response({ state_version: 3, latest_turn: null }));
+  await flush();
+
+  assert.equal(calls.filter(([, method]) => method === "POST").length, 0);
+  assert.equal(AiRpgPending.load(app.storage).body.request_id, "request-old");
+  assert.equal(app.elements["version-value"].textContent, "4");
+});
+
+test("stale failed restore refresh does not show an old campaign error", async () => {
+  let rejectOldState;
+  const oldState = new Promise((_, reject) => { rejectOldState = reject; });
+  const pending = AiRpgPending.create({
+    campaignId: "campaign-a",
+    actorId: "actor-a",
+    displayText: "調べる",
+    content: { kind: "text", text: "調べる" },
+    stateVersion: 3,
+    requestId: "request-old",
+  });
+  const app = harness(async path => {
+    if (path === "/health") return response({ status: "ok" });
+    if (path === "/campaigns/campaign-a/state") return oldState;
+    if (path === "/campaigns/campaign-b/state") {
+      return response({ state_version: 4, latest_turn: null });
+    }
+    throw new Error(`unexpected request: ${path}`);
+  }, [], pending);
+  await flush();
+
+  app.elements["campaign-id"].value = "campaign-b";
+  await app.elements["campaign-id"].dispatch("change");
+  rejectOldState(new Error("Campaign A refresh failed"));
+  await flush();
+
+  assert.equal(
+    find(app.elements.timeline, node => node.textContent === "Campaign A refresh failed"),
+    null,
+  );
+  assert.equal(app.elements["version-value"].textContent, "4");
+});
+
 test("reload tracks an accepted turn by GET without another POST", async () => {
   const calls = [];
   const pending = {

@@ -470,14 +470,23 @@
     async function refreshCampaignState(campaignId, { resume = false } = {}) {
       const generation = (refreshGenerations.get(campaignId) || 0) + 1;
       refreshGenerations.set(campaignId, generation);
-      const state = await api(`/campaigns/${encodeURIComponent(campaignId)}/state`);
-      if (refreshGenerations.get(campaignId) !== generation || ui["campaign-id"].value.trim() !== campaignId) return state;
-      if (!setStateVersion(campaignId, state.state_version)) return state;
+      const ownsRefresh = () => refreshGenerations.get(campaignId) === generation &&
+        ui["campaign-id"].value.trim() === campaignId;
+      let state;
+      try {
+        state = await api(`/campaigns/${encodeURIComponent(campaignId)}/state`);
+      } catch (error) {
+        if (!ownsRefresh()) return { applied: false, state: null };
+        throw error;
+      }
+      if (!ownsRefresh() || !setStateVersion(campaignId, state.state_version)) {
+        return { applied: false, state };
+      }
       if (state.latest_turn) {
         updateStatus(campaignId, state.latest_turn);
         if (resume) await resumeTurn(campaignId, state.latest_turn);
       }
-      return state;
+      return { applied: ownsRefresh(), state };
     }
 
     async function pollTurn(campaignId, turnId, active, setTimer) {
@@ -643,8 +652,15 @@
         if (rejected) AiRpgPending.clear(localStorage);
         if (["STATE_VERSION_CONFLICT", "TURN_IN_PROGRESS", "CHOICE_NOT_AVAILABLE", "IDEMPOTENCY_CONFLICT"].includes(error?.code)) {
           AiRpgPending.clear(localStorage);
-          try { await refreshCampaignState(pending.campaignId, { resume: error.code === "TURN_IN_PROGRESS" }); } catch (_) { /* original error remains primary */ }
-          if (!ownsWorkflow()) return;
+          let refreshApplied = true;
+          try {
+            const refreshed = await refreshCampaignState(
+              pending.campaignId,
+              { resume: error.code === "TURN_IN_PROGRESS" },
+            );
+            refreshApplied = refreshed.applied;
+          } catch (_) { /* original error remains primary */ }
+          if (!ownsWorkflow() || !refreshApplied) return;
           showError(error.message);
         } else {
           const message = error instanceof Error ? error.message : "Turnの処理に失敗しました。";
@@ -688,7 +704,9 @@
       let pending = null;
       try {
         const knownVersion = stateCampaignId === campaignId ? stateVersion : null;
-        const current = await refreshCampaignState(campaignId);
+        const refreshed = await refreshCampaignState(campaignId);
+        if (!refreshed.applied) return;
+        const current = refreshed.state;
         if (knownVersion !== null && current.state_version !== knownVersion) {
           showError("世界の状態が更新されました。行動内容を確認してから再送してください。");
           return;
@@ -739,7 +757,8 @@
       if (pending) {
         ui["campaign-id"].value = pending.campaignId;
         ui["actor-id"].value = pending.actorId;
-        await refreshCampaignState(pending.campaignId);
+        const refreshed = await refreshCampaignState(pending.campaignId);
+        if (!refreshed.applied) return;
         await continuePending(pending, false);
         return;
       }
