@@ -1,0 +1,143 @@
+{
+  "scenario_ref": "ruined_chapel",
+  "version": 1,
+  "title": "廃礼拝堂の聖印",
+  "objective": "廃礼拝堂の奥から銀の聖印を回収する",
+  "scenes": [
+    {
+      "scene_ref": "entrance",
+      "sequence": 1,
+      "title": "入口",
+      "description": "崩れかけた廃礼拝堂の入口に立っている。",
+      "actions": [
+        {
+          "action_ref": "enter_chapel",
+          "label": "礼拝堂に入る",
+          "public_fact": "廃礼拝堂の中へ入った。",
+          "kind": "scenario_action",
+          "success": {
+            "next_scene_ref": "hall",
+            "ending_ref": null,
+            "add_flags": []
+          }
+        }
+      ]
+    },
+    {
+      "scene_ref": "hall",
+      "sequence": 2,
+      "title": "広間",
+      "description": "朽ちた長椅子が並ぶ薄暗い広間だ。",
+      "actions": [
+        {
+          "action_ref": "search_hall",
+          "label": "広間を調べる",
+          "kind": "skill_check",
+          "check_ref": "normal",
+          "skill_ref": "perception",
+          "success": {
+            "next_scene_ref": "sanctum",
+            "ending_ref": null,
+            "add_flags": ["clue_found"]
+          },
+          "failure": {
+            "next_scene_ref": "sanctum",
+            "ending_ref": null,
+            "add_flags": ["alerted"]
+          }
+        }
+      ]
+    },
+    {
+      "scene_ref": "sanctum",
+      "sequence": 3,
+      "title": "奥の部屋",
+      "description": "銀の聖印を守るゴブリンが待ち構えている。",
+      "actions": [
+        {
+          "action_ref": "negotiate_guard",
+          "label": "守衛と交渉する",
+          "kind": "skill_check",
+          "check_ref": "normal",
+          "skill_ref": "persuasion",
+          "success": {
+            "next_scene_ref": null,
+            "ending_ref": "recovered",
+            "add_flags": []
+          },
+          "failure": {
+            "next_scene_ref": null,
+            "ending_ref": "costly_success",
+            "add_flags": []
+          }
+        },
+        {
+          "action_ref": "sneak_to_relic",
+          "label": "聖印へ忍び寄る",
+          "kind": "skill_check",
+          "check_ref": "normal",
+          "skill_ref": "stealth",
+          "success": {
+            "next_scene_ref": null,
+            "ending_ref": "recovered",
+            "add_flags": []
+          },
+          "failure": {
+            "next_scene_ref": null,
+            "ending_ref": "costly_success",
+            "add_flags": []
+          }
+        },
+        {
+          "action_ref": "defeat_guard",
+          "label": "守衛を倒す",
+          "kind": "attack",
+          "target_ref": "goblin",
+          "defeated": {
+            "next_scene_ref": null,
+            "ending_ref": "recovered",
+            "add_flags": []
+          }
+        },
+        {
+          "action_ref": "retreat",
+          "label": "撤退する",
+          "public_fact": "銀の聖印の回収を断念して撤退した。",
+          "kind": "scenario_action",
+          "success": {
+            "next_scene_ref": null,
+            "ending_ref": "retreated",
+            "add_flags": []
+          }
+        }
+      ]
+    }
+  ],
+  "flags": [
+    {
+      "flag_ref": "clue_found",
+      "public_fact": "広間で聖印へ続く手掛かりを見つけた。"
+    },
+    {
+      "flag_ref": "alerted",
+      "public_fact": "礼拝堂の守衛に侵入を警戒されている。"
+    }
+  ],
+  "endings": [
+    {
+      "ending_ref": "recovered",
+      "title": "回収成功",
+      "summary": "銀の聖印を無事に回収した。"
+    },
+    {
+      "ending_ref": "costly_success",
+      "title": "代償付き成功",
+      "summary": "代償を払いながらも銀の聖印を回収した。"
+    },
+    {
+      "ending_ref": "retreated",
+      "title": "撤退",
+      "summary": "銀の聖印の回収を断念し、廃礼拝堂から撤退した。"
+    }
+  ]
+}
