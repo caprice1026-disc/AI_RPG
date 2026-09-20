@@ -116,6 +116,24 @@ class NarrationWorkItem:
 
 
 @dataclass(frozen=True, slots=True)
+class ScenarioSceneSnapshot:
+    id: UUID
+    sequence: int
+    status: str
+
+
+@dataclass(frozen=True, slots=True)
+class ScenarioRunSnapshot:
+    campaign_id: UUID
+    scenario_ref: str
+    scenario_version: int
+    status: str
+    ending_ref: str | None
+    scenes: tuple[ScenarioSceneSnapshot, ...]
+    flags: frozenset[str]
+
+
+@dataclass(frozen=True, slots=True)
 class CanonicalSnapshot:
     campaign_id: UUID
     state_version: int
@@ -126,6 +144,7 @@ class CanonicalSnapshot:
     skill_checks: tuple[Mapping[str, object], ...]
     entities: tuple[Mapping[str, object], ...]
     scene_entities: tuple[Mapping[str, object], ...] = ()
+    scenario_run: ScenarioRunSnapshot | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -250,6 +269,10 @@ class CanonicalRepository(Protocol):
     ) -> int: ...
 
 
+class ScenarioRepository(Protocol):
+    async def snapshot(self, campaign_id: UUID) -> ScenarioRunSnapshot | None: ...
+
+
 class NarrationRepository(Protocol):
     async def acquire_lease(
         self,
@@ -305,6 +328,7 @@ class PublicEventRepository(Protocol):
 class RepositorySet(Protocol):
     turns: TurnRepository
     canonical: CanonicalRepository
+    scenarios: ScenarioRepository
     narration: NarrationRepository
     llm_calls: LLMCallRepository
     events: PublicEventRepository

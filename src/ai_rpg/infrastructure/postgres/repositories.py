@@ -35,6 +35,9 @@ from ai_rpg.application.ports.repositories import (
     PublicEventRepository,
     RecentMessage,
     ResolutionWorkItem,
+    ScenarioRepository,
+    ScenarioRunSnapshot,
+    ScenarioSceneSnapshot,
     StateVersionConflictError,
     TurnInProgressError,
     TurnRepository,
@@ -69,6 +72,8 @@ from ai_rpg.infrastructure.postgres.models import (
     EventModel,
     MvpCharacterModel,
     MvpInventoryModel,
+    MvpScenarioFlagModel,
+    MvpScenarioRunModel,
     MvpSceneEntityModel,
     MvpSceneSkillCheckModel,
     MvpSkillModifierModel,
@@ -1266,6 +1271,51 @@ class PostgresTurnRepository:
         return version
 
 
+class PostgresScenarioRepository:
+    def __init__(self, session: AsyncSession) -> None:
+        self._session = session
+
+    async def snapshot(self, campaign_id: UUID) -> ScenarioRunSnapshot | None:
+        run = (
+            await self._session.execute(
+                select(
+                    MvpScenarioRunModel.campaign_id,
+                    MvpScenarioRunModel.scenario_ref,
+                    MvpScenarioRunModel.scenario_version,
+                    MvpScenarioRunModel.status,
+                    MvpScenarioRunModel.ending_ref,
+                ).where(MvpScenarioRunModel.campaign_id == campaign_id)
+            )
+        ).mappings().one_or_none()
+        if run is None:
+            return None
+
+        scene_rows = (
+            await self._session.execute(
+                select(SceneModel.id, SceneModel.sequence, SceneModel.status)
+                .where(SceneModel.campaign_id == campaign_id)
+                .order_by(SceneModel.sequence)
+            )
+        ).all()
+        flags = await self._session.execute(
+            select(MvpScenarioFlagModel.flag_ref).where(
+                MvpScenarioFlagModel.campaign_id == campaign_id
+            )
+        )
+        return ScenarioRunSnapshot(
+            campaign_id=run["campaign_id"],
+            scenario_ref=run["scenario_ref"],
+            scenario_version=int(run["scenario_version"]),
+            status=run["status"],
+            ending_ref=run["ending_ref"],
+            scenes=tuple(
+                ScenarioSceneSnapshot(id=row.id, sequence=int(row.sequence), status=row.status)
+                for row in scene_rows
+            ),
+            flags=frozenset(flags.scalars()),
+        )
+
+
 class PostgresCanonicalRepository:
     def __init__(self, session: AsyncSession) -> None:
         self._session = session
@@ -1303,6 +1353,7 @@ class PostgresCanonicalRepository:
             await rows(MvpSceneSkillCheckModel.__table__),
             await rows(EntityModel.__table__),
             scene_entities=tuple(dict(row) for row in scene_entities.mappings()),
+            scenario_run=await PostgresScenarioRepository(self._session).snapshot(campaign_id),
         )
 
     async def update_with_campaign_lock(
@@ -1777,6 +1828,7 @@ class PostgresUnitOfWork:
 
     turns: TurnRepository
     canonical: CanonicalRepository
+    scenarios: ScenarioRepository
     narration: NarrationRepository
     llm_calls: LLMCallRepository
     events: PublicEventRepository
@@ -1789,6 +1841,7 @@ class PostgresUnitOfWork:
         self._session = self._factory()
         self.turns = PostgresTurnRepository(self._session)
         self.canonical = PostgresCanonicalRepository(self._session)
+        self.scenarios = PostgresScenarioRepository(self._session)
         self.narration = PostgresNarrationRepository(self._session)
         self.llm_calls = PostgresLLMCallRepository(self._session)
         self.events = PostgresPublicEventRepository(self._session)

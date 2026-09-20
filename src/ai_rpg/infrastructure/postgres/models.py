@@ -560,6 +560,41 @@ class MvpSceneEntityModel(Base):
     )
 
 
+class MvpScenarioRunModel(Base):
+    __tablename__ = "mvp_scenario_runs"
+
+    campaign_id: Mapped[UUID] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("campaigns.id"), primary_key=True
+    )
+    scenario_ref: Mapped[str] = mapped_column(Text, nullable=False)
+    scenario_version: Mapped[int] = mapped_column(Integer, nullable=False)
+    status: Mapped[str] = mapped_column(Text, nullable=False)
+    ending_ref: Mapped[str | None] = mapped_column(Text)
+
+    __table_args__ = (
+        CheckConstraint("scenario_ref ~ '^[a-z][a-z0-9_]{0,63}$'"),
+        CheckConstraint("scenario_version > 0"),
+        CheckConstraint("status IN ('active','completed')"),
+        CheckConstraint("(status='completed') = (ending_ref IS NOT NULL)"),
+        CheckConstraint(
+            "ending_ref IS NULL OR ending_ref ~ '^[a-z][a-z0-9_]{0,63}$'"
+        ),
+    )
+
+
+class MvpScenarioFlagModel(Base):
+    __tablename__ = "mvp_scenario_flags"
+
+    campaign_id: Mapped[UUID] = mapped_column(
+        PG_UUID(as_uuid=True),
+        ForeignKey("mvp_scenario_runs.campaign_id"),
+        primary_key=True,
+    )
+    flag_ref: Mapped[str] = mapped_column(Text, primary_key=True)
+
+    __table_args__ = (CheckConstraint("flag_ref ~ '^[a-z][a-z0-9_]{0,63}$'"),)
+
+
 class MvpSceneSkillCheckModel(Base):
     __tablename__ = "mvp_scene_skill_checks"
 

@@ -54,6 +54,7 @@ from ai_rpg.application.ports import (
     Lease,
     NarrationLease,
 )
+from ai_rpg.application.ports import repositories as repository_ports
 from ai_rpg.contracts import PlayerTurnInput, TurnResponse
 from ai_rpg.contracts.context import OutputLimits
 from ai_rpg.contracts.responses import MechanicalNarrationInput
@@ -69,6 +70,7 @@ from ai_rpg.domain.results import (
 )
 from ai_rpg.engine import DiceEngine, MvpV1Ruleset
 from ai_rpg.infrastructure.postgres import PostgresAuthorizationPolicy, PostgresUnitOfWork
+from ai_rpg.infrastructure.postgres import repositories as postgres_repositories
 from ai_rpg.infrastructure.postgres.repositories import (
     PostgresCanonicalRepository,
     PostgresLLMCallRepository,
@@ -872,6 +874,8 @@ def test_empty_database_upgrades_and_downgrades(empty_database_url: str) -> None
             "mvp_inventory",
             "mvp_scene_skill_checks",
             "mvp_scene_entities",
+            "mvp_scenario_runs",
+            "mvp_scenario_flags",
             "principals",
             "principal_identities",
         } <= _public_tables(engine)
@@ -883,6 +887,98 @@ def test_empty_database_upgrades_and_downgrades(empty_database_url: str) -> None
     try:
         assert _public_tables(engine) == {"alembic_version"}
         assert _public_functions(engine) == set()
+    finally:
+        engine.dispose()
+
+
+@pytest.mark.parametrize(
+    ("scenario_ref", "scenario_version", "status", "ending_ref"),
+    [
+        ("ruined_chapel", 1, "active", "escaped"),
+        ("ruined_chapel", 1, "completed", None),
+        ("RuinedChapel", 1, "active", None),
+        ("ruined_chapel", 0, "active", None),
+        ("ruined_chapel", 1, "paused", None),
+        ("ruined_chapel", 1, "completed", "Invalid-Ending"),
+    ],
+)
+def test_scenario_progress_run_constraints(
+    database: Engine,
+    scenario_ref: str,
+    scenario_version: int,
+    status: str,
+    ending_ref: str | None,
+) -> None:
+    assert {"mvp_scenario_runs", "mvp_scenario_flags"} <= _public_tables(database)
+    with database.begin() as connection:
+        _seed_campaigns(connection)
+
+    with pytest.raises(IntegrityError) as error, database.begin() as connection:
+        connection.execute(
+            text(
+                "INSERT INTO mvp_scenario_runs("
+                "campaign_id,scenario_ref,scenario_version,status,ending_ref"
+                ") VALUES(:campaign,:scenario_ref,:scenario_version,:status,:ending_ref)"
+            ),
+            {
+                "campaign": CAMPAIGN_A,
+                "scenario_ref": scenario_ref,
+                "scenario_version": scenario_version,
+                "status": status,
+                "ending_ref": ending_ref,
+            },
+        )
+
+    _assert_sqlstate(error.value, "23514")
+
+
+def test_scenario_progress_flag_ref_constraint(database: Engine) -> None:
+    with database.begin() as connection:
+        _seed_campaigns(connection)
+        connection.execute(
+            text(
+                "INSERT INTO mvp_scenario_runs("
+                "campaign_id,scenario_ref,scenario_version,status"
+                ") VALUES(:campaign,'ruined_chapel',1,'active')"
+            ),
+            {"campaign": CAMPAIGN_A},
+        )
+
+    with pytest.raises(IntegrityError) as error, database.begin() as connection:
+        connection.execute(
+            text(
+                "INSERT INTO mvp_scenario_flags(campaign_id,flag_ref) "
+                "VALUES(:campaign,'Invalid-Flag')"
+            ),
+            {"campaign": CAMPAIGN_A},
+        )
+
+    _assert_sqlstate(error.value, "23514")
+
+
+def test_scenario_progress_upgrade_has_no_backfill_and_downgrades_in_dependency_order(
+    empty_database_url: str,
+) -> None:
+    _run_alembic(empty_database_url, "upgrade", "0008_scene_entities")
+    engine = create_engine(empty_database_url)
+    try:
+        with engine.begin() as connection:
+            _seed_campaigns(connection)
+        original_tables = _public_tables(engine)
+
+        _run_alembic(empty_database_url, "upgrade", "head")
+        assert _public_tables(engine) == original_tables | {
+            "mvp_scenario_runs",
+            "mvp_scenario_flags",
+        }
+        with engine.connect() as connection:
+            assert connection.scalar(text("SELECT count(*) FROM mvp_scenario_runs")) == 0
+            assert connection.scalar(text("SELECT count(*) FROM mvp_scenario_flags")) == 0
+
+        _run_alembic(empty_database_url, "downgrade", "0008_scene_entities")
+        assert _public_tables(engine) == original_tables
+        with engine.connect() as connection:
+            assert connection.scalar(text("SELECT count(*) FROM campaigns")) == 2
     finally:
         engine.dispose()
 
@@ -971,7 +1067,11 @@ def test_scene_entity_upgrade_has_no_backfill_and_rollback_preserves_data(
             _seed_members_entities_and_scene(connection)
         original_tables = _public_tables(engine)
         _run_alembic(empty_database_url, "upgrade", "head")
-        assert _public_tables(engine) == original_tables | {"mvp_scene_entities"}
+        assert _public_tables(engine) == original_tables | {
+            "mvp_scene_entities",
+            "mvp_scenario_runs",
+            "mvp_scenario_flags",
+        }
         with engine.begin() as connection:
             assert connection.scalar(text("SELECT count(*) FROM mvp_scene_entities")) == 0
             connection.execute(
@@ -1822,6 +1922,71 @@ def test_canonical_snapshot_scene_entities_filter_campaign_and_scene(
         },)
 
 
+def test_canonical_snapshot_nests_scenario_run_and_wires_uow(database: Engine) -> None:
+    with database.begin() as connection:
+        _seed_members_entities_and_scene(connection)
+        connection.execute(
+            text(
+                "INSERT INTO scenes(id,campaign_id,sequence,status) "
+                "VALUES(:scene,:campaign,2,'planned')"
+            ),
+            {"scene": SCENE_B, "campaign": CAMPAIGN_A},
+        )
+        connection.execute(
+            text(
+                "INSERT INTO mvp_scenario_runs("
+                "campaign_id,scenario_ref,scenario_version,status"
+                ") VALUES(:campaign,'ruined_chapel',1,'active')"
+            ),
+            {"campaign": CAMPAIGN_A},
+        )
+        connection.execute(
+            text(
+                "INSERT INTO mvp_scenario_flags(campaign_id,flag_ref) "
+                "VALUES(:campaign,'door_open'),(:campaign,'altar_examined')"
+            ),
+            {"campaign": CAMPAIGN_A},
+        )
+
+    expected = repository_ports.ScenarioRunSnapshot(
+        campaign_id=UUID(CAMPAIGN_A),
+        scenario_ref="ruined_chapel",
+        scenario_version=1,
+        status="active",
+        ending_ref=None,
+        scenes=(
+            repository_ports.ScenarioSceneSnapshot(
+                id=UUID(SCENE_A), sequence=1, status="active"
+            ),
+            repository_ports.ScenarioSceneSnapshot(
+                id=UUID(SCENE_B), sequence=2, status="planned"
+            ),
+        ),
+        flags=frozenset({"door_open", "altar_examined"}),
+    )
+
+    async def read() -> tuple[object, object, object, bool]:
+        url = database.url.render_as_string(hide_password=False)
+        async with _postgres_sessions(url) as factory, PostgresUnitOfWork(factory) as uow:
+            direct = await uow.scenarios.snapshot(UUID(CAMPAIGN_A))
+            absent = await uow.scenarios.snapshot(UUID(CAMPAIGN_B))
+            canonical = await uow.canonical.snapshot(UUID(CAMPAIGN_A), UUID(SCENE_A))
+            return (
+                direct,
+                absent,
+                canonical.scenario_run,
+                isinstance(uow.scenarios, postgres_repositories.PostgresScenarioRepository),
+            )
+
+    with asyncio.Runner(loop_factory=asyncio.SelectorEventLoop) as runner:
+        direct, absent, canonical, wired = runner.run(read())
+
+    assert wired
+    assert direct == expected
+    assert absent is None
+    assert canonical == expected
+
+
 def test_canonical_snapshot_locks_campaign_before_typed_reads(database: Engine) -> None:
     with database.begin() as connection:
         _seed_resolution_state(connection)
@@ -1867,6 +2032,7 @@ def test_canonical_snapshot_locks_campaign_before_typed_reads(database: Engine) 
         value, statements = runner.run(snapshot())
 
     assert value.state_version == 0
+    assert value.scenario_run is None
     assert value.skill_checks == (
         {
             "campaign_id": UUID(CAMPAIGN_A),
@@ -1882,6 +2048,7 @@ def test_canonical_snapshot_locks_campaign_before_typed_reads(database: Engine) 
     assert "for update" in statements[0]
     assert any("from mvp_characters" in statement for statement in statements[1:])
     assert any("from mvp_scene_entities" in statement for statement in statements[1:])
+    assert any("from mvp_scenario_runs" in statement for statement in statements[1:])
 
 
 def test_canonical_snapshot_waits_for_campaign_update_and_reads_one_version(

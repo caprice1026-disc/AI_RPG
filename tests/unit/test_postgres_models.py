@@ -93,6 +93,15 @@ def test_scene_entity_metadata_matches_scope_constraints() -> None:
     assert str(check.sqltext) == "NOT is_attack_reachable OR is_public"
 
 
+def test_scenario_progress_metadata_matches_constraints() -> None:
+    run = models.MvpScenarioRunModel.__table__
+    flags = models.MvpScenarioFlagModel.__table__
+
+    assert list(run.primary_key.columns.keys()) == ["campaign_id"]
+    assert {"scenario_ref", "scenario_version", "status", "ending_ref"} <= set(run.c.keys())
+    assert list(flags.primary_key.columns.keys()) == ["campaign_id", "flag_ref"]
+
+
 def test_canonical_snapshot_defaults_scene_entities_for_existing_fixtures() -> None:
     snapshot = CanonicalSnapshot(
         campaign_id=UUID(int=1),
@@ -105,3 +114,4 @@ def test_canonical_snapshot_defaults_scene_entities_for_existing_fixtures() -> N
         entities=(),
     )
     assert snapshot.scene_entities == ()
+    assert snapshot.scenario_run is None
