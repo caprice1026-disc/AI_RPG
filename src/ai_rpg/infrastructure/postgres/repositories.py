@@ -58,7 +58,7 @@ from ai_rpg.contracts.responses import (
     RecoveryReason,
     TurnRecovery,
 )
-from ai_rpg.domain.commands import AttackCommand, UseItemCommand
+from ai_rpg.domain.commands import AttackCommand, ScenarioActionCommand, UseItemCommand
 from ai_rpg.domain.events import NarrationGeneratedPayload
 from ai_rpg.domain.results import AppliedResult, NotApplicableResult
 from ai_rpg.infrastructure.postgres.models import (
@@ -947,6 +947,9 @@ class PostgresTurnRepository:
         return True
 
     async def commit_resolution(self, bundle: CommitBundle) -> int:
+        if any(isinstance(action.command, ScenarioActionCommand) for action in bundle.actions):
+            raise InvalidCommitBundleError("Scenario Actionの永続化は未対応です")
+
         # デッドロックを避ける不変順序: Campaign、Turn。
         campaign = (
             (
@@ -1068,6 +1071,7 @@ class PostgresTurnRepository:
         )
         for action in projection.actions:
             command = action.command
+            assert not isinstance(command, ScenarioActionCommand)
             item_id = (
                 command.weapon_id
                 if isinstance(command, AttackCommand)
