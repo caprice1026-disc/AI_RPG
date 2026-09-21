@@ -59,7 +59,7 @@ test("clearing a rejected operation leaves no stale retry", () => {
     requestId: "request-b",
   }));
 
-  pendingState.clear(storage);
+  pendingState.clear(storage, pendingState.load(storage));
 
   assert.equal(pendingState.load(storage), null);
 });
@@ -71,10 +71,28 @@ test("start recovery persists the exact payload separately from pending turns", 
     preset_ref: "scout", player_name: "  葵  ",
   }, adventure: null };
   pendingState.saveStart(storage, start);
-  pendingState.clear(storage);
+  pendingState.clear(storage, pendingState.load(storage));
   assert.deepEqual(pendingState.loadStart(storage), start);
   pendingState.saveStart(storage, { ...start, adventure: { campaign_id: "c1", actor_id: "a1" } });
   assert.equal(pendingState.loadStart(storage).adventure.campaign_id, "c1");
   pendingState.clearStart(storage);
   assert.equal(pendingState.loadStart(storage), null);
+});
+
+test("pending save and clear require the expected operation identity", () => {
+  const storage = new MemoryStorage();
+  const old = pendingState.create({ campaignId: "campaign-a", actorId: "actor-a", displayText: "old",
+    content: { kind: "text", text: "old" }, stateVersion: 0, requestId: "request-old" });
+  const next = pendingState.create({ campaignId: "campaign-a", actorId: "actor-a", displayText: "next",
+    content: { kind: "text", text: "next" }, stateVersion: 0, requestId: "request-next" });
+  pendingState.save(storage, next);
+  pendingState.save(storage, { ...old, turnId: "old-turn" }, old);
+  assert.deepEqual(pendingState.load(storage), next);
+  pendingState.clear(storage, old);
+  assert.deepEqual(pendingState.load(storage), next);
+  pendingState.save(storage, old);
+  assert.deepEqual(pendingState.load(storage), next, "claim requires an empty slot");
+  pendingState.clear(storage, next);
+  pendingState.save(storage, { ...old, turnId: "old-turn" }, old);
+  assert.equal(pendingState.load(storage), null, "obsolete update cannot resurrect a cleared slot");
 });

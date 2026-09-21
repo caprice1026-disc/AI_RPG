@@ -45,6 +45,14 @@ class FakeElement extends FakeNode {
       child.remove(); child.parent = this; this.children.unshift(child);
     }
   }
+  before(...children) {
+    if (!this.parent) return;
+    for (const child of children) {
+      child.remove();
+      child.parent = this.parent;
+      this.parent.children.splice(this.parent.children.indexOf(this), 0, child);
+    }
+  }
   replaceChildren(...children) { this.children = []; this.append(...children); }
   remove() {
     if (this.parent) this.parent.children = this.parent.children.filter(child => child !== this);
@@ -744,8 +752,11 @@ test("replacement pending workflow keeps the newer pending operation", async () 
     content: { kind: "text", text: "new" }, stateVersion: 0, requestId: "request-new",
   });
 
+  AiRpgPending.save(app.storage, oldPending);
   const oldWorkflow = app.context.continuePending(oldPending, false);
   await flush();
+  // Simulate another owner replacing the persisted operation before a new workflow.
+  app.storage.setItem("ai-rpg-pending-turn", JSON.stringify(newPending));
   const newWorkflow = app.context.continuePending(newPending, false);
   await flush();
   await oldWorkflow;
@@ -1224,4 +1235,173 @@ test("DB pending turn resumes through polling and refreshes public state without
   assert.ok(find(app.elements.timeline, node => node.textContent === "戦う"));
   assert.ok(find(app.elements.timeline, node => node.textContent === "続行した。"));
   assert.equal(app.elements["send-action"].disabled, false);
+});
+
+function storyMessages(app) {
+  return app.elements.timeline.children
+    .filter(node => ["message player", "message gm"].includes(node.className))
+    .map(node => [node.children[0].textContent, node.querySelector(".message-body").textContent]);
+}
+
+test("P1 unused retry for A cannot overwrite or clear later ambiguous request B", async () => {
+  const storage = new MemoryStorage();
+  const pendingA = AiRpgPending.create({ campaignId: "campaign-a", actorId: "actor-a", displayText: "old input",
+    content: { kind: "text", text: "old input" }, stateVersion: 0, requestId: "request-a" });
+  AiRpgPending.save(storage, pendingA);
+  const posts = [];
+  const app = newAdventureApp((path, options) => {
+    if (options.method === "POST") {
+      const body = JSON.parse(options.body);
+      posts.push(body);
+      if (body.request_id !== "request-a") throw new Error("B response lost");
+      return response(terminalTurn("turn-a", 0), 202);
+    }
+  }, { storage });
+  await flush();
+  const unusedRetry = find(app.elements.timeline, node => node.textContent === "同じ送信を再試行");
+  app.elements["action-text"].value = "create another retry for A";
+  await app.elements.composer.requestSubmit();
+  await flush();
+  const otherRetry = find(app.elements.timeline, node => node !== unusedRetry && node.textContent === "同じ送信を再試行");
+  assert.ok(otherRetry);
+  await otherRetry.dispatch("click");
+  await flush();
+  app.elements["action-text"].value = "new input";
+  await app.elements.composer.requestSubmit();
+  await flush();
+  const pendingB = AiRpgPending.load(storage);
+  assert.equal(pendingB.body.content.text, "new input");
+  await unusedRetry.dispatch("click");
+  await flush();
+  assert.deepEqual(posts.map(body => body.request_id), ["request-a", "start-1"]);
+  assert.deepEqual(AiRpgPending.load(storage), pendingB);
+  assert.equal(unusedRetry.disabled, true);
+});
+
+test("P1 delayed acceptance or rejection cannot mutate a replacement pending slot", async () => {
+  for (const outcome of [202, 422, 409]) {
+    const storage = new MemoryStorage();
+    let resolvePost;
+    const posted = new Promise(resolve => { resolvePost = resolve; });
+    const app = newAdventureApp((path, options) => options.method === "POST" ? posted : undefined, { storage });
+    await flush();
+    await app.context.selectAdventure("campaign-a", "actor-a");
+    app.elements["action-text"].value = "old input";
+    await app.elements.composer.requestSubmit();
+    await flush();
+    const replacement = AiRpgPending.create({ campaignId: "campaign-a", actorId: "actor-a", displayText: "replacement",
+      content: { kind: "text", text: "replacement" }, stateVersion: 0, requestId: "replacement-request" });
+    // Another page owns the slot now; deliberately bypass the production writer.
+    storage.setItem("ai-rpg-pending-turn", JSON.stringify(replacement));
+    resolvePost(outcome === 202 ? response(terminalTurn("old-turn", 0), 202)
+      : response({ detail: { code: outcome === 409 ? "STATE_VERSION_CONFLICT" : "UNKNOWN" } }, outcome));
+    await flush();
+    assert.deepEqual(AiRpgPending.load(storage), replacement, `status ${outcome}`);
+    assert.equal(find(app.elements.timeline, node => node.textContent === "続行した。"), null);
+  }
+});
+
+test("P2 unknown acceptance replay renders its original input exactly once with its output", async () => {
+  const storage = new MemoryStorage();
+  AiRpgPending.save(storage, AiRpgPending.create({ campaignId: "campaign-a", actorId: "actor-a", displayText: "original input",
+    content: { kind: "text", text: "original input" }, stateVersion: 0, requestId: "unknown-request" }));
+  const app = newAdventureApp((path, options) => options.method === "POST"
+    ? response({ ...terminalTurn("recovered", 1), narration: "recovered output" }, 202) : undefined, { storage });
+  await flush();
+  await find(app.elements.timeline, node => node.textContent === "同じ送信を再試行").dispatch("click");
+  await flush();
+  assert.deepEqual(storyMessages(app), [["YOU", "original input"], ["GM", "recovered output"]]);
+});
+
+test("P2 latest history retry reconciles complete input-output pairs after live play", async () => {
+  const old = { ...terminalTurn("turn-old", 0), narration: "old output" };
+  const next = { ...terminalTurn("turn-new", 0), narration: "new output" };
+  let latest = old;
+  let historyCalls = 0;
+  const app = newAdventureApp((path, options) => {
+    if (path.endsWith("/state")) return response(adventureState({ latest_turn: latest }));
+    if (path.includes("/history?")) {
+      if (++historyCalls === 1) throw new Error("history unavailable");
+      return response({ items: [
+        { created_at: "2026-09-22T00:00:00Z", player_input: "old input", turn: old },
+        { created_at: "2026-09-22T00:01:00Z", player_input: "new input", turn: next },
+      ], next_before_turn_id: null });
+    }
+    if (options.method === "POST") { latest = next; return response(next, 202); }
+  });
+  await flush();
+  await app.context.selectAdventure("campaign-a", "actor-a");
+  app.elements["action-text"].value = "new input";
+  await app.elements.composer.requestSubmit();
+  await flush();
+  await app.elements["load-history"].dispatch("click");
+  await flush();
+  assert.deepEqual(storyMessages(app), [
+    ["YOU", "old input"], ["GM", "old output"], ["YOU", "new input"], ["GM", "new output"],
+  ]);
+});
+
+test("P2 history reconciliation preserves unfinished DB input and unaccepted local input", async () => {
+  const old = { ...terminalTurn("turn-old", 0), narration: "old output" };
+  let historyCalls = 0;
+  const app = newAdventureApp((path, options) => {
+    if (path.endsWith("/state")) return response(adventureState({ latest_turn: old }));
+    if (path.includes("/history?")) {
+      if (++historyCalls === 1) throw new Error("history unavailable");
+      return response({ items: [
+        { created_at: "2026-09-22T00:00:00Z", player_input: "old input", turn: old },
+        { created_at: "2026-09-22T00:01:00Z", player_input: "unfinished input", turn: pendingTurn("unfinished") },
+      ], next_before_turn_id: null });
+    }
+    if (options.method === "POST") throw new Error("unaccepted local request");
+  });
+  await flush();
+  await app.context.selectAdventure("campaign-a", "actor-a");
+  app.elements["action-text"].value = "local input";
+  await app.elements.composer.requestSubmit();
+  await flush();
+  const local = AiRpgPending.load(app.storage);
+  await app.elements["load-history"].dispatch("click");
+  await flush();
+  assert.deepEqual(storyMessages(app), [
+    ["YOU", "old input"], ["GM", "old output"], ["YOU", "unfinished input"], ["YOU", "local input"],
+  ]);
+  assert.deepEqual(AiRpgPending.load(app.storage), local);
+});
+
+test("P2 delayed unfinished history keeps the live completed pair and current choices", async () => {
+  const events = eventSourceTracker();
+  const old = { ...terminalTurn("old", 0), narration: "old output" };
+  const completed = { ...terminalTurn("live", 1), narration: "live output", choices: [{ id: "next", label: "current choice" }] };
+  let latest = old;
+  let historyCalls = 0;
+  let resolveHistory;
+  const delayedHistory = new Promise(resolve => { resolveHistory = resolve; });
+  const app = newAdventureApp((path, options) => {
+    if (path.endsWith("/state")) return response(adventureState({ state_version: latest === completed ? 1 : 0, latest_turn: latest }));
+    if (path.includes("/history?")) {
+      if (++historyCalls === 1) throw new Error("history unavailable");
+      return delayedHistory;
+    }
+    if (options.method === "POST") return response(pendingTurn("live"), 202);
+  }, events);
+  await flush();
+  await app.context.selectAdventure("campaign-a", "actor-a");
+  app.elements["action-text"].value = "live input";
+  await app.elements.composer.requestSubmit();
+  await flush();
+  const loading = app.elements["load-history"].dispatch("click");
+  latest = completed;
+  events.instances[0].emit("turn.updated", completed);
+  await flush();
+  resolveHistory(response({ items: [
+    { created_at: "2026-09-22T00:00:00Z", player_input: "old input", turn: old },
+    { created_at: "2026-09-22T00:01:00Z", player_input: "live input", turn: pendingTurn("live") },
+  ], next_before_turn_id: null }));
+  await loading;
+  assert.deepEqual(storyMessages(app), [
+    ["YOU", "old input"], ["GM", "old output"], ["YOU", "live input"], ["GM", "live output"],
+  ]);
+  assert.equal(find(app.elements.timeline, node => node.textContent === "current choice").disabled, false);
+  assert.equal(AiRpgPending.load(app.storage), null);
 });

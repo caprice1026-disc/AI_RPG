@@ -356,8 +356,8 @@
     let historyCursor = null;
     let historyBusy = false;
     let listGeneration = 0;
-    const renderedTurns = new Set();
-    const historyTurns = new Set();
+    const turnRecords = new Map();
+    const pendingInputs = new Map();
     const storageError = "送信内容をブラウザーに保存できません。再送時の重複を防ぐため、保存を許可してから送信してください。";
     try {
       localStorage.removeItem("ai-rpg-state-version");
@@ -376,9 +376,12 @@
       const blocked = value || adventureCompleted || authRequired || stateVersion === null;
       ui["send-action"].disabled = blocked;
       ui["action-text"].disabled = blocked;
+      const pending = AiRpgPending.load(localStorage);
       document.querySelectorAll(".choice").forEach(button => {
         if (button.dataset.turnId) button.disabled = blocked || button.dataset.turnId !== latestTurnId;
         if (button.dataset.action) button.disabled = blocked;
+        if (button.dataset.requestId && (button.dataset.requestId !== pending?.body.request_id ||
+            button.dataset.campaignId !== pending?.campaignId)) button.disabled = true;
       });
       ui["send-action"].textContent = value ? "処理中…" : "送信";
     }
@@ -552,14 +555,11 @@
         const suffix = historyCursor ? `&before_turn_id=${encodeURIComponent(historyCursor)}` : "";
         const page = await api(`/campaigns/${encodeURIComponent(campaignId)}/history?limit=50${suffix}`);
         if (!ownsHistory()) return;
-        const fragment = document.createElement("ol");
+        const pageNodes = [];
         for (const item of page.items) {
-          if (historyTurns.has(item.turn.turn_id)) continue;
-          historyTurns.add(item.turn.turn_id);
-          addMessage("YOU", "player", item.player_input, "", fragment);
-          if (terminal(item.turn)) renderCompleted(item.turn, fragment);
+          pageNodes.push(...renderTurn(item.turn, item.player_input, null, false));
         }
-        ui.timeline.prepend(...fragment.children);
+        ui.timeline.prepend(...pageNodes);
         const empty = document.getElementById("empty-state");
         if (empty) empty.textContent = "まだ行動の記録はありません。行動を入力して物語を進めましょう。";
         historyCursor = page.next_before_turn_id;
@@ -595,8 +595,9 @@
         if (!ownsSelection()) return false;
         const pending = AiRpgPending.load(localStorage);
         if (pending?.campaignId === campaignId) {
-          if (pending.turnId) await continuePending(pending, false);
-          else showRetry("前の送信結果が未確認です。同じ送信を再試行してください。", () => continuePending(pending, false));
+          if (pending.turnId) await continuePending(pending);
+          else showRetry("前の送信結果が未確認です。同じ送信を再試行してください。",
+            () => continuePending(pending), "同じ送信を再試行", pending);
         } else if (refreshed.state.latest_turn) {
           await resumeTurn(campaignId, refreshed.state.latest_turn);
         }
@@ -653,7 +654,7 @@
       announce(message);
     }
 
-    function showRetry(message, retry, label = "同じ送信を再試行") {
+    function showRetry(message, retry, label = "同じ送信を再試行", pending = null) {
       const box = document.createElement("div");
       box.className = "notice error";
       const text = document.createElement("span");
@@ -662,10 +663,15 @@
       button.type = "button";
       button.className = "choice";
       button.textContent = label;
+      if (pending) {
+        button.dataset.requestId = pending.body.request_id;
+        button.dataset.campaignId = pending.campaignId;
+      }
       const selection = selectionGeneration;
       button.addEventListener("click", () => {
         if (button.disabled || busy || selection !== selectionGeneration) return;
         button.disabled = true;
+        if (pending && !AiRpgPending.isCurrent(localStorage, pending)) return;
         return retry();
       });
       box.append(text, document.createElement("br"), button);
@@ -682,8 +688,8 @@
     }
 
     function resetView() {
-      renderedTurns.clear();
-      historyTurns.clear();
+      turnRecords.clear();
+      pendingInputs.clear();
       historyCursor = null;
       historyBusy = false;
       latestTurnId = null;
@@ -721,10 +727,40 @@
       return true;
     }
 
-    function renderCompleted(turn, target = ui.timeline) {
-      if (target === ui.timeline) document.querySelector('[data-role="processing"]')?.remove();
-      if (renderedTurns.has(turn.turn_id)) return;
-      renderedTurns.add(turn.turn_id);
+    function renderPendingInput(pending) {
+      const requestId = pending.body.request_id;
+      if (pendingInputs.has(requestId) || turnRecords.get(pending.turnId)?.playerInput !== undefined) return;
+      const fragment = document.createElement("ol");
+      addMessage("YOU", "player", pending.displayText, "", fragment);
+      const node = fragment.lastElementChild;
+      pendingInputs.set(requestId, node);
+      ui.timeline.append(node);
+    }
+
+    function renderTurn(turn, playerInput, pending = null, scroll = true) {
+      const previous = turnRecords.get(turn.turn_id);
+      // A history page fetched before completion must not erase the live result.
+      if (previous && terminal(previous.turn) && !terminal(turn)) turn = previous.turn;
+      playerInput = pending ? previous?.playerInput ?? playerInput : playerInput ?? previous?.playerInput;
+      const fragment = document.createElement("ol");
+      if (playerInput !== undefined) addMessage("YOU", "player", playerInput, "", fragment);
+      if (terminal(turn)) renderTurnOutput(turn, fragment);
+      const nodes = [...fragment.children];
+      const localInput = pending && pendingInputs.get(pending.body.request_id);
+      const anchor = previous?.nodes[0] || localInput;
+      if (anchor) anchor.before(...nodes); else ui.timeline.append(...nodes);
+      previous?.nodes.forEach(node => node.remove());
+      localInput?.remove();
+      if (pending) pendingInputs.delete(pending.body.request_id);
+      turnRecords.set(turn.turn_id, { turn, playerInput, nodes });
+      if (scroll) {
+        nodes.at(-1)?.scrollIntoView({ block: "nearest" });
+        if (terminal(turn)) announce(turn.recovery?.fallback ? "復旧用描写でTurnが完了しました。" : "Turnが完了しました。");
+      }
+      return nodes;
+    }
+
+    function renderTurnOutput(turn, target) {
       for (const action of turn.action_results || []) {
         const result = action.result;
         const lines = [];
@@ -761,8 +797,6 @@
         const lastGm = target.lastElementChild?.querySelector(".message-body");
         (lastGm || target).append(choices);
       }
-      const summary = turn.recovery?.fallback ? "復旧用描写でTurnが完了しました。" : "Turnが完了しました。";
-      if (target === ui.timeline) announce(summary);
     }
 
     function terminal(turn) {
@@ -937,7 +971,8 @@
         observeTurn(campaignId, turn);
         const completed = terminal(turn) ? turn : await waitForTurn(campaignId, turn.turn_id);
         if (!ownsWorkflow() || !completed) return;
-        renderCompleted(completed);
+        document.querySelector('[data-role="processing"]')?.remove();
+        renderTurn(completed);
         if (!terminal(turn)) await refreshAfterTurn(campaignId);
       } catch (error) {
         if (!ownsWorkflow()) return;
@@ -962,13 +997,16 @@
       }
     }
 
-    async function continuePending(pending, showPlayer) {
-      if (ui["campaign-id"].value !== pending.campaignId || authRequired) return;
+    async function continuePending(pending) {
+      if (ui["campaign-id"].value !== pending.campaignId || authRequired ||
+          !AiRpgPending.isCurrent(localStorage, pending)) return;
+      pending = AiRpgPending.load(localStorage);
       const workflow = ++workflowGeneration;
       const ownsWorkflow = () => workflow === workflowGeneration;
+      const ownsPending = () => ownsWorkflow() && AiRpgPending.isCurrent(localStorage, pending);
       cancelTracking?.();
       setBusy(true);
-      if (showPlayer) addMessage("YOU", "player", pending.displayText);
+      renderPendingInput(pending);
       processingMessage();
       announce("Turnを送信しました。判定中です。");
       try {
@@ -983,25 +1021,28 @@
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify(pending.body)
           });
-          if (!ownsWorkflow()) return;
-          pending = { ...pending, turnId: accepted.turn_id };
-          AiRpgPending.save(localStorage, pending);
+          if (!ownsPending()) return;
+          const acceptedPending = { ...pending, turnId: accepted.turn_id };
+          if (!AiRpgPending.save(localStorage, acceptedPending, pending)) return;
+          pending = acceptedPending;
         }
-        if (!ownsWorkflow()) return;
+        if (!ownsPending()) return;
+        if (!terminal(accepted)) renderTurn(accepted, pending.displayText, pending);
         updateStatus(pending.campaignId, accepted);
         const completed = terminal(accepted) ? accepted : await waitForTurn(pending.campaignId, accepted.turn_id);
-        if (!ownsWorkflow() || !completed) return;
-        renderCompleted(completed);
-        AiRpgPending.clear(localStorage);
+        if (!ownsPending() || !completed) return;
+        document.querySelector('[data-role="processing"]')?.remove();
+        renderTurn(completed, pending.displayText, pending);
+        if (!AiRpgPending.clear(localStorage, pending)) return;
         if (pending.body.content.kind === "text") ui["action-text"].value = "";
         await refreshAfterTurn(pending.campaignId);
       } catch (error) {
-        if (!ownsWorkflow()) return;
+        if (!ownsPending()) return;
         document.querySelector('[data-role="processing"]')?.remove();
         const rejected = !pending.turnId && error?.status >= 400 && error.status < 500;
-        if (rejected) AiRpgPending.clear(localStorage);
-        if (["STATE_VERSION_CONFLICT", "TURN_IN_PROGRESS", "CHOICE_NOT_AVAILABLE", "IDEMPOTENCY_CONFLICT"].includes(error?.code)) {
-          AiRpgPending.clear(localStorage);
+        const conflict = ["STATE_VERSION_CONFLICT", "TURN_IN_PROGRESS", "CHOICE_NOT_AVAILABLE", "IDEMPOTENCY_CONFLICT"].includes(error?.code);
+        if ((rejected || conflict) && !AiRpgPending.clear(localStorage, pending)) return;
+        if (conflict) {
           let refreshApplied = true;
           try {
             const refreshed = await refreshCampaignState(
@@ -1017,10 +1058,7 @@
           if (rejected) {
             showError(message);
           } else {
-            showRetry(message, () => {
-              const saved = AiRpgPending.load(localStorage);
-              if (saved) continuePending(saved, false);
-            });
+            showRetry(message, () => continuePending(pending), "同じ送信を再試行", pending);
           }
         }
         if (error?.status === 401) {
@@ -1047,8 +1085,8 @@
       if (existing) {
         showRetry("前の送信結果が未確認です。送信した冒険を開いて結果を確認してください。", async () => {
           if (campaignId !== existing.campaignId) await selectAdventure(existing.campaignId, existing.actorId);
-          else await continuePending(existing, false);
-        });
+          else await continuePending(existing);
+        }, "同じ送信を再試行", existing);
         return;
       }
       const workflow = ++workflowGeneration;
@@ -1076,14 +1114,19 @@
           stateVersion: current.state_version,
           requestId: crypto.randomUUID()
         });
-        try { AiRpgPending.save(localStorage, draft); } catch (_) { throw new Error(storageError); }
+        try {
+          if (!AiRpgPending.save(localStorage, draft)) {
+            showError("別の送信結果が未確認です。冒険を開き直して確認してください。");
+            return;
+          }
+        } catch (_) { throw new Error(storageError); }
         pending = draft;
       } catch (error) {
         if (ownsWorkflow()) showError(error instanceof Error ? error.message : "Turnの処理に失敗しました。");
       } finally {
         if (ownsWorkflow()) setBusy(false);
       }
-      if (ownsWorkflow() && pending) await continuePending(pending, true);
+      if (ownsWorkflow() && pending) await continuePending(pending);
     }
 
     ui.composer.addEventListener("submit", event => {

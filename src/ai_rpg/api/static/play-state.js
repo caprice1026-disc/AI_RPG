@@ -33,12 +33,26 @@
     }
   }
 
-  function save(storage, value) {
-    storage.setItem(key, JSON.stringify(value));
+  function sameOperation(left, right) {
+    if (!left || !right) return left === right;
+    return left.campaignId === right.campaignId && left.actorId === right.actorId &&
+      JSON.stringify(left.body) === JSON.stringify(right.body);
   }
 
-  function clear(storage) {
+  function isCurrent(storage, value) {
+    return !!value && sameOperation(load(storage), value);
+  }
+
+  function save(storage, value, expected = null) {
+    if (!sameOperation(load(storage), expected) || (expected && !sameOperation(value, expected))) return false;
+    storage.setItem(key, JSON.stringify(value));
+    return true;
+  }
+
+  function clear(storage, expected) {
+    if (!isCurrent(storage, expected)) return false;
     storage.removeItem(key);
+    return true;
   }
 
   function loadStart(storage) {
@@ -64,7 +78,7 @@
     storage.removeItem(startKey);
   }
 
-  const api = Object.freeze({ create, load, save, clear, loadStart, saveStart, clearStart });
+  const api = Object.freeze({ create, load, save, clear, isCurrent, loadStart, saveStart, clearStart });
   root.AiRpgPending = api;
   if (typeof module !== "undefined" && module.exports) module.exports = api;
 })(typeof globalThis !== "undefined" ? globalThis : this);
