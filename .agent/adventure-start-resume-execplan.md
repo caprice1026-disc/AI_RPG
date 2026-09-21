@@ -44,7 +44,7 @@
 - [x] README/API docsを更新する。開発環境だけで使う認証、Fakeの制約、開始・再開の操作を明記する。
 - [x] 専用test DBで全pytest、Ruff、mypy、JS tests、build、git diff --checkを実行する。
 - [x] test DBと分離した検証DBでAPI/Fake workersを起動し、desktop/mobileの実browserで開始→進行→reload→再開→結末を確認する。
-- [ ] 最終review後、mainへfast-forwardしpush、remote SHAを照合する。
+- [x] 最終review後、mainへfast-forwardしpush、remote SHAを照合する。
 
 ## 検証環境と記録
 
@@ -62,3 +62,4 @@ worktree: .worktrees/adventure-start-resume、branch: codex/adventure-start-resu
 - 最終reviewで、古いTurn再試行ボタンが後続の未確認要求を失わせる問題と、履歴復旧時に入力が欠落・重複する問題を再現。4d3644aで要求の所有権照合と入力・結果を一組として扱う履歴管理へ修正。追加テストの失敗から成功を確認し、限定再reviewで両指摘の解消を確認した。
 - 修正後のJS全47 tests、API/HTML連携16 tests、wheel/sdist再buildと差分checkが成功。Python/DB処理は不変のため全DB suiteは繰り返していない。実Chromeでも、未到達Turnのreload・再送で入力が復元され、未使用の旧再試行ボタンが無効になることを確認。履歴GETの初回503→次Turn完了→履歴再取得で2Turnの入力・結果・描写が一度ずつ正順に並ぶことを確認した。
 - ブラウザログイン、実モデル、敵の反撃は未実装・対象外。検証DBとDocker socketの退避データは残す。検証専用API/Fake workerは作業終了時に停止する。
+- 実装と検証記録をmainへfast-forwardし、509bfb03ee3c029cdf885fb9a8ae4df1b2b31654のpush後にremote SHA一致を確認。検証専用API/Fake workerと2つの検証ブラウザを停止した。この完了記録は文書のみの追記。
