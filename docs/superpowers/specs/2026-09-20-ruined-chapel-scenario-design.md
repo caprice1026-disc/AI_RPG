@@ -101,7 +101,7 @@ Applicationは実行前に次を確認する。
 - 必要な進行フラグを満たしている。
 - 無効化条件となるフラグを持っていない。
 
-条件不一致はnot_appliedとし、Scene、フラグ、結末を変更しない。
+条件不一致または静的検証失敗はTurnをnot_appliedで確定する。この拒否経路では、監査・再開用のGMNarrationGeneratedを変更前と同じstate_versionで一件だけ追加する。Gameplay EventとActionは追加せず、Engine/RNGを呼ばない。Campaign state_version、Scenario run、HP、在庫、Scene、flag、endingは変更しない。
 
 ## シナリオ進行
 
@@ -245,7 +245,8 @@ GET /campaigns/{campaign_id}/stateの互換性を保ちながら、任意のadve
 - 有効な礼拝堂JSONを型付き定義として読み込める。
 - 重複参照、参照切れ、無効な技能、遷移とEndingの競合を拒否する。
 - 入口、探索success/failure、交渉、隠密、戦闘、撤退を公開状態から評価できる。
-- 未登録actionと条件不一致では進行更新を作らない。
+- 未登録actionと条件不一致では進行更新を作らず、変更前と同じstate_versionのGMNarrationGeneratedだけを一件追加する。
+- 拒否されたnot_applied Turnでは、Gameplay Event、Action、Engine/RNG呼出し、Canonical StateおよびScenario状態の変更がない。
 - 複数のScenario進行を含む複合計画をRNG前に拒否する。
 
 ### PostgreSQL

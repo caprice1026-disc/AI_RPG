@@ -12,6 +12,7 @@
 
 - 設計正本は docs/superpowers/specs/2026-09-20-ruined-chapel-scenario-design.md とする。
 - Narrative commitはCanonical Stateを変更しない。Scenario変更はMechanical commitだけで行う。
+- 拒否されたnot_applied Turnは、監査・再開用のGMNarrationGeneratedだけを変更前と同じstate_versionで一件追加する。Gameplay Event、Action、Canonical State、Scenario状態は変更しない。
 - LLMは登録済みaction_refを提案するだけで、Scene ID、flag、endingを指定しない。
 - Engineはダイス、攻撃、回復を担当し、Scenario遷移条件を持たない。
 - Scenarioなしの既存Campaignでは現在のTurn、API、worker挙動を維持する。
@@ -499,7 +500,7 @@ testsは次をassertする。
 
 - Scenario runでは固定文ではなく現在Scene、目的、公開fact、available actionがinput_dataに入る。
 - hidden ending条件、別Scene説明、生のflag名は入らない。
-- 未登録scenario_actionはEngine/RNG、Action、Event、progressを一切変更しない。
+- 未登録scenario_actionと静的検証失敗はEngine/RNGを呼ばず、ActionとGameplay Eventを追加しない。監査・再開用のGMNarrationGeneratedだけを変更前と同じstate_versionで一件追加し、Campaign state_version、Scenario run、HP、在庫、Scene、flag、endingは変更しない。
 - 二つの進行actionを含むplanは最初のRNG前に拒否される。
 - enter_chapelとretreatはdiceなしAppliedResultになる。
 - search skill outcomeとgoblin HP 0でScenarioProgressUpdateがbundleへ入る。
