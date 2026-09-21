@@ -1133,6 +1133,7 @@ def test_scenario_progress_upgrade_has_no_backfill_and_downgrades_in_dependency_
         assert _public_tables(engine) == original_tables | {
             "mvp_scenario_runs",
             "mvp_scenario_flags",
+            "adventure_start_requests",
         }
         with engine.connect() as connection:
             assert connection.scalar(text("SELECT count(*) FROM mvp_scenario_runs")) == 0
@@ -1326,6 +1327,7 @@ def test_scene_entity_upgrade_has_no_backfill_and_rollback_preserves_data(
             "mvp_scene_entities",
             "mvp_scenario_runs",
             "mvp_scenario_flags",
+            "adventure_start_requests",
         }
         with engine.begin() as connection:
             assert connection.scalar(text("SELECT count(*) FROM mvp_scene_entities")) == 0
