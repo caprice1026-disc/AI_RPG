@@ -157,6 +157,29 @@ def seed_development_fixture(database_url: str) -> DevelopmentFixture:
             )
             connection.execute(
                 text(
+                    "DELETE FROM mvp_scene_entities "
+                    "WHERE campaign_id=:campaign AND scene_id=:scene "
+                    "AND entity_id=:target"
+                ),
+                {
+                    "campaign": fixture.campaign_id,
+                    "scene": fixture.entrance_scene_id,
+                    "target": fixture.target_id,
+                },
+            )
+            connection.execute(
+                text(
+                    "DELETE FROM mvp_scene_skill_checks "
+                    "WHERE campaign_id=:campaign AND scene_id=:scene "
+                    "AND check_ref='observe_room'"
+                ),
+                {
+                    "campaign": fixture.campaign_id,
+                    "scene": fixture.entrance_scene_id,
+                },
+            )
+            connection.execute(
+                text(
                     "INSERT INTO mvp_scene_entities("
                     "campaign_id,scene_id,entity_id,is_public,is_attack_reachable"
                     ") VALUES(:campaign,:scene,:entity,true,:reachable) "

@@ -7652,6 +7652,125 @@ def test_development_fixture_is_idempotent(database: Engine) -> None:
         ) == 1
 
 
+def test_development_fixture_removes_only_obsolete_legacy_rows(
+    database: Engine,
+) -> None:
+    from ai_rpg.runtime import DEVELOPMENT_FIXTURE, seed_development_fixture
+
+    fixture = DEVELOPMENT_FIXTURE
+    with database.begin() as connection:
+        connection.execute(
+            text(
+                "INSERT INTO campaigns(id,ruleset_version) VALUES(:campaign,'mvp_v1')"
+            ),
+            {"campaign": fixture.campaign_id},
+        )
+        connection.execute(
+            text(
+                "INSERT INTO entities(id,campaign_id,kind,ref,label) VALUES"
+                "(:target,:campaign,'npc','goblin','ゴブリン'),"
+                "(:sentinel,:campaign,'item','legacy_sentinel','保持対象')"
+            ),
+            {
+                "campaign": fixture.campaign_id,
+                "target": fixture.target_id,
+                "sentinel": fixture.weapon_id,
+            },
+        )
+        connection.execute(
+            text(
+                "INSERT INTO scenes(id,campaign_id,sequence,status) "
+                "VALUES(:scene,:campaign,1,'active')"
+            ),
+            {
+                "campaign": fixture.campaign_id,
+                "scene": fixture.entrance_scene_id,
+            },
+        )
+        connection.execute(
+            text(
+                "INSERT INTO mvp_scene_entities("
+                "campaign_id,scene_id,entity_id,is_public,is_attack_reachable"
+                ") VALUES"
+                "(:campaign,:scene,:target,true,true),"
+                "(:campaign,:scene,:sentinel,true,false)"
+            ),
+            {
+                "campaign": fixture.campaign_id,
+                "scene": fixture.entrance_scene_id,
+                "target": fixture.target_id,
+                "sentinel": fixture.weapon_id,
+            },
+        )
+        connection.execute(
+            text(
+                "INSERT INTO mvp_scene_skill_checks("
+                "campaign_id,scene_id,check_ref,skill_ref,difficulty,public_description"
+                ") VALUES"
+                "(:campaign,:scene,'observe_room','perception','normal',"
+                "'床に新しい足跡が残っている。'),"
+                "(:campaign,:scene,'keep_me','perception','easy','保持対象')"
+            ),
+            {
+                "campaign": fixture.campaign_id,
+                "scene": fixture.entrance_scene_id,
+            },
+        )
+
+    seed_development_fixture(database.url.render_as_string(hide_password=False))
+
+    with database.connect() as connection:
+        entrance_entities = set(
+            connection.execute(
+                text(
+                    "SELECT entity_id,is_public,is_attack_reachable "
+                    "FROM mvp_scene_entities "
+                    "WHERE campaign_id=:campaign AND scene_id=:scene"
+                ),
+                {
+                    "campaign": fixture.campaign_id,
+                    "scene": fixture.entrance_scene_id,
+                },
+            )
+        )
+        assert (fixture.target_id, True, True) not in entrance_entities
+        assert (fixture.weapon_id, True, False) in entrance_entities
+        assert (fixture.actor_id, True, False) in entrance_entities
+        assert connection.execute(
+            text(
+                "SELECT check_ref FROM mvp_scene_skill_checks "
+                "WHERE campaign_id=:campaign AND scene_id=:scene ORDER BY check_ref"
+            ),
+            {
+                "campaign": fixture.campaign_id,
+                "scene": fixture.entrance_scene_id,
+            },
+        ).scalars().all() == ["keep_me"]
+        assert connection.execute(
+            text(
+                "SELECT sequence,status FROM scenes "
+                "WHERE campaign_id=:campaign ORDER BY sequence"
+            ),
+            {"campaign": fixture.campaign_id},
+        ).all() == [(1, "active"), (2, "planned"), (3, "planned")]
+        assert set(
+            connection.execute(
+                text(
+                    "SELECT scene_id,skill_ref FROM mvp_scene_skill_checks "
+                    "WHERE campaign_id=:campaign AND scene_id<>:entrance"
+                ),
+                {
+                    "campaign": fixture.campaign_id,
+                    "entrance": fixture.entrance_scene_id,
+                },
+            )
+        ) == {
+            (fixture.hall_scene_id, "perception"),
+            (fixture.sanctum_scene_id, "persuasion"),
+            (fixture.sanctum_scene_id, "stealth"),
+        }
+
+
 def test_adventure_state_projects_development_fixture(database: Engine) -> None:
     from ai_rpg.runtime import seed_development_fixture
 
