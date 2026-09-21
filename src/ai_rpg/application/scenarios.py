@@ -22,6 +22,10 @@ class ScenarioStateError(ValueError):
     """保存済みScenario状態が登録済み定義と一致しない。"""
 
 
+class ScenarioActionUnavailableError(ValueError):
+    """登録済みScenario行動のflag条件を満たしていない。"""
+
+
 @dataclass(frozen=True, slots=True)
 class ScenarioPublicContext:
     scene_title: str
@@ -35,6 +39,14 @@ ScenarioActionBinding: TypeAlias = (
     DirectScenarioAction | SkillScenarioAction | AttackScenarioAction
 )
 ScenarioOutcome: TypeAlias = Literal["success", "failure", "neutral"]
+
+
+def _action_is_available(
+    action: ScenarioActionBinding, flags: frozenset[str]
+) -> bool:
+    return set(action.required_flags) <= flags and flags.isdisjoint(
+        action.disabled_flags
+    )
 
 
 class ScenarioProgressor:
@@ -59,7 +71,9 @@ class ScenarioProgressor:
                 if flag.flag_ref in snapshot.flags
             ),
             available_actions=tuple(
-                (action.action_ref, action.label) for action in scene.actions
+                (action.action_ref, action.label)
+                for action in scene.actions
+                if _action_is_available(action, snapshot.flags)
             ),
         )
 
@@ -73,7 +87,11 @@ class ScenarioProgressor:
             if isinstance(action, DirectScenarioAction)
             and action.action_ref == action_ref
         )
-        return matches[0] if len(matches) == 1 else None
+        if len(matches) != 1:
+            return None
+        if not _action_is_available(matches[0], snapshot.flags):
+            raise ScenarioActionUnavailableError("Scenario行動のflag条件を満たしていません")
+        return matches[0]
 
     def bind_skill_check(
         self, snapshot: ScenarioRunSnapshot, skill_ref: str
@@ -84,7 +102,11 @@ class ScenarioProgressor:
             for action in scene.actions
             if isinstance(action, SkillScenarioAction) and action.skill_ref == skill_ref
         )
-        return matches[0] if len(matches) == 1 else None
+        if len(matches) != 1:
+            return None
+        if not _action_is_available(matches[0], snapshot.flags):
+            raise ScenarioActionUnavailableError("Scenario行動のflag条件を満たしていません")
+        return matches[0]
 
     def bind_attack(
         self, snapshot: ScenarioRunSnapshot, target_ref: str
@@ -96,7 +118,11 @@ class ScenarioProgressor:
             if isinstance(action, AttackScenarioAction)
             and action.target_ref == target_ref
         )
-        return matches[0] if len(matches) == 1 else None
+        if len(matches) != 1:
+            return None
+        if not _action_is_available(matches[0], snapshot.flags):
+            raise ScenarioActionUnavailableError("Scenario行動のflag条件を満たしていません")
+        return matches[0]
 
     def progress_for(
         self,

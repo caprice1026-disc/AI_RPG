@@ -34,6 +34,7 @@ from ai_rpg.application.ports.repositories import ScenarioProgressUpdate
 from ai_rpg.application.routing import RuleBasedTurnRouter, TurnRouter
 from ai_rpg.application.scenarios import (
     ScenarioActionBinding,
+    ScenarioActionUnavailableError,
     ScenarioProgressor,
     ScenarioPublicContext,
 )
@@ -1161,23 +1162,26 @@ class SkillCheckResolutionWorker:
 
         bindings: list[ScenarioActionBinding | None] = []
         for intent in intents:
-            binding: ScenarioActionBinding | None
-            if isinstance(intent, ScenarioActionIntent):
-                binding = self._scenario_progressor.bind_scenario_action(
-                    run, intent.action_ref
-                )
-                if binding is None:
-                    raise ResolutionInputError("登録済みScenario行動ではありません")
-            elif isinstance(intent, SkillCheckIntent):
-                binding = self._scenario_progressor.bind_skill_check(
-                    run, intent.skill_ref
-                )
-            elif isinstance(intent, AttackIntent):
-                binding = self._scenario_progressor.bind_attack(
-                    run, intent.target_ref
-                )
-            else:
-                binding = None
+            try:
+                binding: ScenarioActionBinding | None
+                if isinstance(intent, ScenarioActionIntent):
+                    binding = self._scenario_progressor.bind_scenario_action(
+                        run, intent.action_ref
+                    )
+                    if binding is None:
+                        raise ResolutionInputError("登録済みScenario行動ではありません")
+                elif isinstance(intent, SkillCheckIntent):
+                    binding = self._scenario_progressor.bind_skill_check(
+                        run, intent.skill_ref
+                    )
+                elif isinstance(intent, AttackIntent):
+                    binding = self._scenario_progressor.bind_attack(
+                        run, intent.target_ref
+                    )
+                else:
+                    binding = None
+            except ScenarioActionUnavailableError as error:
+                raise ResolutionInputError(str(error)) from error
             bindings.append(binding)
         if sum(binding is not None for binding in bindings) >= 2:
             raise ResolutionInputError("一つのplanに複数のScenario進行行動があります")

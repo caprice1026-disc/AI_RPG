@@ -21,7 +21,12 @@ class ScenarioEffect(Contract):
     overrides: tuple[ScenarioEndingOverride, ...] = ()
 
 
-class DirectScenarioAction(Contract):
+class ScenarioActionConditions(Contract):
+    required_flags: tuple[Ref, ...] = ()
+    disabled_flags: tuple[Ref, ...] = ()
+
+
+class DirectScenarioAction(ScenarioActionConditions):
     action_ref: Ref
     label: ShortText
     public_fact: ShortText
@@ -29,7 +34,7 @@ class DirectScenarioAction(Contract):
     success: ScenarioEffect
 
 
-class SkillScenarioAction(Contract):
+class SkillScenarioAction(ScenarioActionConditions):
     action_ref: Ref
     label: ShortText
     kind: Literal["skill_check"]
@@ -39,7 +44,7 @@ class SkillScenarioAction(Contract):
     failure: ScenarioEffect
 
 
-class AttackScenarioAction(Contract):
+class AttackScenarioAction(ScenarioActionConditions):
     action_ref: Ref
     label: ShortText
     kind: Literal["attack"]
@@ -106,6 +111,13 @@ class ScenarioDefinition(Contract):
         known_endings = set(ending_refs)
         for scene in self.scenes:
             for action in scene.actions:
+                required_flags = set(action.required_flags)
+                disabled_flags = set(action.disabled_flags)
+                if not (required_flags | disabled_flags) <= known_flags:
+                    raise ValueError("Action条件が存在しないFlagを参照しています")
+                if required_flags & disabled_flags:
+                    raise ValueError("Actionの必須Flagと無効化Flagは重複できません")
+
                 effects: tuple[ScenarioEffect, ...]
                 if isinstance(action, SkillScenarioAction):
                     if action.skill_ref not in SUPPORTED_SKILL_REFS:

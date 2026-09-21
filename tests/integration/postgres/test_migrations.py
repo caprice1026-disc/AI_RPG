@@ -86,7 +86,7 @@ from ai_rpg.infrastructure.postgres.repositories import (
     PostgresTurnRepository,
 )
 from ai_rpg.llm import DevelopmentFakeTransport, ProviderRefusalError, ScriptedFakeTransport
-from ai_rpg.scenarios import BUILTIN_SCENARIOS
+from ai_rpg.scenarios import BUILTIN_SCENARIOS, ScenarioCatalog, ScenarioDefinition
 
 URL = os.getenv("AIRPG_TEST_DATABASE_URL")
 ROOT = Path(__file__).parents[3]
@@ -6299,6 +6299,7 @@ def _run_scenario_worker(
     player_text: str,
     decision: dict[str, object],
     random_source: object,
+    scenario_progressor: ScenarioProgressor | None = None,
 ) -> tuple[UUID, dict[str, Any], MagicMock]:
     ruleset = MagicMock(wraps=MvpV1Ruleset(DiceEngine(random_source)))
 
@@ -6312,7 +6313,9 @@ def _run_scenario_worker(
                 transport,
                 ruleset,
                 WorkerPhasePolicy(60, 3, 120, "fake-intent"),
-                scenario_progressor=ScenarioProgressor(BUILTIN_SCENARIOS),
+                scenario_progressor=(
+                    scenario_progressor or ScenarioProgressor(BUILTIN_SCENARIOS)
+                ),
                 rng_source="seeded_test",
             )
             assert await worker.run_once(accepted.turn_id)
@@ -6321,6 +6324,26 @@ def _run_scenario_worker(
     with asyncio.Runner(loop_factory=asyncio.SelectorEventLoop) as runner:
         turn_id, llm_input = runner.run(resolve())
     return turn_id, llm_input, ruleset
+
+
+def _conditioned_scenario_progressor(
+    action_ref: str,
+    *,
+    required_flags: tuple[str, ...] = (),
+    disabled_flags: tuple[str, ...] = (),
+) -> ScenarioProgressor:
+    payload = BUILTIN_SCENARIOS.get("ruined_chapel", 1).model_dump(mode="json")
+    action = next(
+        action
+        for scene in payload["scenes"]
+        for action in scene["actions"]
+        if action["action_ref"] == action_ref
+    )
+    action["required_flags"] = list(required_flags)
+    action["disabled_flags"] = list(disabled_flags)
+    return ScenarioProgressor(
+        ScenarioCatalog((ScenarioDefinition.model_validate(payload),))
+    )
 
 
 def test_scenario_worker_context_exposes_only_current_public_data(
@@ -6442,6 +6465,83 @@ def test_scenario_worker_rejects_invalid_progression_plan_before_rng_or_writes(
             connection.execute(text("SELECT status FROM scenes ORDER BY sequence")).scalars()
         ) == expected_statuses
         assert connection.scalar(text("SELECT count(*) FROM mvp_scenario_flags")) == 0
+
+
+def test_scenario_worker_rejects_unmet_attack_condition_before_rng_or_writes(
+    database: Engine,
+) -> None:
+    def stored_state(connection: Connection) -> dict[str, object]:
+        return {
+            "characters": list(
+                connection.execute(
+                    text(
+                        "SELECT entity_id,current_hp,max_hp,defense,attack_bonus "
+                        "FROM mvp_characters ORDER BY entity_id"
+                    )
+                )
+            ),
+            "inventory": list(
+                connection.execute(
+                    text(
+                        "SELECT owner_id,item_id,quantity,equipped "
+                        "FROM mvp_inventory ORDER BY owner_id,item_id"
+                    )
+                )
+            ),
+            "run": connection.execute(
+                text("SELECT status,ending_ref FROM mvp_scenario_runs")
+            ).one(),
+            "scenes": list(
+                connection.execute(
+                    text("SELECT sequence,status FROM scenes ORDER BY sequence")
+                )
+            ),
+            "flags": list(
+                connection.execute(
+                    text("SELECT flag_ref FROM mvp_scenario_flags ORDER BY flag_ref")
+                ).scalars()
+            ),
+        }
+
+    with database.begin() as connection:
+        _seed_scenario_worker_state(connection, active_sequence=3)
+        before = stored_state(connection)
+    random = _SequenceRandom([10, 2])
+
+    turn_id, _llm_input, ruleset = _run_scenario_worker(
+        database,
+        player_text="ゴブリンを攻撃する",
+        decision={
+            "kind": "action_plan",
+            "actions": [
+                {"kind": "attack", "target_ref": "goblin", "weapon_ref": None}
+            ],
+        },
+        random_source=random,
+        scenario_progressor=_conditioned_scenario_progressor(
+            "defeat_guard", required_flags=("clue_found",)
+        ),
+    )
+
+    assert random.calls == 0
+    assert ruleset.mock_calls == []
+    with database.connect() as connection:
+        assert connection.scalar(text("SELECT count(*) FROM actions")) == 0
+        assert connection.execute(
+            text("SELECT type,action_id,state_version FROM events")
+        ).all() == [("GMNarrationGenerated", None, 0)]
+        assert connection.scalar(
+            text("SELECT state_version FROM campaigns WHERE id=:campaign"),
+            {"campaign": CAMPAIGN_A},
+        ) == 0
+        assert connection.execute(
+            text(
+                "SELECT resolution_status,committed_state_version,narration_status "
+                "FROM turns WHERE id=:turn"
+            ),
+            {"turn": turn_id},
+        ).one() == ("not_applied", None, "completed")
+        assert stored_state(connection) == before
 
 
 def test_scenario_worker_preflights_narrative_escalation_before_route_write(

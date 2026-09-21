@@ -7,6 +7,7 @@ import pytest
 
 from ai_rpg.application.ports import ScenarioRunSnapshot, ScenarioSceneSnapshot
 from ai_rpg.application.scenarios import (
+    ScenarioActionUnavailableError,
     ScenarioProgressor,
     ScenarioPublicContext,
     ScenarioStateError,
@@ -15,6 +16,8 @@ from ai_rpg.scenarios import (
     BUILTIN_SCENARIOS,
     AttackScenarioAction,
     DirectScenarioAction,
+    ScenarioCatalog,
+    ScenarioDefinition,
     SkillScenarioAction,
 )
 
@@ -25,6 +28,20 @@ SANCTUM_ID = UUID(int=4)
 SCENE_IDS = (ENTRANCE_ID, HALL_ID, SANCTUM_ID)
 
 progressor = ScenarioProgressor(BUILTIN_SCENARIOS)
+
+
+def progressor_with_conditions(
+    conditions: dict[str, tuple[tuple[str, ...], tuple[str, ...]]],
+) -> ScenarioProgressor:
+    payload = BUILTIN_SCENARIOS.get("ruined_chapel", 1).model_dump(mode="json")
+    for scene in payload["scenes"]:
+        for action in scene["actions"]:
+            if action["action_ref"] in conditions:
+                required, disabled = conditions[action["action_ref"]]
+                action["required_flags"] = list(required)
+                action["disabled_flags"] = list(disabled)
+    definition = ScenarioDefinition.model_validate(payload)
+    return ScenarioProgressor(ScenarioCatalog((definition,)))
 
 
 def scenario_snapshot(
@@ -135,33 +152,57 @@ def test_search_success_adds_clue_and_advances() -> None:
     assert progress.ending_ref is None
 
 
-def test_alerted_persuasion_success_is_costly_success() -> None:
-    snapshot = sanctum_snapshot(flags={"alerted"})
-
-    progress = progressor.progress_for(
-        snapshot,
-        binding=skill_binding(snapshot, "persuasion"),
-        outcome="success",
-        target_hp_after=None,
+@pytest.mark.parametrize(
+    ("action_kind", "action_ref", "flags", "outcome", "expected_ending"),
+    [
+        ("skill", "persuasion", (), "success", "recovered"),
+        ("skill", "persuasion", ("alerted",), "success", "costly_success"),
+        ("skill", "persuasion", (), "failure", "costly_success"),
+        ("skill", "persuasion", ("alerted",), "failure", "costly_success"),
+        ("skill", "stealth", (), "success", "recovered"),
+        ("skill", "stealth", ("alerted",), "success", "costly_success"),
+        ("skill", "stealth", (), "failure", "costly_success"),
+        ("skill", "stealth", ("alerted",), "failure", "costly_success"),
+        ("attack", "goblin", (), "success", "recovered"),
+        ("attack", "goblin", ("alerted",), "success", "costly_success"),
+    ],
+    ids=[
+        "persuasion-success-unalerted",
+        "persuasion-success-alerted",
+        "persuasion-failure-unalerted",
+        "persuasion-failure-alerted",
+        "stealth-success-unalerted",
+        "stealth-success-alerted",
+        "stealth-failure-unalerted",
+        "stealth-failure-alerted",
+        "combat-complete-unalerted",
+        "combat-complete-alerted",
+    ],
+)
+def test_sanctum_progression_matrix(
+    action_kind: str,
+    action_ref: str,
+    flags: tuple[str, ...],
+    outcome: str,
+    expected_ending: str,
+) -> None:
+    snapshot = sanctum_snapshot(flags=set(flags))
+    binding = (
+        skill_binding(snapshot, action_ref)
+        if action_kind == "skill"
+        else attack_binding(snapshot, action_ref)
     )
 
-    assert progress is not None
-    assert progress.ending_ref == "costly_success"
-
-
-def test_stealth_failure_is_costly_success() -> None:
-    snapshot = sanctum_snapshot()
-
     progress = progressor.progress_for(
         snapshot,
-        binding=skill_binding(snapshot, "stealth"),
-        outcome="failure",
-        target_hp_after=None,
+        binding=binding,
+        outcome=outcome,
+        target_hp_after=0 if action_kind == "attack" else None,
     )
 
     assert progress is not None
     assert progress.to_scene_id is None
-    assert progress.ending_ref == "costly_success"
+    assert progress.ending_ref == expected_ending
 
 
 def test_attack_does_not_progress_while_target_has_hp() -> None:
@@ -175,22 +216,6 @@ def test_attack_does_not_progress_while_target_has_hp() -> None:
     )
 
     assert progress is None
-
-
-def test_attack_progresses_when_target_reaches_zero_hp() -> None:
-    snapshot = sanctum_snapshot()
-
-    progress = progressor.progress_for(
-        snapshot,
-        binding=attack_binding(snapshot, "goblin"),
-        outcome="success",
-        target_hp_after=0,
-    )
-
-    assert progress is not None
-    assert progress.from_scene_id == SANCTUM_ID
-    assert progress.to_scene_id is None
-    assert progress.ending_ref == "recovered"
 
 
 def test_retreat_uses_registered_ending() -> None:
@@ -214,6 +239,66 @@ def test_binding_rejects_unregistered_or_other_scene_actions() -> None:
     assert progressor.bind_scenario_action(snapshot, "not_registered") is None
     assert progressor.bind_skill_check(snapshot, "perception") is None
     assert progressor.bind_attack(snapshot, "goblin") is None
+
+
+@pytest.mark.parametrize(
+    ("action_kind", "action_ref", "expected_type"),
+    [
+        ("direct", "retreat", DirectScenarioAction),
+        ("skill", "persuasion", SkillScenarioAction),
+        ("attack", "goblin", AttackScenarioAction),
+    ],
+)
+def test_binding_enforces_required_and_disabled_flags(
+    action_kind: str,
+    action_ref: str,
+    expected_type: type[object],
+) -> None:
+    conditional = progressor_with_conditions(
+        {
+            {
+                "direct": "retreat",
+                "skill": "negotiate_guard",
+                "attack": "defeat_guard",
+            }[action_kind]: (("clue_found",), ("alerted",))
+        }
+    )
+
+    def bind(snapshot: ScenarioRunSnapshot) -> object | None:
+        if action_kind == "direct":
+            return conditional.bind_scenario_action(snapshot, action_ref)
+        if action_kind == "skill":
+            return conditional.bind_skill_check(snapshot, action_ref)
+        return conditional.bind_attack(snapshot, action_ref)
+
+    with pytest.raises(ScenarioActionUnavailableError):
+        bind(sanctum_snapshot())
+    assert isinstance(bind(sanctum_snapshot(flags={"clue_found"})), expected_type)
+    with pytest.raises(ScenarioActionUnavailableError):
+        bind(sanctum_snapshot(flags={"clue_found", "alerted"}))
+
+
+def test_public_context_filters_unavailable_actions_without_exposing_conditions() -> None:
+    conditional = progressor_with_conditions(
+        {
+            "negotiate_guard": (("clue_found",), ("alerted",)),
+            "sneak_to_relic": ((), ("clue_found",)),
+            "defeat_guard": (("clue_found",), ("alerted",)),
+            "retreat": (("alerted",), ()),
+        }
+    )
+
+    context = conditional.public_context_for(
+        sanctum_snapshot(flags={"clue_found"})
+    )
+
+    assert context.available_actions == (
+        ("negotiate_guard", "守衛と交渉する"),
+        ("defeat_guard", "守衛を倒す"),
+    )
+    assert "required_flags" not in repr(context)
+    assert "disabled_flags" not in repr(context)
+    assert "clue_found" not in repr(context)
 
 
 def test_progress_rejects_structurally_equal_non_identical_binding() -> None:

@@ -59,11 +59,25 @@ def valid_payload() -> dict[str, Any]:
                             "ending_ref": "retreated",
                             "add_flags": [],
                         },
-                    }
+                    },
+                    {
+                        "action_ref": "fight",
+                        "label": "Fight",
+                        "kind": "attack",
+                        "target_ref": "guard",
+                        "defeated": {
+                            "next_scene_ref": None,
+                            "ending_ref": "complete",
+                            "add_flags": [],
+                        },
+                    },
                 ],
             },
         ],
-        "flags": [{"flag_ref": "found", "public_fact": "Found a clue."}],
+        "flags": [
+            {"flag_ref": "found", "public_fact": "Found a clue."},
+            {"flag_ref": "blocked", "public_fact": "The route is blocked."},
+        ],
         "endings": [
             {"ending_ref": "complete", "title": "Complete", "summary": "Done."},
             {"ending_ref": "retreated", "title": "Retreated", "summary": "Left."},
@@ -146,6 +160,61 @@ def test_scenario_definition_accepts_conditional_ending_override() -> None:
     override = scenario.scenes[1].actions[0].success.overrides[0]
     assert override.requires_flags == ("found",)
     assert override.ending_ref == "retreated"
+
+
+@pytest.mark.parametrize(
+    ("scene_index", "action_index"),
+    [(0, 0), (1, 0), (1, 1)],
+    ids=["direct", "skill", "attack"],
+)
+def test_scenario_action_conditions_are_typed_tuples(
+    scene_index: int, action_index: int
+) -> None:
+    payload = valid_payload()
+    action = payload["scenes"][scene_index]["actions"][action_index]
+    action["required_flags"] = ["found"]
+    action["disabled_flags"] = ["blocked"]
+
+    scenario = ScenarioDefinition.model_validate(payload)
+
+    parsed = scenario.scenes[scene_index].actions[action_index]
+    assert parsed.required_flags == ("found",)
+    assert parsed.disabled_flags == ("blocked",)
+
+
+def test_scenario_action_conditions_default_to_empty_tuples() -> None:
+    scenario = ScenarioDefinition.model_validate(valid_payload())
+
+    for scene in scenario.scenes:
+        for action in scene.actions:
+            assert action.required_flags == ()
+            assert action.disabled_flags == ()
+
+
+@pytest.mark.parametrize(
+    ("scene_index", "action_index"),
+    [(0, 0), (1, 0), (1, 1)],
+    ids=["direct", "skill", "attack"],
+)
+@pytest.mark.parametrize(
+    "change",
+    ["unknown-required", "unknown-disabled", "overlap"],
+)
+def test_scenario_definition_rejects_invalid_action_conditions(
+    scene_index: int, action_index: int, change: str
+) -> None:
+    payload = valid_payload()
+    action = payload["scenes"][scene_index]["actions"][action_index]
+    if change == "unknown-required":
+        action["required_flags"] = ["missing"]
+    elif change == "unknown-disabled":
+        action["disabled_flags"] = ["missing"]
+    else:
+        action["required_flags"] = ["found"]
+        action["disabled_flags"] = ["found"]
+
+    with pytest.raises(ValidationError):
+        ScenarioDefinition.model_validate(payload)
 
 
 def test_builtin_scenario_nested_collections_are_immutable_tuples() -> None:
