@@ -36,9 +36,10 @@
       background-size: auto, 42px 42px, 42px 42px, auto;
     }
 
-    button, input, textarea { font: inherit; }
+    button, input, textarea, select { font: inherit; }
     button { cursor: pointer; }
-    button:disabled { cursor: wait; opacity: .55; }
+    button:disabled { cursor: not-allowed; opacity: .55; }
+    [hidden] { display: none !important; }
     :focus-visible { outline: 3px solid var(--focus); outline-offset: 3px; }
 
     .topbar {
@@ -80,6 +81,7 @@
     }
 
     .panel {
+      min-width: 0;
       border: 1px solid var(--line);
       border-radius: var(--radius);
       background: linear-gradient(160deg, rgba(17, 34, 56, .97), rgba(10, 24, 40, .97));
@@ -92,7 +94,7 @@
     .hint { color: var(--muted); font-size: .88rem; line-height: 1.65; }
     .field { margin-top: 20px; }
     label { display: block; margin-bottom: 8px; font-weight: 700; font-size: .9rem; }
-    input, textarea {
+    input, textarea, select {
       width: 100%;
       color: var(--text);
       border: 1px solid #46617e;
@@ -100,9 +102,9 @@
       background: rgba(5, 15, 27, .7);
       transition: border-color .15s, box-shadow .15s;
     }
-    input { padding: 11px 12px; }
+    input, select { padding: 11px 12px; min-width: 0; }
     textarea { min-height: 92px; padding: 13px 14px; resize: vertical; line-height: 1.55; }
-    input:focus, textarea:focus { border-color: var(--cyan); box-shadow: 0 0 0 3px rgba(114, 213, 208, .12); }
+    input:focus, textarea:focus, select:focus { border-color: var(--cyan); box-shadow: 0 0 0 3px rgba(114, 213, 208, .12); }
     .field small { display: block; margin-top: 7px; color: var(--muted); line-height: 1.45; }
 
     .story {
@@ -139,7 +141,7 @@
     .message.player .speaker { color: #b7cbff; border-color: #496aa8; }
     .message.gm .speaker { color: var(--cyan); border-color: #39736f; }
     .message.system .speaker { color: var(--amber); border-color: #775d36; }
-    .message-body { min-width: 0; line-height: 1.75; }
+    .message-body { min-width: 0; line-height: 1.75; white-space: pre-wrap; }
     .message.gm .message-body { font-family: Georgia, "Yu Mincho", serif; font-size: 1.02rem; }
     .result-box, .notice {
       padding: 14px 16px; border: 1px solid var(--line); border-radius: 10px;
@@ -157,6 +159,18 @@
       padding: 8px 11px; color: var(--cyan); border: 1px solid #39736f;
       border-radius: 8px; background: rgba(23, 63, 73, .42);
     }
+    .setup .send { width: 100%; margin-top: 20px; }
+    .saved-adventures { margin-top: 28px; }
+    .adventure-list, .public-list { padding-left: 20px; line-height: 1.65; }
+    .adventure-list { list-style: none; padding-left: 0; }
+    .adventure-list li { margin-top: 10px; }
+    .adventure-list button { width: 100%; text-align: left; }
+    .choice, .message-body, .public-state { overflow-wrap: anywhere; }
+    .public-state h3 { margin: 22px 0 8px; font-size: .95rem; }
+    .public-state p { line-height: 1.65; white-space: pre-wrap; }
+    .public-state .choices { flex-direction: column; align-items: stretch; }
+    .turn-details { border-top: 1px solid var(--line); margin-top: 24px; padding-top: 18px; }
+    .turn-details summary { cursor: pointer; color: var(--muted); }
 
     .composer { padding: 17px 20px 20px; border-top: 1px solid var(--line); background: rgba(7, 18, 31, .72); }
     .composer-row { display: grid; grid-template-columns: 1fr auto; gap: 12px; align-items: end; }
@@ -181,13 +195,14 @@
 
     @media (max-width: 980px) {
       .shell { grid-template-columns: 1fr; }
-      .setup, .turn-panel { display: grid; grid-template-columns: repeat(2, 1fr); gap: 0 18px; }
-      .setup h2, .setup > p, .turn-panel h2, .turn-panel > p, .status-list, .recovery { grid-column: 1 / -1; }
+      .setup { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 0 18px; }
+      .setup h2, .setup > p, .setup > .recovery { grid-column: 1 / -1; }
       .story { min-height: 680px; grid-row: 2; }
       .turn-panel { grid-row: 3; }
     }
     @media (max-width: 620px) {
       .topbar { align-items: flex-start; }
+      .topbar { flex-wrap: wrap; gap: 14px; }
       .brand { display: block; }
       .brand span { display: block; margin-top: 7px; }
       .shell { padding: 10px; }
@@ -215,41 +230,73 @@
 
   <main class="shell">
     <aside class="panel setup" aria-labelledby="setup-heading">
-      <h2 id="setup-heading">ゲーム設定</h2>
-      <p class="hint">Campaignと操作するActorを指定します。開発時はREADMEの固定IDを利用できます。</p>
-      <div class="field">
-        <label for="campaign-id">Campaign ID</label>
-        <input id="campaign-id" name="campaign-id" type="text" autocomplete="off" required placeholder="xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx">
-      </div>
-      <div class="field">
-        <label for="actor-id">Actor ID</label>
-        <input id="actor-id" name="actor-id" type="text" autocomplete="off" required placeholder="xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx">
-      </div>
+      <h2 id="setup-heading">冒険を始める</h2>
+      <p class="hint">舞台と冒険者を選び、新しい物語へ。</p>
+      <input id="campaign-id" type="hidden">
+      <input id="actor-id" type="hidden">
+      <form id="start-form">
+        <div class="field">
+          <label for="scenario-select">シナリオ</label>
+          <select id="scenario-select" required disabled aria-describedby="scenario-description"></select>
+          <small id="scenario-description"></small>
+        </div>
+        <div class="field">
+          <label for="preset-select">冒険者のタイプ</label>
+          <select id="preset-select" required disabled aria-describedby="preset-description"></select>
+          <small id="preset-description"></small>
+        </div>
+        <div class="field">
+          <label for="player-name">冒険者の名前</label>
+          <input id="player-name" type="text" required maxlength="40" autocomplete="off" placeholder="1〜40文字">
+        </div>
+        <button id="start-adventure" class="send" type="submit" disabled>冒険を始める</button>
+        <p id="start-status" class="hint" role="status"></p>
+        <button id="retry-start" class="choice" type="button" hidden>同じ開始を再試行</button>
+      </form>
+      <section class="saved-adventures" aria-labelledby="saved-heading">
+        <h3 id="saved-heading">保存済みの冒険</h3>
+        <button id="refresh-adventures" class="choice" type="button">一覧を更新</button>
+        <p id="adventures-status" class="hint" role="status">読込み中…</p>
+        <ul id="adventure-list" class="adventure-list"></ul>
+      </section>
     </aside>
 
     <section class="panel story" aria-labelledby="story-heading">
       <div class="story-head">
         <h1 id="story-heading">物語</h1>
         <p>確定した判定と描写が、ここに時系列で残ります。</p>
+        <button id="load-history" class="choice" type="button" hidden>以前の履歴を読む</button>
       </div>
       <ol id="timeline" class="timeline" aria-label="物語の履歴">
         <li id="empty-state" class="empty">
-          <p><strong>最初の行動を選んでください。</strong><br>周囲を調べる、話す、進むなど自由に入力できます。</p>
+          <p><strong>冒険を始めるか、保存済みの冒険を選んでください。</strong></p>
         </li>
       </ol>
       <form id="composer" class="composer">
         <label for="action-text">行動を入力</label>
         <div class="composer-row">
-          <textarea id="action-text" name="action-text" maxlength="8000" required placeholder="例: 周囲を注意深く観察する"></textarea>
-          <button id="send-action" class="send" type="submit">送信</button>
+          <textarea id="action-text" name="action-text" maxlength="8000" required disabled placeholder="例: 周囲を注意深く観察する"></textarea>
+          <button id="send-action" class="send" type="submit" disabled>送信</button>
         </div>
         <p class="shortcut">Ctrl + Enterでも送信できます</p>
       </form>
     </section>
 
     <aside class="panel turn-panel" aria-labelledby="turn-heading">
-      <h2 id="turn-heading">Turn status</h2>
-      <p class="hint">現在のTurnの処理状況</p>
+      <h2 id="turn-heading">冒険の状態</h2>
+      <div class="public-state">
+        <h3>冒険者</h3><p id="player-value">—</p>
+        <h3>HP</h3><p id="hp-value">—</p>
+        <h3>持ち物</h3><ul id="inventory-list" class="public-list"></ul>
+        <h3>現在地</h3><p id="scene-title">—</p><p id="scene-description" class="hint"></p>
+        <h3>目的</h3><p id="objective-value">—</p>
+        <h3>発見</h3><ul id="facts-list" class="public-list"></ul>
+        <h3>行動候補</h3><div id="available-actions" class="choices"></div>
+        <section id="ending" class="recovery" hidden aria-labelledby="ending-title">
+          <h3 id="ending-title"></h3><p id="ending-summary"></p>
+        </section>
+      </div>
+      <details class="turn-details"><summary>Turn の処理状況</summary>
       <ul class="status-list">
         <li><span>Route</span><strong id="route-value">—</strong></li>
         <li><span>Resolution</span><strong id="resolution-value" class="phase">待機中</strong></li>
@@ -258,6 +305,7 @@
         <li><span>Turn ID</span><strong id="turn-value">—</strong></li>
       </ul>
       <div id="recovery" class="recovery" hidden></div>
+      </details>
     </aside>
   </main>
 
@@ -268,7 +316,12 @@
     const ui = Object.fromEntries([
       "campaign-id", "actor-id", "action-text", "send-action", "composer", "timeline",
       "empty-state", "connection", "connection-label", "route-value", "resolution-value",
-      "narration-value", "version-value", "turn-value", "recovery", "live-status"
+      "narration-value", "version-value", "turn-value", "recovery", "live-status",
+      "start-form", "scenario-select", "preset-select", "player-name", "start-adventure",
+      "scenario-description", "preset-description", "start-status", "retry-start",
+      "refresh-adventures", "adventure-list", "adventures-status", "load-history", "story-heading",
+      "player-value", "hp-value", "inventory-list", "scene-title", "scene-description",
+      "objective-value", "facts-list", "available-actions", "ending", "ending-title", "ending-summary"
     ].map(id => [id, document.getElementById(id)]));
 
     const labels = {
@@ -277,8 +330,8 @@
       completed: "完了", fallback: "復旧済み", narrative: "Narrative", mechanical: "Mechanical"
     };
     const errors = {
-      UNAUTHENTICATED: "認証が設定されていません。開発時はAPIを --dev-principal 付きで起動してください。",
-      FORBIDDEN: "このCampaignまたはActorを操作する権限がありません。",
+      UNAUTHENTICATED: "認証が必要です。ログイン状態を確認してから再度お試しください。",
+      FORBIDDEN: "この冒険を操作する権限がありません。",
       TURN_IN_PROGRESS: "前のTurnを処理中です。完了後にもう一度送信してください。",
       STATE_VERSION_CONFLICT: "世界の状態が更新されたため行動は送信していません。内容を確認してから再送してください。",
       CHOICE_NOT_AVAILABLE: "その選択肢は現在利用できません。",
@@ -291,10 +344,25 @@
     let trackingGeneration = 0;
     let cancelTracking = null;
     let workflowGeneration = 0;
+    let selectionGeneration = 0;
+    let latestTurnId = null;
+    let adventureCompleted = false;
+    let authRequired = false;
+    let catalog = { scenarios: [], presets: [] };
+    let startBusy = false;
+    let pendingStart = null;
+    let historyCursor = null;
+    let historyBusy = false;
+    let listGeneration = 0;
     const renderedTurns = new Set();
-    localStorage.removeItem("ai-rpg-state-version");
-    ui["campaign-id"].value = localStorage.getItem("ai-rpg-campaign") || "";
-    ui["actor-id"].value = localStorage.getItem("ai-rpg-actor") || "";
+    const historyTurns = new Set();
+    const storageError = "送信内容をブラウザーに保存できません。再送時の重複を防ぐため、保存を許可してから送信してください。";
+    try {
+      localStorage.removeItem("ai-rpg-state-version");
+      ui["campaign-id"].value = localStorage.getItem("ai-rpg-campaign") || "";
+      ui["actor-id"].value = localStorage.getItem("ai-rpg-actor") || "";
+      pendingStart = AiRpgPending.loadStart(localStorage);
+    } catch (_) { showError(storageError); }
     ui["version-value"].textContent = "—";
 
     function announce(message) {
@@ -303,16 +371,250 @@
 
     function setBusy(value) {
       busy = value;
-      ui["send-action"].disabled = value;
-      ui["action-text"].disabled = value;
-      ui["campaign-id"].disabled = value;
-      ui["actor-id"].disabled = value;
-      document.querySelectorAll(".choice").forEach(button => { button.disabled = value; });
+      const blocked = value || adventureCompleted || authRequired || stateVersion === null;
+      ui["send-action"].disabled = blocked;
+      ui["action-text"].disabled = blocked;
+      document.querySelectorAll(".choice").forEach(button => {
+        if (button.dataset.turnId) button.disabled = blocked || button.dataset.turnId !== latestTurnId;
+        if (button.dataset.action) button.disabled = blocked;
+      });
       ui["send-action"].textContent = value ? "処理中…" : "送信";
     }
 
-    function addMessage(speaker, kind, content, className = "") {
-      ui["empty-state"]?.remove();
+    function updateStartControls() {
+      const blocked = startBusy || !!pendingStart || authRequired;
+      ui["start-adventure"].disabled = blocked || !catalog.scenarios.length || !catalog.presets.length;
+      ui["scenario-select"].disabled = blocked || !catalog.scenarios.length;
+      ui["preset-select"].disabled = blocked || !catalog.presets.length;
+      ui["player-name"].disabled = blocked;
+      ui["retry-start"].hidden = !pendingStart;
+      ui["retry-start"].disabled = startBusy || authRequired;
+      ui["retry-start"].textContent = pendingStart?.adventure ? "作成済みの冒険を開く" : "同じ開始を再試行";
+    }
+
+    function catalogDescription() {
+      const scenario = catalog.scenarios.find(item => item.scenario_ref === ui["scenario-select"].value);
+      const preset = catalog.presets.find(item => item.preset_ref === ui["preset-select"].value);
+      ui["scenario-description"].textContent = scenario?.objective || "";
+      ui["preset-description"].textContent = preset ? `${preset.description}（HP ${preset.max_hp}）` : "";
+    }
+
+    async function loadCatalog() {
+      try {
+        catalog = await api("/adventures/catalog");
+        for (const [id, items, valueKey, labelKey] of [
+          ["scenario-select", catalog.scenarios, "scenario_ref", "title"],
+          ["preset-select", catalog.presets, "preset_ref", "name"]
+        ]) {
+          ui[id].replaceChildren();
+          for (const item of items) {
+            const option = document.createElement("option");
+            option.value = item[valueKey];
+            option.textContent = item[labelKey];
+            ui[id].append(option);
+          }
+          ui[id].value = items[0]?.[valueKey] || "";
+        }
+        catalogDescription();
+      } catch (error) {
+        ui["start-status"].textContent = error.message;
+      } finally { updateStartControls(); }
+    }
+
+    async function loadAdventures() {
+      const generation = ++listGeneration;
+      ui["adventures-status"].textContent = "読込み中…";
+      try {
+        const result = await api("/adventures");
+        if (generation !== listGeneration) return;
+        ui["adventure-list"].replaceChildren();
+        for (const adventure of result.adventures) {
+          const item = document.createElement("li");
+          const button = document.createElement("button");
+          button.type = "button";
+          button.className = "choice";
+          button.textContent = `${adventure.player_name} — ${adventure.title}（${adventure.status === "completed" ? "完了" : "冒険中"}）`;
+          button.addEventListener("click", () => selectAdventure(adventure.campaign_id, adventure.actor_id));
+          item.append(button);
+          ui["adventure-list"].append(item);
+        }
+        ui["adventures-status"].textContent = result.adventures.length ? "冒険を選んで再開できます。" : "保存済みの冒険はありません。";
+      } catch (error) {
+        if (generation === listGeneration) ui["adventures-status"].textContent = error.message;
+      }
+    }
+
+    async function startAdventure() {
+      if (startBusy || authRequired) return;
+      const selection = selectionGeneration;
+      startBusy = true;
+      updateStartControls();
+      try {
+        if (!pendingStart) {
+          const scenario = catalog.scenarios.find(item => item.scenario_ref === ui["scenario-select"].value);
+          const preset = catalog.presets.find(item => item.preset_ref === ui["preset-select"].value);
+          const name = ui["player-name"].value;
+          if (!scenario || !preset || !name.trim() || [...name].length > 40 || /[\p{C}\p{Zl}\p{Zp}]/u.test(name)) {
+            throw new Error("シナリオ、冒険者のタイプと1〜40文字の名前を確認してください。");
+          }
+          const draft = { body: { request_id: crypto.randomUUID(), scenario_ref: scenario.scenario_ref,
+            scenario_version: scenario.scenario_version, preset_ref: preset.preset_ref, player_name: name }, adventure: null };
+          try { AiRpgPending.saveStart(localStorage, draft); } catch (_) { throw new Error(storageError); }
+          pendingStart = draft;
+        }
+        ui["start-status"].textContent = pendingStart.adventure ? "作成済みの冒険を読み込んでいます…" : "冒険を作成しています…";
+        if (!pendingStart.adventure) {
+          pendingStart.adventure = await api("/adventures", {
+            method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(pendingStart.body)
+          });
+          try { AiRpgPending.saveStart(localStorage, pendingStart); } catch (_) { throw new Error(storageError); }
+        }
+        // Acceptance is durable before selection: a failing GET must never create a new adventure.
+        const { campaign_id, actor_id } = pendingStart.adventure;
+        loadAdventures();
+        if (selection !== selectionGeneration) {
+          ui["start-status"].textContent = "冒険を作成しました。作成済みの冒険を開いて再開できます。";
+          return;
+        }
+        const selected = await selectAdventure(campaign_id, actor_id);
+        if (!selected) {
+          ui["start-status"].textContent = "冒険は作成済みです。保存済みの冒険から再開するか、もう一度開いてください。";
+          return;
+        }
+        ui["start-status"].textContent = "冒険を始めました。";
+        announce("冒険を始めました。行動を入力できます。");
+      } catch (error) {
+        if (!pendingStart?.adventure && error.status >= 400 && error.status < 500) {
+          try { AiRpgPending.clearStart(localStorage); pendingStart = null; } catch (_) { /* preserve recovery if storage fails */ }
+        }
+        ui["start-status"].textContent = error.message;
+        showError(error.message);
+      } finally {
+        startBusy = false;
+        updateStartControls();
+      }
+    }
+
+    function renderState(state) {
+      const player = state.player;
+      const adventure = state.adventure;
+      adventureCompleted = adventure?.status === "completed";
+      latestTurnId = state.latest_turn?.turn_id || null;
+      ui["story-heading"].textContent = adventure?.title || "物語";
+      ui["player-value"].textContent = player?.name || "—";
+      ui["hp-value"].textContent = player ? `${player.current_hp} / ${player.max_hp}` : "—";
+      ui["scene-title"].textContent = adventure?.current_scene?.title || "—";
+      ui["scene-description"].textContent = adventure?.current_scene?.description || "";
+      ui["objective-value"].textContent = adventure?.objective || "—";
+      for (const [id, texts] of [
+        ["inventory-list", player?.inventory?.map(item => `${item.name} ×${item.quantity}${item.equipped ? "（装備中）" : ""}`) || []],
+        ["facts-list", adventure?.discovered_facts || []]
+      ]) {
+        ui[id].replaceChildren();
+        for (const text of texts.length ? texts : ["まだありません"]) {
+          const item = document.createElement("li");
+          item.textContent = text;
+          ui[id].append(item);
+        }
+      }
+      ui["available-actions"].replaceChildren();
+      const selection = selectionGeneration;
+      const version = stateVersion;
+      for (const action of adventure?.available_actions || []) {
+        const button = document.createElement("button");
+        button.type = "button";
+        button.className = "choice";
+        button.dataset.action = "true";
+        button.textContent = action.label;
+        button.addEventListener("click", () => {
+          if (button.disabled || selection !== selectionGeneration || version !== stateVersion) return;
+          ui["action-text"].value = action.label;
+          ui["action-text"].focus();
+        });
+        ui["available-actions"].append(button);
+      }
+      ui.ending.hidden = !adventureCompleted;
+      ui["ending-title"].textContent = adventure?.ending?.title || "冒険は完了しました";
+      ui["ending-summary"].textContent = adventure?.ending?.summary || "保存済みの冒険から振り返ることができます。";
+      setBusy(busy);
+    }
+
+    async function loadHistory() {
+      if (historyBusy) return;
+      const campaignId = ui["campaign-id"].value;
+      const selection = selectionGeneration;
+      const ownsHistory = () => selection === selectionGeneration && campaignId === ui["campaign-id"].value;
+      historyBusy = true;
+      ui["load-history"].disabled = true;
+      try {
+        const suffix = historyCursor ? `&before_turn_id=${encodeURIComponent(historyCursor)}` : "";
+        const page = await api(`/campaigns/${encodeURIComponent(campaignId)}/history?limit=50${suffix}`);
+        if (!ownsHistory()) return;
+        const fragment = document.createElement("ol");
+        for (const item of page.items) {
+          if (historyTurns.has(item.turn.turn_id)) continue;
+          historyTurns.add(item.turn.turn_id);
+          addMessage("YOU", "player", item.player_input, "", fragment);
+          if (terminal(item.turn)) renderCompleted(item.turn, fragment);
+        }
+        ui.timeline.prepend(...fragment.children);
+        const empty = document.getElementById("empty-state");
+        if (empty) empty.textContent = "まだ行動の記録はありません。行動を入力して物語を進めましょう。";
+        historyCursor = page.next_before_turn_id;
+        ui["load-history"].hidden = !historyCursor;
+        setBusy(busy);
+      } catch (error) {
+        if (ownsHistory()) {
+          showError(error.message);
+          ui["load-history"].hidden = false;
+        }
+      } finally {
+        if (ownsHistory()) { historyBusy = false; ui["load-history"].disabled = false; }
+      }
+    }
+
+    async function selectAdventure(campaignId, actorId) {
+      const selection = ++selectionGeneration;
+      ++workflowGeneration;
+      cancelTracking?.();
+      ui["campaign-id"].value = campaignId;
+      ui["actor-id"].value = actorId;
+      resetView();
+      setBusy(true);
+      const ownsSelection = () => selection === selectionGeneration;
+      try {
+        try {
+          localStorage.setItem("ai-rpg-campaign", campaignId);
+          localStorage.setItem("ai-rpg-actor", actorId);
+        } catch (_) { showError(storageError); }
+        const refreshed = await refreshCampaignState(campaignId);
+        if (!ownsSelection() || !refreshed.applied) return false;
+        await loadHistory();
+        if (!ownsSelection()) return false;
+        const pending = AiRpgPending.load(localStorage);
+        if (pending?.campaignId === campaignId) {
+          if (pending.turnId) await continuePending(pending, false);
+          else showRetry("前の送信結果が未確認です。同じ送信を再試行してください。", () => continuePending(pending, false));
+        } else if (refreshed.state.latest_turn) {
+          await resumeTurn(campaignId, refreshed.state.latest_turn);
+        }
+        if (ownsSelection() && pendingStart?.adventure?.campaign_id === campaignId) {
+          try { AiRpgPending.clearStart(localStorage); } catch (_) { throw new Error(storageError); }
+          pendingStart = null;
+          ui["start-status"].textContent = "作成済みの冒険を開きました。";
+          updateStartControls();
+        }
+        return ownsSelection();
+      } catch (error) {
+        if (ownsSelection()) showError(error.message);
+        return false;
+      } finally {
+        if (ownsSelection()) setBusy(false);
+      }
+    }
+
+    function addMessage(speaker, kind, content, className = "", target = ui.timeline) {
+      document.getElementById("empty-state")?.remove();
       const item = document.createElement("li");
       item.className = `message ${kind}`;
       if (className) item.dataset.role = className;
@@ -323,8 +625,8 @@
       body.className = "message-body";
       if (content instanceof Node) body.append(content); else body.textContent = content;
       item.append(badge, body);
-      ui.timeline.append(item);
-      item.scrollIntoView({ block: "nearest" });
+      target.append(item);
+      if (target === ui.timeline) item.scrollIntoView({ block: "nearest" });
       return body;
     }
 
@@ -349,7 +651,7 @@
       announce(message);
     }
 
-    function showRetry(message, retry) {
+    function showRetry(message, retry, label = "同じ送信を再試行") {
       const box = document.createElement("div");
       box.className = "notice error";
       const text = document.createElement("span");
@@ -357,8 +659,13 @@
       const button = document.createElement("button");
       button.type = "button";
       button.className = "choice";
-      button.textContent = "同じ送信を再試行";
-      button.addEventListener("click", retry);
+      button.textContent = label;
+      const selection = selectionGeneration;
+      button.addEventListener("click", () => {
+        if (button.disabled || busy || selection !== selectionGeneration) return;
+        button.disabled = true;
+        return retry();
+      });
       box.append(text, document.createElement("br"), button);
       addMessage("SYSTEM", "system", box);
       announce(message);
@@ -374,11 +681,18 @@
 
     function resetView() {
       renderedTurns.clear();
+      historyTurns.clear();
+      historyCursor = null;
+      historyBusy = false;
+      latestTurnId = null;
+      ui["load-history"].hidden = true;
+      ui["load-history"].disabled = false;
+      ui["action-text"].value = "";
       ui.timeline.replaceChildren();
       const empty = document.createElement("li");
       empty.id = "empty-state";
       empty.className = "empty";
-      empty.textContent = "Campaignの状態を読み込んでいます。";
+      empty.textContent = "冒険の状態を読み込んでいます。";
       ui.timeline.append(empty);
       ui["route-value"].textContent = "—";
       ui["resolution-value"].textContent = "待機中";
@@ -387,6 +701,7 @@
       ui["version-value"].textContent = "—";
       stateCampaignId = null;
       stateVersion = null;
+      renderState({});
     }
 
     function updateStatus(campaignId, turn) {
@@ -404,8 +719,8 @@
       return true;
     }
 
-    function renderCompleted(turn) {
-      document.querySelector('[data-role="processing"]')?.remove();
+    function renderCompleted(turn, target = ui.timeline) {
+      if (target === ui.timeline) document.querySelector('[data-role="processing"]')?.remove();
       if (renderedTurns.has(turn.turn_id)) return;
       renderedTurns.add(turn.turn_id);
       for (const action of turn.action_results || []) {
@@ -421,9 +736,9 @@
         const box = document.createElement("div");
         box.className = "result-box";
         box.textContent = lines.join("\n") || "判定結果が確定しました。";
-        addMessage("RESULT", "system", box);
+        addMessage("RESULT", "system", box, "", target);
       }
-      if (turn.narration) addMessage("GM", "gm", turn.narration);
+      if (turn.narration) addMessage("GM", "gm", turn.narration, "", target);
       if (turn.choices?.length) {
         const choices = document.createElement("div");
         choices.className = "choices";
@@ -431,15 +746,21 @@
           const button = document.createElement("button");
           button.type = "button";
           button.className = "choice";
+          button.dataset.turnId = turn.turn_id;
+          button.disabled = true;
           button.textContent = choice.label;
-          button.addEventListener("click", () => submitTurn({ kind: "choice", choice_id: choice.id }, choice.label));
+          const selection = selectionGeneration;
+          button.addEventListener("click", () => {
+            if (button.disabled || selection !== selectionGeneration || latestTurnId !== turn.turn_id) return;
+            return submitTurn({ kind: "choice", choice_id: choice.id }, choice.label);
+          });
           choices.append(button);
         }
-        const lastGm = ui.timeline.lastElementChild?.querySelector(".message-body");
-        (lastGm || ui.timeline).append(choices);
+        const lastGm = target.lastElementChild?.querySelector(".message-body");
+        (lastGm || target).append(choices);
       }
       const summary = turn.recovery?.fallback ? "復旧用描写でTurnが完了しました。" : "Turnが完了しました。";
-      announce(summary);
+      if (target === ui.timeline) announce(summary);
     }
 
     function terminal(turn) {
@@ -455,6 +776,7 @@
     }
 
     async function api(path, options = {}) {
+      const selection = selectionGeneration;
       const response = await fetch(path, options);
       if (!response.ok) {
         let code = "UNKNOWN";
@@ -462,15 +784,23 @@
         const error = new Error(errors[code] || `API error (${response.status})`);
         error.status = response.status;
         error.code = code;
+        if (response.status === 401 && (selection === selectionGeneration || !path.startsWith("/campaigns/"))) {
+          authRequired = true;
+          ui.connection.dataset.state = "error";
+          ui["connection-label"].textContent = "認証が必要";
+          setBusy(busy);
+          updateStartControls();
+        }
         throw error;
       }
       return response.json();
     }
 
     async function refreshCampaignState(campaignId, { resume = false } = {}) {
+      const selection = selectionGeneration;
       const generation = (refreshGenerations.get(campaignId) || 0) + 1;
       refreshGenerations.set(campaignId, generation);
-      const ownsRefresh = () => refreshGenerations.get(campaignId) === generation &&
+      const ownsRefresh = () => selection === selectionGeneration && refreshGenerations.get(campaignId) === generation &&
         ui["campaign-id"].value.trim() === campaignId;
       let state;
       try {
@@ -482,6 +812,7 @@
       if (!ownsRefresh() || !setStateVersion(campaignId, state.state_version)) {
         return { applied: false, state };
       }
+      renderState(state);
       if (state.latest_turn) {
         updateStatus(campaignId, state.latest_turn);
         if (resume) await resumeTurn(campaignId, state.latest_turn);
@@ -605,6 +936,7 @@
         const completed = terminal(turn) ? turn : await waitForTurn(campaignId, turn.turn_id);
         if (!ownsWorkflow() || !completed) return;
         renderCompleted(completed);
+        if (!terminal(turn)) await refreshAfterTurn(campaignId);
       } catch (error) {
         if (!ownsWorkflow()) return;
         document.querySelector('[data-role="processing"]')?.remove();
@@ -614,7 +946,22 @@
       }
     }
 
+    async function refreshAfterTurn(campaignId) {
+      const selection = selectionGeneration;
+      try {
+        await refreshCampaignState(campaignId);
+        if (selection === selectionGeneration) loadAdventures();
+      } catch (error) {
+        if (selection !== selectionGeneration) return;
+        stateVersion = null;
+        ui["version-value"].textContent = "—";
+        showRetry(`Turnは完了しました。状態の取得に失敗しました: ${error.message}`,
+          () => selectAdventure(campaignId, ui["actor-id"].value), "状態を再取得");
+      }
+    }
+
     async function continuePending(pending, showPlayer) {
+      if (ui["campaign-id"].value !== pending.campaignId || authRequired) return;
       const workflow = ++workflowGeneration;
       const ownsWorkflow = () => workflow === workflowGeneration;
       cancelTracking?.();
@@ -645,6 +992,7 @@
         renderCompleted(completed);
         AiRpgPending.clear(localStorage);
         if (pending.body.content.kind === "text") ui["action-text"].value = "";
+        await refreshAfterTurn(pending.campaignId);
       } catch (error) {
         if (!ownsWorkflow()) return;
         document.querySelector('[data-role="processing"]')?.remove();
@@ -686,32 +1034,39 @@
     }
 
     async function submitTurn(content, displayText) {
-      if (busy) return;
+      if (busy || adventureCompleted || authRequired) return;
       const campaignId = ui["campaign-id"].value.trim();
       const actorId = ui["actor-id"].value.trim();
       if (!campaignId || !actorId || !displayText.trim()) {
-        showError("Campaign ID、Actor ID、行動を入力してください。");
+        showError("冒険を選び、行動を入力してください。");
         return;
       }
-      localStorage.setItem("ai-rpg-campaign", campaignId);
-      localStorage.setItem("ai-rpg-actor", actorId);
       const existing = AiRpgPending.load(localStorage);
       if (existing) {
-        showRetry("前の送信結果が未確認です。新しい行動の前に同じ送信を再試行してください。", () => continuePending(existing, false));
+        showRetry("前の送信結果が未確認です。送信した冒険を開いて結果を確認してください。", async () => {
+          if (campaignId !== existing.campaignId) await selectAdventure(existing.campaignId, existing.actorId);
+          else await continuePending(existing, false);
+        });
         return;
       }
+      const workflow = ++workflowGeneration;
+      const ownsWorkflow = () => workflow === workflowGeneration && ui["campaign-id"].value === campaignId;
       setBusy(true);
       let pending = null;
       try {
         const knownVersion = stateCampaignId === campaignId ? stateVersion : null;
         const refreshed = await refreshCampaignState(campaignId);
-        if (!refreshed.applied) return;
+        if (!ownsWorkflow() || !refreshed.applied || adventureCompleted) return;
         const current = refreshed.state;
+        if (current.latest_turn && !terminal(current.latest_turn)) {
+          await resumeTurn(campaignId, current.latest_turn);
+          return;
+        }
         if (knownVersion !== null && current.state_version !== knownVersion) {
           showError("世界の状態が更新されました。行動内容を確認してから再送してください。");
           return;
         }
-        pending = AiRpgPending.create({
+        const draft = AiRpgPending.create({
           campaignId,
           actorId,
           displayText,
@@ -719,13 +1074,14 @@
           stateVersion: current.state_version,
           requestId: crypto.randomUUID()
         });
-        AiRpgPending.save(localStorage, pending);
+        try { AiRpgPending.save(localStorage, draft); } catch (_) { throw new Error(storageError); }
+        pending = draft;
       } catch (error) {
-        showError(error instanceof Error ? error.message : "Turnの処理に失敗しました。");
+        if (ownsWorkflow()) showError(error instanceof Error ? error.message : "Turnの処理に失敗しました。");
       } finally {
-        setBusy(false);
+        if (ownsWorkflow()) setBusy(false);
       }
-      if (pending) await continuePending(pending, true);
+      if (ownsWorkflow() && pending) await continuePending(pending, true);
     }
 
     ui.composer.addEventListener("submit", event => {
@@ -740,43 +1096,48 @@
       }
     });
     ui["campaign-id"].addEventListener("change", async () => {
-      if (busy) return;
       const campaignId = ui["campaign-id"].value.trim();
-      localStorage.setItem("ai-rpg-campaign", campaignId);
-      resetView();
       if (!campaignId) return;
-      try {
-        await refreshCampaignState(campaignId, { resume: true });
-      } catch (error) {
-        showError(error instanceof Error ? error.message : "Campaignの読込みに失敗しました。");
-      }
+      await selectAdventure(campaignId, ui["actor-id"].value);
     });
+    ui["scenario-select"].addEventListener("change", catalogDescription);
+    ui["preset-select"].addEventListener("change", catalogDescription);
+    ui["start-form"].addEventListener("submit", event => { event.preventDefault(); return startAdventure(); });
+    ui["retry-start"].addEventListener("click", startAdventure);
+    ui["refresh-adventures"].addEventListener("click", () => { loadCatalog(); return loadAdventures(); });
+    ui["load-history"].addEventListener("click", loadHistory);
 
     async function restoreSession() {
+      if (pendingStart) {
+        ui["start-status"].textContent = pendingStart.adventure
+          ? "作成済みの冒険があります。開いて再開できます。"
+          : "開始の受付結果が未確認です。同じ開始を再試行してください。";
+        updateStartControls();
+      }
       const pending = AiRpgPending.load(localStorage);
       if (pending) {
-        ui["campaign-id"].value = pending.campaignId;
-        ui["actor-id"].value = pending.actorId;
-        const refreshed = await refreshCampaignState(pending.campaignId);
-        if (!refreshed.applied) return;
-        await continuePending(pending, false);
+        await selectAdventure(pending.campaignId, pending.actorId);
         return;
       }
       const campaignId = ui["campaign-id"].value.trim();
-      if (campaignId) await refreshCampaignState(campaignId, { resume: true });
+      if (campaignId) await selectAdventure(campaignId, ui["actor-id"].value);
     }
 
+    loadCatalog();
+    loadAdventures();
     restoreSession().catch(error => {
       showError(error instanceof Error ? error.message : "保存済みSessionの復元に失敗しました。");
     });
 
     fetch("/health")
       .then(response => {
+        if (authRequired) return;
         if (!response.ok) throw new Error();
         ui.connection.dataset.state = "ok";
         ui["connection-label"].textContent = "API接続済み";
       })
       .catch(() => {
+        if (authRequired) return;
         ui.connection.dataset.state = "error";
         ui["connection-label"].textContent = "API未接続";
       });

@@ -63,3 +63,18 @@ test("clearing a rejected operation leaves no stale retry", () => {
 
   assert.equal(pendingState.load(storage), null);
 });
+
+test("start recovery persists the exact payload separately from pending turns", () => {
+  const storage = new MemoryStorage();
+  const start = { body: {
+    request_id: "start-1", scenario_ref: "chapel", scenario_version: 2,
+    preset_ref: "scout", player_name: "  葵  ",
+  }, adventure: null };
+  pendingState.saveStart(storage, start);
+  pendingState.clear(storage);
+  assert.deepEqual(pendingState.loadStart(storage), start);
+  pendingState.saveStart(storage, { ...start, adventure: { campaign_id: "c1", actor_id: "a1" } });
+  assert.equal(pendingState.loadStart(storage).adventure.campaign_id, "c1");
+  pendingState.clearStart(storage);
+  assert.equal(pendingState.loadStart(storage), null);
+});

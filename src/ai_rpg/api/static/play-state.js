@@ -2,6 +2,7 @@
   "use strict";
 
   const key = "ai-rpg-pending-turn";
+  const startKey = "ai-rpg-pending-start";
 
   function create({ campaignId, actorId, displayText, content, stateVersion, requestId }) {
     return {
@@ -40,7 +41,30 @@
     storage.removeItem(key);
   }
 
-  const api = Object.freeze({ create, load, save, clear });
+  function loadStart(storage) {
+    try {
+      const value = JSON.parse(storage.getItem(startKey));
+      const body = value?.body;
+      if (!body || typeof body.request_id !== "string" ||
+          typeof body.scenario_ref !== "string" || !Number.isInteger(body.scenario_version) ||
+          typeof body.preset_ref !== "string" || typeof body.player_name !== "string") return null;
+      if (value.adventure && (typeof value.adventure.campaign_id !== "string" ||
+          typeof value.adventure.actor_id !== "string")) return null;
+      return value;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  function saveStart(storage, value) {
+    storage.setItem(startKey, JSON.stringify(value));
+  }
+
+  function clearStart(storage) {
+    storage.removeItem(startKey);
+  }
+
+  const api = Object.freeze({ create, load, save, clear, loadStart, saveStart, clearStart });
   root.AiRpgPending = api;
   if (typeof module !== "undefined" && module.exports) module.exports = api;
 })(typeof globalThis !== "undefined" ? globalThis : this);

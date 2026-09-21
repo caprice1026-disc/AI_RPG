@@ -36,8 +36,13 @@ class FakeElement extends FakeNode {
   async dispatch(type, event = {}) { return this.listeners[type]?.(event); }
   append(...children) {
     for (const child of children) {
-      if (child instanceof FakeElement) child.parent = this;
+      if (child instanceof FakeElement) { child.remove(); child.parent = this; }
       this.children.push(child);
+    }
+  }
+  prepend(...children) {
+    for (const child of [...children].reverse()) {
+      child.remove(); child.parent = this; this.children.unshift(child);
     }
   }
   replaceChildren(...children) { this.children = []; this.append(...children); }
@@ -141,17 +146,21 @@ function harness(fetch, ids = ["request-1"], initialPending = null, options = {}
     setTimeout: schedule = setTimeout,
     clearTimeout: cancel = clearTimeout,
   } = options;
-  const elementIds = [
-    "campaign-id", "actor-id", "action-text", "send-action", "composer", "timeline",
-    "empty-state", "connection", "connection-label", "route-value", "resolution-value",
-    "narration-value", "version-value", "turn-value", "recovery", "live-status",
-  ];
+  const elementIds = [...html.matchAll(/\bid="([^"]+)"/g)].map(match => match[1]);
   const elements = Object.fromEntries(elementIds.map(id => [id, new FakeElement(id)]));
   elements.timeline.append(elements["empty-state"]);
   const document = {
-    getElementById(id) { return elements[id] ?? null; },
+    getElementById(id) { return id === "empty-state" ? find(elements.timeline, node => node.id === id) : elements[id] ?? null; },
     createElement() { return new FakeElement(); },
-    querySelectorAll() { return []; },
+    querySelectorAll(selector) {
+      const found = new Set();
+      const visit = node => {
+        if (selector === ".choice" && node.className === "choice") found.add(node);
+        for (const child of node.children || []) visit(child);
+      };
+      Object.values(elements).forEach(visit);
+      return [...found];
+    },
     querySelector(selector) {
       if (selector === '[data-role="processing"]') {
         return find(elements.timeline, node => node.dataset.role === "processing");
@@ -162,7 +171,7 @@ function harness(fetch, ids = ["request-1"], initialPending = null, options = {}
       return null;
     },
   };
-  const storage = new MemoryStorage();
+  const storage = options.storage || new MemoryStorage();
   if (initialPending) AiRpgPending.save(storage, initialPending);
   const uuidValues = [...ids];
   const context = vm.createContext({
@@ -171,7 +180,16 @@ function harness(fetch, ids = ["request-1"], initialPending = null, options = {}
     document,
     localStorage: storage,
     crypto: { randomUUID() { return uuidValues.shift(); } },
-    fetch,
+    fetch: (path, request = {}) => {
+      // Legacy recovery fixtures have no adventure catalog/history. New UI tests
+      // opt in to the full API so missing or incorrect requests fail explicitly.
+      if (!options.adventureApi) {
+        if (path === "/adventures/catalog") return Promise.resolve(response({ scenarios: [], presets: [] }));
+        if (path === "/adventures" && !request.method) return Promise.resolve(response({ adventures: [] }));
+        if (path.includes("/history?")) return Promise.resolve(response({ items: [], next_before_turn_id: null }));
+      }
+      return fetch(path, request);
+    },
     window: EventSource ? { EventSource } : {},
     EventSource,
     console,
@@ -687,6 +705,7 @@ test("replacement resume keeps the new workflow busy", async () => {
   const events = eventSourceTracker();
   const app = harness(async path => {
     if (path === "/health") return response({ status: "ok" });
+    if (path.endsWith("/state")) return response({ state_version: 0, latest_turn: terminalTurn("turn-new", 0) });
     throw new Error(`unexpected request: ${path}`);
   }, [], null, events);
   app.elements["campaign-id"].value = "campaign-a";
@@ -825,4 +844,384 @@ test("campaign switch ignores a delayed polling response", async () => {
 
   assert.equal(pendingText.textContent, "Campaign B pending");
   assert.equal(app.elements["connection-label"].textContent, "Campaign B");
+});
+
+const catalog = {
+  scenarios: [{ scenario_ref: "chapel", scenario_version: 2, title: "廃礼拝堂", objective: "鐘を探す" }],
+  presets: [
+    { preset_ref: "guard", name: "守り手", description: "丈夫な旅人", max_hp: 18 },
+    { preset_ref: "scout", name: "斥候", description: "身軽な旅人", max_hp: 12 },
+  ],
+};
+function adventureState(overrides = {}) {
+  return {
+    state_version: 0, latest_turn: null,
+    player: { actor_id: "actor-a", name: "葵", current_hp: 9, max_hp: 12,
+      inventory: [{ item_id: "item-1", item_ref: "sword", name: "短剣", quantity: 1, equipped: true }] },
+    adventure: { scenario_ref: "chapel", title: "廃礼拝堂", objective: "鐘を探す", status: "active",
+      current_scene: { scene_ref: "gate", title: "門前", description: "霧の中に門がある。" },
+      discovered_facts: ["扉は閉ざされている"],
+      available_actions: [{ action_ref: "look", label: "周囲を見る" }], ending: null },
+    ...overrides,
+  };
+}
+const savedAdventure = { campaign_id: "campaign-a", actor_id: "actor-a", player_name: "葵",
+  scenario_ref: "chapel", scenario_version: 2, title: "廃礼拝堂", status: "active",
+  state_version: 0, created_at: "2026-09-22T00:00:00Z" };
+function adventureFetch(handler = () => undefined) {
+  return async (path, options = {}) => {
+    const handled = await handler(path, options);
+    if (handled !== undefined) return handled;
+    if (path === "/health") return response({ status: "ok" });
+    if (path === "/adventures/catalog") return response(catalog);
+    if (path === "/adventures" && !options.method) return response({ adventures: [savedAdventure] });
+    if (path.endsWith("/state")) return response(adventureState());
+    if (path.includes("/history?")) return response({ items: [], next_before_turn_id: null });
+    throw new Error(`unexpected request: ${path}`);
+  };
+}
+function newAdventureApp(handler, options = {}) {
+  return harness(adventureFetch(handler), ["start-1", "turn-1", "request-3"], null, { adventureApi: true, ...options });
+}
+async function startFromForm(app, name = "  葵  ") {
+  app.elements["scenario-select"].value = "chapel";
+  app.elements["preset-select"].value = "scout";
+  app.elements["player-name"].value = name;
+  await app.elements["start-form"].dispatch("submit", { preventDefault() {} });
+  await flush();
+}
+
+test("catalog builds two presets and start renders authoritative player and adventure state", async () => {
+  const posts = [];
+  const app = newAdventureApp((path, options) => {
+    if (path === "/adventures" && options.method === "POST") {
+      posts.push(JSON.parse(options.body));
+      return response({ campaign_id: "campaign-a", actor_id: "actor-a" }, 201);
+    }
+  });
+  await flush();
+  assert.equal(app.elements["preset-select"].children.length, 2);
+  assert.deepEqual(app.elements["preset-select"].children.map(node => node.value), ["guard", "scout"]);
+  await startFromForm(app);
+  assert.deepEqual(posts, [{ request_id: "start-1", scenario_ref: "chapel", scenario_version: 2,
+    preset_ref: "scout", player_name: "  葵  " }]);
+  assert.equal(app.elements["campaign-id"].value, "campaign-a");
+  assert.equal(app.elements["hp-value"].textContent, "9 / 12");
+  assert.equal(app.elements["scene-title"].textContent, "門前");
+  assert.equal(app.elements["objective-value"].textContent, "鐘を探す");
+  assert.ok(find(app.elements["inventory-list"], node => node.textContent.includes("短剣")));
+  assert.ok(find(app.elements["facts-list"], node => node.textContent === "扉は閉ざされている"));
+  const action = find(app.elements["available-actions"], node => node.textContent === "周囲を見る");
+  await action.dispatch("click");
+  assert.equal(app.elements["action-text"].value, "周囲を見る");
+  assert.equal(posts.length, 1);
+});
+
+test("lost start response survives reload and explicit retry uses the exact payload", async () => {
+  const posts = [];
+  const storage = new MemoryStorage();
+  const handler = (path, options) => {
+    if (path === "/adventures" && options.method === "POST") {
+      posts.push(options.body);
+      if (posts.length === 1) throw new TypeError("response lost");
+      return response({ campaign_id: "campaign-a", actor_id: "actor-a" }, 201);
+    }
+  };
+  const first = newAdventureApp(handler, { storage });
+  await flush();
+  await startFromForm(first);
+  const reloaded = newAdventureApp(handler, { storage });
+  await flush();
+  assert.equal(posts.length, 1, "reload must not create another adventure");
+  assert.equal(reloaded.elements["retry-start"].hidden, false);
+  reloaded.elements["player-name"].value = "changed";
+  await reloaded.elements["retry-start"].dispatch("click");
+  await flush();
+  assert.equal(posts.length, 2);
+  assert.equal(posts[1], posts[0]);
+  assert.equal(AiRpgPending.loadStart(storage), null);
+});
+
+test("accepted start with failed state GET retries selection without another POST", async () => {
+  let posts = 0;
+  let failState = true;
+  const app = newAdventureApp((path, options) => {
+    if (path === "/adventures" && options.method === "POST") {
+      posts++;
+      return response({ campaign_id: "campaign-a", actor_id: "actor-a" }, 201);
+    }
+    if (path.endsWith("/state") && failState) throw new Error("state unavailable");
+  });
+  await flush();
+  await startFromForm(app);
+  assert.equal(posts, 1);
+  assert.equal(AiRpgPending.loadStart(app.storage).adventure.campaign_id, "campaign-a");
+  failState = false;
+  await app.elements["retry-start"].dispatch("click");
+  await flush();
+  assert.equal(posts, 1);
+  assert.equal(app.elements["hp-value"].textContent, "9 / 12");
+});
+
+test("storage denied at load or save explains recovery requirement and sends no POST", async () => {
+  for (const denyRead of [false, true]) {
+    const storage = new MemoryStorage();
+    storage.setItem = () => { throw new Error("storage denied"); };
+    if (denyRead) storage.getItem = () => { throw new Error("storage denied"); };
+    let posts = 0;
+    const app = newAdventureApp((path, options) => {
+      if (options.method === "POST") { posts++; return response({}); }
+    }, { storage });
+    await flush();
+    await startFromForm(app);
+    app.elements["campaign-id"].value = "campaign-a";
+    app.elements["actor-id"].value = "actor-a";
+    app.elements["action-text"].value = "進む";
+    await app.elements.composer.requestSubmit();
+    await flush();
+    assert.equal(posts, 0);
+    assert.ok(find(app.elements.timeline, node => /保存.*送信|送信.*保存/.test(node.textContent)));
+  }
+});
+
+test("saved adventure restores DB history and prepends older pages with inert old choices", async () => {
+  const recent = { ...terminalTurn("turn-2", 2), narration: "今の描写", choices: [{ id: "choice-2", label: "新しい選択" }] };
+  const old = { ...terminalTurn("turn-1", 1), narration: "古い描写", choices: [{ id: "choice-1", label: "古い選択" }] };
+  const requested = [];
+  const storage = new MemoryStorage();
+  storage.setItem("ai-rpg-campaign", "campaign-a");
+  storage.setItem("ai-rpg-actor", "actor-a");
+  const app = newAdventureApp(path => {
+    if (path.endsWith("/state")) return response(adventureState({ state_version: 2, latest_turn: recent }));
+    if (path.includes("/history?")) {
+      requested.push(path);
+      return response(path.includes("before_turn_id=turn-2")
+        ? { items: [{ created_at: "2026-09-21T00:00:00Z", player_input: "最初の行動", turn: old }], next_before_turn_id: null }
+        : { items: [{ created_at: "2026-09-22T00:00:00Z", player_input: "次の行動", turn: recent }], next_before_turn_id: "turn-2" });
+    }
+  }, { storage });
+  await flush();
+  assert.ok(find(app.elements.timeline, node => node.textContent === "次の行動"));
+  await app.elements["load-history"].dispatch("click");
+  await flush();
+  const bodies = app.elements.timeline.children.map(node => node.querySelector(".message-body")?.textContent);
+  assert.deepEqual(bodies, ["最初の行動", "古い描写", "次の行動", "今の描写"]);
+  const oldChoice = find(app.elements.timeline, node => node.textContent === "古い選択");
+  assert.ok(!oldChoice || oldChoice.disabled);
+  assert.equal(find(app.elements.timeline, node => node.textContent === "新しい選択").disabled, false);
+  assert.equal(app.elements["load-history"].hidden, true);
+  assert.deepEqual(requested, ["/campaigns/campaign-a/history?limit=50", "/campaigns/campaign-a/history?limit=50&before_turn_id=turn-2"]);
+});
+
+test("delayed state and history from an earlier selection cannot overwrite the current adventure", async () => {
+  let resolveState, resolveHistory;
+  const state = new Promise(resolve => { resolveState = resolve; });
+  const history = new Promise(resolve => { resolveHistory = resolve; });
+  const app = newAdventureApp(path => {
+    if (path === "/campaigns/campaign-a/state") return state;
+    if (path.startsWith("/campaigns/campaign-a/history?")) return history;
+    if (path === "/campaigns/campaign-b/state") return response(adventureState({
+      state_version: 9, player: { ...adventureState().player, actor_id: "actor-b", name: "別の冒険者" },
+    }));
+  });
+  await flush();
+  const old = app.context.selectAdventure("campaign-a", "actor-a");
+  await flush();
+  await app.context.selectAdventure("campaign-b", "actor-b");
+  resolveState(response(adventureState()));
+  resolveHistory(response({ items: [{ player_input: "古い行動", created_at: "2026-09-21T00:00:00Z", turn: terminalTurn("old", 1) }], next_before_turn_id: "old" }));
+  await old;
+  assert.equal(app.elements["version-value"].textContent, "9");
+  assert.equal(app.elements["player-value"].textContent, "別の冒険者");
+  assert.equal(find(app.elements.timeline, node => node.textContent === "古い行動"), null);
+});
+
+test("last turn refreshes HP scene ending and disables actions while allowing another adventure", async () => {
+  const done = terminalTurn("turn-final", 1);
+  let completed = false;
+  let posts = 0;
+  const app = newAdventureApp((path, options) => {
+    if (options.method === "POST") { completed = true; posts++; return response(done, 202); }
+    if (path.endsWith("/state") && completed) return response(adventureState({
+      state_version: 1, latest_turn: done,
+      player: { ...adventureState().player, current_hp: 4 },
+      adventure: { ...adventureState().adventure, status: "completed", available_actions: [],
+        current_scene: { scene_ref: "exit", title: "出口", description: "帰り道" },
+        ending: { ending_ref: "safe", title: "生還", summary: "鐘を持ち帰った。" } },
+    }));
+  });
+  await flush();
+  await app.context.selectAdventure("campaign-a", "actor-a");
+  app.elements["action-text"].value = "帰る";
+  await app.elements.composer.requestSubmit();
+  await flush();
+  assert.equal(app.elements["hp-value"].textContent, "4 / 12");
+  assert.equal(app.elements["scene-title"].textContent, "出口");
+  assert.equal(app.elements["ending-title"].textContent, "生還");
+  assert.equal(app.elements["send-action"].disabled, true);
+  assert.equal(app.elements["start-adventure"].disabled, false);
+  await app.elements.composer.requestSubmit();
+  await flush();
+  assert.equal(posts, 1);
+});
+
+test("401 remains visible after a late health success and never automatically retries POST", async () => {
+  let resolveHealth;
+  const health = new Promise(resolve => { resolveHealth = resolve; });
+  let posts = 0;
+  const app = newAdventureApp((path, options) => {
+    if (path === "/health") return health;
+    if (options.method === "POST") {
+      posts++;
+      return response({ detail: { code: "UNAUTHENTICATED" } }, 401);
+    }
+  });
+  await flush();
+  await startFromForm(app);
+  resolveHealth(response({ status: "ok" }));
+  await flush();
+  assert.equal(app.elements["connection-label"].textContent, "認証が必要");
+  assert.equal(AiRpgPending.loadStart(app.storage), null);
+  assert.equal(posts, 1);
+});
+
+test("late start acceptance does not replace a newer selected adventure", async () => {
+  let resolveStart;
+  const accepted = new Promise(resolve => { resolveStart = resolve; });
+  const app = newAdventureApp((path, options) => {
+    if (path === "/adventures" && options.method === "POST") return accepted;
+  });
+  await flush();
+  const starting = startFromForm(app);
+  await flush();
+  await app.context.selectAdventure("campaign-b", "actor-b");
+  resolveStart(response({ campaign_id: "campaign-a", actor_id: "actor-a" }, 201));
+  await starting;
+  assert.equal(app.elements["campaign-id"].value, "campaign-b");
+  assert.equal(AiRpgPending.loadStart(app.storage).adventure.campaign_id, "campaign-a");
+  assert.equal(app.elements["retry-start"].hidden, false);
+});
+
+test("late history page is ignored after switching adventures", async () => {
+  let resolveHistory;
+  const history = new Promise(resolve => { resolveHistory = resolve; });
+  const app = newAdventureApp(path => {
+    if (path.startsWith("/campaigns/campaign-a/history?")) return history;
+  });
+  await flush();
+  const oldSelection = app.context.selectAdventure("campaign-a", "actor-a");
+  await flush();
+  await app.context.selectAdventure("campaign-b", "actor-b");
+  resolveHistory(response({ items: [{ player_input: "old history", created_at: "2026-09-21T00:00:00Z", turn: terminalTurn("old", 1) }], next_before_turn_id: "old" }));
+  await oldSelection;
+  assert.equal(find(app.elements.timeline, node => node.textContent === "old history"), null);
+  assert.equal(app.elements["load-history"].hidden, true);
+});
+
+test("reload of an unknown turn offers an explicit replay and the used retry cannot replay again", async () => {
+  const storage = new MemoryStorage();
+  const pending = AiRpgPending.create({ campaignId: "campaign-a", actorId: "actor-a", displayText: "調べる",
+    content: { kind: "text", text: "調べる" }, stateVersion: 0, requestId: "old-request" });
+  AiRpgPending.save(storage, pending);
+  const posts = [];
+  const app = newAdventureApp((path, options) => {
+    if (options.method === "POST") { posts.push(JSON.parse(options.body)); return response(terminalTurn("turn-1", 0), 202); }
+  }, { storage });
+  await flush();
+  assert.equal(posts.length, 0);
+  const retry = find(app.elements.timeline, node => node.textContent === "同じ送信を再試行");
+  assert.ok(retry);
+  await retry.dispatch("click");
+  await flush();
+  assert.deepEqual(posts, [pending.body]);
+  await retry.dispatch("click");
+  await flush();
+  assert.equal(posts.length, 1);
+});
+
+test("422 start clears pending while 503 preserves its exact payload for retry", async () => {
+  for (const status of [422, 503]) {
+    const posts = [];
+    const app = newAdventureApp((path, options) => {
+      if (path === "/adventures" && options.method === "POST") {
+        posts.push(options.body);
+        if (posts.length === 1) return response({ detail: { code: "UNKNOWN" } }, status);
+        return response({ campaign_id: "campaign-a", actor_id: "actor-a" }, 201);
+      }
+    });
+    await flush();
+    await startFromForm(app);
+    if (status === 422) {
+      assert.equal(AiRpgPending.loadStart(app.storage), null);
+      await startFromForm(app, "別の名前");
+      assert.notEqual(JSON.parse(posts[1]).request_id, JSON.parse(posts[0]).request_id);
+    } else {
+      assert.ok(AiRpgPending.loadStart(app.storage));
+      await app.elements["retry-start"].dispatch("click");
+      assert.equal(posts[1], posts[0]);
+    }
+  }
+});
+
+test("completed turn with state failure uses GET-only recovery", async () => {
+  let posts = 0;
+  let failState = false;
+  const app = newAdventureApp((path, options) => {
+    if (options.method === "POST") { posts++; failState = true; return response(terminalTurn("turn-done", 1), 202); }
+    if (path.endsWith("/state") && failState) throw new Error("state failed");
+  });
+  await flush();
+  await app.context.selectAdventure("campaign-a", "actor-a");
+  app.elements["action-text"].value = "調べる";
+  await app.elements.composer.requestSubmit();
+  await flush();
+  assert.equal(AiRpgPending.load(app.storage), null);
+  assert.equal(app.elements["send-action"].disabled, true);
+  const retry = find(app.elements.timeline, node => node.textContent === "状態を再取得");
+  assert.ok(retry);
+  failState = false;
+  await retry.dispatch("click");
+  await flush();
+  assert.equal(posts, 1);
+  assert.equal(app.elements["send-action"].disabled, false);
+});
+
+test("accepted start reload opens its saved adventure and releases the start form without POST", async () => {
+  const storage = new MemoryStorage();
+  AiRpgPending.saveStart(storage, { body: { request_id: "accepted-start", scenario_ref: "chapel",
+    scenario_version: 2, preset_ref: "scout", player_name: "葵" },
+    adventure: { campaign_id: "campaign-a", actor_id: "actor-a" } });
+  storage.setItem("ai-rpg-campaign", "campaign-a");
+  storage.setItem("ai-rpg-actor", "actor-a");
+  let posts = 0;
+  const app = newAdventureApp((path, options) => { if (options.method === "POST") posts++; }, { storage });
+  await flush();
+  assert.equal(posts, 0);
+  assert.equal(AiRpgPending.loadStart(storage), null);
+  assert.equal(app.elements["start-adventure"].disabled, false);
+  assert.equal(app.elements["hp-value"].textContent, "9 / 12");
+});
+
+test("DB pending turn resumes through polling and refreshes public state without POST", async () => {
+  const storage = new MemoryStorage();
+  storage.setItem("ai-rpg-campaign", "campaign-a");
+  storage.setItem("ai-rpg-actor", "actor-a");
+  const progress = pendingTurn("in-progress");
+  let finished = false;
+  let posts = 0;
+  const app = newAdventureApp((path, options) => {
+    if (options.method === "POST") posts++;
+    if (path.endsWith("/state")) return response(adventureState({ state_version: finished ? 1 : 0,
+      latest_turn: finished ? terminalTurn("in-progress", 1) : progress,
+      player: { ...adventureState().player, current_hp: finished ? 6 : 9 } }));
+    if (path.includes("/history?")) return response({ items: [{ created_at: "2026-09-22T00:00:00Z",
+      player_input: "戦う", turn: progress }], next_before_turn_id: null });
+    if (path.endsWith("/turns/in-progress")) { finished = true; return response(terminalTurn("in-progress", 1)); }
+  }, { storage });
+  await flush();
+  assert.equal(posts, 0);
+  assert.equal(app.elements["hp-value"].textContent, "6 / 12");
+  assert.ok(find(app.elements.timeline, node => node.textContent === "戦う"));
+  assert.ok(find(app.elements.timeline, node => node.textContent === "続行した。"));
+  assert.equal(app.elements["send-action"].disabled, false);
 });
