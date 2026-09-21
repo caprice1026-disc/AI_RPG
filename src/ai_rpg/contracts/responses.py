@@ -122,9 +122,26 @@ class AdventureState(Contract):
     ending: AdventureEnding | None
 
 
+class InventoryItem(Contract):
+    item_id: UUID
+    item_ref: Ref | None = None
+    name: ShortText
+    quantity: NonNegativeInt
+    equipped: StrictBool
+
+
+class PlayerState(Contract):
+    actor_id: UUID
+    name: ShortText
+    current_hp: NonNegativeInt
+    max_hp: NonNegativeInt
+    inventory: list[InventoryItem] = Field(default_factory=list)
+
+
 class CampaignStateResponse(Contract):
     """プレイ再開に必要なCampaignの正本versionと最新Turn。"""
 
     state_version: NonNegativeInt
     latest_turn: TurnResponse | None
     adventure: AdventureState | None = None
+    player: PlayerState | None = None

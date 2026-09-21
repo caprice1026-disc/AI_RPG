@@ -31,14 +31,14 @@ class RuleBasedTurnRouter:
     )
     _english_explanation = re.compile(r"\b(?:what\s+is|how\s+does)\b", re.IGNORECASE)
     _negated = re.compile(
-        r"(?:攻撃し(?:ない|ません)|攻撃するな|殴ら(?:ない|ず)|斬ら(?:ない|ず)|"
+        r"(?:攻撃し(?:ない|ません)|攻撃するな|守衛を倒すな|殴ら(?:ない|ず)|斬ら(?:ない|ず)|"
         r"撃た(?:ない|ず)|使わ(?:ない|ず)|飲ま(?:ない|ず)|振ら(?:ない|ず)|"
         r"判定し(?:ない|ません))|"
         r"(?:do\s+not|don't|never)\s+(?:attack|hit|use|drink|roll)",
         re.IGNORECASE,
     )
     _attack = re.compile(
-        r"(?:攻撃(?:する|したい)?|殴(?:る|りたい)|斬(?:る|りたい)|撃(?:つ|ちたい)|"
+        r"(?:攻撃(?:する|したい)?|守衛を倒す|殴(?:る|りたい)|斬(?:る|りたい)|撃(?:つ|ちたい)|"
         r"\b(?:attack|hit|damage)\b)",
         re.IGNORECASE,
     )

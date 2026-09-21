@@ -20,6 +20,7 @@ from ai_rpg.infrastructure.postgres import (
     PostgresIdentityStore,
 )
 from ai_rpg.runtime import (
+    DEVELOPMENT_FIXTURE,
     build_narration_worker,
     build_provider_transport,
     build_resolution_worker,
@@ -37,7 +38,10 @@ def _parser() -> argparse.ArgumentParser:
     api = commands.add_parser("api")
     api.add_argument("--host", default="127.0.0.1")
     api.add_argument("--port", type=int, default=8000)
-    api.add_argument("--dev-principal", type=UUID)
+    api.add_argument(
+        "--dev-principal", type=UUID, nargs="?", const=DEVELOPMENT_FIXTURE.principal_id,
+        help="Enable development authentication (optional principal UUID; local use only)",
+    )
 
     auth = commands.add_parser("auth")
     auth_commands = auth.add_subparsers(dest="auth_command", required=True)

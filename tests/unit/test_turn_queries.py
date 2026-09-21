@@ -118,7 +118,9 @@ async def test_get_campaign_state_returns_version_and_latest_turn() -> None:
 
     assert result == state
     assert result.adventure is None
-    unit_of_work.turns.get_campaign_state.assert_awaited_once_with(campaign_id)
+    unit_of_work.turns.get_campaign_state.assert_awaited_once_with(
+        campaign_id, principal.principal_id
+    )
     unit_of_work.scenarios.snapshot.assert_awaited_once_with(campaign_id)
     unit_of_work.commit.assert_awaited_once()
 

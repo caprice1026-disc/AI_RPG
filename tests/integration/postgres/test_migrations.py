@@ -1199,7 +1199,7 @@ def test_scenario_commit_action_kind_migration_is_forward_only_with_live_rows(
         )
         with engine.connect() as connection:
             assert connection.scalar(text("SELECT version_num FROM alembic_version")) == (
-                "0010_scenario_action_kind"
+                "0011_adventure_starts"
             )
             assert connection.scalar(
                 text("SELECT kind FROM actions WHERE id=:action"),
@@ -1536,6 +1536,7 @@ def test_oidc_bearer_round_trip_uses_registered_identity_and_campaign_membership
         "state_version": 0,
         "latest_turn": None,
         "adventure": None,
+        "player": None,
     }
     for response in (unregistered, disabled):
         assert response.status_code == 401
@@ -4186,6 +4187,18 @@ def test_fake_llm_skill_check_round_trip_reopens_turn_acceptance(
                 "state_version": completed.json()["committed_state_version"],
                 "latest_turn": completed.json(),
                 "adventure": None,
+                "player": {
+                    "actor_id": ACTOR_A,
+                    "name": "主人公",
+                    "current_hp": 10,
+                    "max_hp": 10,
+                    "inventory": [
+                        {"item_id": WEAPON_A, "item_ref": "iron_sword", "name": "鉄の剣",
+                         "quantity": 1, "equipped": True},
+                        {"item_id": ITEM_A, "item_ref": "healing_potion", "name": "回復ポーション",
+                         "quantity": 2, "equipped": False},
+                    ],
+                },
             }
             assert replay.status_code == 202
             assert replay.json() == completed.json()

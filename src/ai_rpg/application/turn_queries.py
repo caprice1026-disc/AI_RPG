@@ -66,7 +66,9 @@ class TurnQueryService:
         ):
             raise AuthorizationError("Campaignを参照する権限がありません")
         async with self._unit_of_work_factory() as unit_of_work:
-            response = await unit_of_work.turns.get_campaign_state(campaign_id)
+            response = await unit_of_work.turns.get_campaign_state(
+                campaign_id, principal.principal_id
+            )
             scenario = await unit_of_work.scenarios.snapshot(campaign_id)
             if scenario is not None:
                 response = response.model_copy(

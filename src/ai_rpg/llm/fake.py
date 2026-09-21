@@ -114,7 +114,7 @@ class DevelopmentFakeTransport:
                     ),
                     (
                         "defeat_guard",
-                        ("攻撃",),
+                        ("攻撃", "守衛を倒す"),
                         {
                             "kind": "attack",
                             "target_ref": "goblin",

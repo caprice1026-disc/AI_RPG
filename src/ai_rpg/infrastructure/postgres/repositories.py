@@ -58,7 +58,9 @@ from ai_rpg.contracts import (
     TurnResponse,
 )
 from ai_rpg.contracts.responses import (
+    InventoryItem,
     MechanicalNarrationInput,
+    PlayerState,
     RecoveryReason,
     TurnRecovery,
 )
@@ -434,7 +436,11 @@ class PostgresTurnRepository:
         row = await self._response_row(campaign_id, turn_id)
         return None if row is None else self._to_response(row)
 
-    async def get_campaign_state(self, campaign_id: UUID) -> CampaignStateResponse:
+    async def get_campaign_state(
+        self,
+        campaign_id: UUID,
+        principal_id: UUID | None = None,
+    ) -> CampaignStateResponse:
         state_version = (
             await self._session.execute(
                 select(CampaignModel.state_version)
@@ -442,6 +448,75 @@ class PostgresTurnRepository:
                 .with_for_update()
             )
         ).scalar_one()
+        player = None
+        if principal_id is not None:
+            member = await self._session.scalar(
+                select(CampaignMemberModel.principal_id)
+                .where(
+                    CampaignMemberModel.campaign_id == campaign_id,
+                    CampaignMemberModel.principal_id == principal_id,
+                    CampaignMemberModel.active.is_(True),
+                )
+                .with_for_update(read=True)
+            )
+            if member is None:
+                raise AuthorizationError("Campaignを参照する権限がありません")
+            character = (
+                await self._session.execute(
+                    select(
+                        EntityModel.id,
+                        EntityModel.label,
+                        MvpCharacterModel.current_hp,
+                        MvpCharacterModel.max_hp,
+                    )
+                    .join(MvpCharacterModel, MvpCharacterModel.entity_id == EntityModel.id)
+                    .where(
+                        EntityModel.campaign_id == campaign_id,
+                        EntityModel.controller_id == principal_id,
+                        EntityModel.kind == "pc",
+                        EntityModel.archived_at.is_(None),
+                    )
+                    .order_by(EntityModel.id)
+                    .limit(1)
+                )
+            ).one_or_none()
+            if character is not None:
+                inventory = (
+                    await self._session.execute(
+                        select(
+                            EntityModel.id,
+                            EntityModel.ref,
+                            EntityModel.label,
+                            MvpInventoryModel.quantity,
+                            MvpInventoryModel.equipped,
+                        )
+                        .join(MvpInventoryModel, MvpInventoryModel.item_id == EntityModel.id)
+                        .where(
+                            MvpInventoryModel.campaign_id == campaign_id,
+                            MvpInventoryModel.owner_id == character.id,
+                            EntityModel.archived_at.is_(None),
+                        )
+                        .order_by(
+                            MvpInventoryModel.equipped.desc(), EntityModel.ref, EntityModel.id
+                        )
+                    )
+                ).all()
+                player = PlayerState(
+                    actor_id=character.id,
+                    name=character.label or "Player",
+                    current_hp=character.current_hp,
+                    max_hp=character.max_hp,
+                    inventory=[
+                        InventoryItem(
+                            item_id=item.id,
+                            item_ref=item.ref,
+                            name=item.label or "Item",
+                            quantity=item.quantity,
+                            equipped=item.equipped,
+                        )
+                        for item in inventory
+                    ],
+                )
         latest_turn_id = (
             await self._session.execute(
                 select(TurnModel.id)
@@ -451,12 +526,12 @@ class PostgresTurnRepository:
             )
         ).scalar_one_or_none()
         latest_turn = (
-            None
-            if latest_turn_id is None
-            else await self.get_response(campaign_id, latest_turn_id)
+            None if latest_turn_id is None else await self.get_response(campaign_id, latest_turn_id)
         )
         return CampaignStateResponse(
-            state_version=int(state_version), latest_turn=latest_turn
+            state_version=int(state_version),
+            latest_turn=latest_turn,
+            player=player,
         )
 
     async def _request_row(

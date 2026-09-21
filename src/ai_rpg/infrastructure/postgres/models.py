@@ -63,6 +63,27 @@ class CampaignMemberModel(Base):
     __table_args__ = (CheckConstraint("role IN ('player','gm')"),)
 
 
+class AdventureStartRequestModel(Base):
+    __tablename__ = "adventure_start_requests"
+
+    principal_id: Mapped[UUID] = mapped_column(PG_UUID(as_uuid=True), primary_key=True)
+    request_id: Mapped[UUID] = mapped_column(PG_UUID(as_uuid=True), primary_key=True)
+    input_payload: Mapped[dict[str, object]] = mapped_column(JSONB, nullable=False)
+    campaign_id: Mapped[UUID] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("campaigns.id", deferrable=True, initially="DEFERRED"),
+        nullable=False, unique=True,
+    )
+    actor_id: Mapped[UUID] = mapped_column(PG_UUID(as_uuid=True), nullable=False)
+
+    __table_args__ = (
+        CheckConstraint("jsonb_typeof(input_payload)='object'"),
+        ForeignKeyConstraint(
+            ["campaign_id", "actor_id"], ["entities.campaign_id", "entities.id"],
+            deferrable=True, initially="DEFERRED",
+        ),
+    )
+
+
 class PrincipalModel(Base):
     __tablename__ = "principals"
 
@@ -312,6 +333,7 @@ class TurnModel(Base):
             ),
         ),
         Index("turns_scene_history", "campaign_id", "scene_id", "created_at", "id"),
+        Index("turns_history", "campaign_id", "created_at", "id"),
     )
 
 

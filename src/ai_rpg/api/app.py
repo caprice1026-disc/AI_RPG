@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Annotated
 from uuid import UUID
 
-from fastapi import Depends, FastAPI, Header, HTTPException, Request, status
+from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, status
 from fastapi.responses import FileResponse, StreamingResponse
 from starlette.types import Message, Send
 
@@ -24,11 +24,21 @@ from ai_rpg.application import (
     TurnQueryService,
     TurnService,
 )
+from ai_rpg.application.adventures import AdventureService
+from ai_rpg.application.ports.adventures import InvalidAdventureError, InvalidHistoryCursorError
 from ai_rpg.application.turns import RuntimePolicy
 from ai_rpg.config import get_settings
 from ai_rpg.contracts import CampaignStateResponse, PlayerTurnInput, TurnResponse
+from ai_rpg.contracts.adventures import (
+    AdventureCatalogResponse,
+    AdventureHistoryResponse,
+    AdventureListResponse,
+    CreateAdventureRequest,
+    CreateAdventureResponse,
+)
 from ai_rpg.infrastructure.database import create_session_factory
 from ai_rpg.infrastructure.postgres import PostgresAuthorizationPolicy, PostgresUnitOfWork
+from ai_rpg.infrastructure.postgres.adventures import PostgresAdventureStore
 from ai_rpg.scenarios import BUILTIN_SCENARIOS
 
 PrincipalProvider = Callable[..., Awaitable[AuthenticatedPrincipal]]
@@ -40,6 +50,8 @@ ApplicationError = (
     | StateVersionConflictError
     | TurnInProgressError
     | TurnNotFoundError
+    | InvalidAdventureError
+    | InvalidHistoryCursorError
 )
 _PLAY_SCREEN = Path(__file__).with_name("static") / "index.html"
 _PLAY_STATE = Path(__file__).with_name("static") / "play-state.js"
@@ -93,6 +105,8 @@ def _application_error(error: ApplicationError) -> HTTPException:
         status_code = status.HTTP_403_FORBIDDEN
     elif isinstance(error, TurnNotFoundError):
         status_code = status.HTTP_404_NOT_FOUND
+    elif isinstance(error, InvalidAdventureError | InvalidHistoryCursorError):
+        status_code = status.HTTP_422_UNPROCESSABLE_CONTENT
     else:
         status_code = status.HTTP_409_CONFLICT
     return HTTPException(status_code=status_code, detail={"code": error.code})
@@ -103,6 +117,7 @@ def create_app(
     turn_service: TurnService | None = None,
     turn_query_service: TurnQueryService | None = None,
     event_stream_service: EventStreamService | None = None,
+    adventure_service: AdventureService | None = None,
     principal_provider: PrincipalProvider = _unconfigured_principal,
     event_poll_seconds: float = 0.5,
     event_heartbeat_seconds: float = 15.0,
@@ -121,10 +136,13 @@ def create_app(
         turn_service is None
         or turn_query_service is None
         or event_stream_service is None
+        or adventure_service is None
     ):
         settings = get_settings()
         sessions = create_session_factory(settings.database_url)
         authorization = PostgresAuthorizationPolicy(sessions)
+        if adventure_service is None:
+            adventure_service = AdventureService(PostgresAdventureStore(sessions))
 
         def unit_of_work_factory() -> PostgresUnitOfWork:
             return PostgresUnitOfWork(sessions)
@@ -163,6 +181,52 @@ def create_app(
         """processがHTTP requestを処理できることを返す。"""
 
         return {"status": "ok"}
+
+    @app.post(
+        "/adventures",
+        tags=["adventures"],
+        status_code=status.HTTP_201_CREATED,
+        response_model=CreateAdventureResponse,
+    )
+    async def create_adventure(
+        adventure: CreateAdventureRequest,
+        principal: Annotated[AuthenticatedPrincipal, Depends(principal_provider)],
+    ) -> CreateAdventureResponse:
+        assert adventure_service is not None
+        try:
+            return await adventure_service.create(principal, adventure)
+        except (AuthorizationError, IdempotencyConflictError, InvalidAdventureError) as error:
+            raise _application_error(error) from error
+
+    @app.get("/adventures/catalog", tags=["adventures"], response_model=AdventureCatalogResponse)
+    async def adventure_catalog(
+        principal: Annotated[AuthenticatedPrincipal, Depends(principal_provider)],
+    ) -> AdventureCatalogResponse:
+        assert adventure_service is not None
+        return adventure_service.catalog()
+
+    @app.get("/adventures", tags=["adventures"], response_model=AdventureListResponse)
+    async def list_adventures(
+        principal: Annotated[AuthenticatedPrincipal, Depends(principal_provider)],
+    ) -> AdventureListResponse:
+        assert adventure_service is not None
+        return await adventure_service.list_owned(principal)
+
+    @app.get(
+        "/campaigns/{campaign_id}/history", tags=["campaigns"],
+        response_model=AdventureHistoryResponse,
+    )
+    async def adventure_history(
+        campaign_id: UUID,
+        principal: Annotated[AuthenticatedPrincipal, Depends(principal_provider)],
+        limit: Annotated[int, Query(ge=1, le=100)] = 50,
+        before_turn_id: UUID | None = None,
+    ) -> AdventureHistoryResponse:
+        assert adventure_service is not None
+        try:
+            return await adventure_service.history(principal, campaign_id, limit, before_turn_id)
+        except (AuthorizationError, InvalidHistoryCursorError) as error:
+            raise _application_error(error) from error
 
     @app.post(
         "/campaigns/{campaign_id}/turns",

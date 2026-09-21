@@ -217,7 +217,7 @@ class TurnRepository(Protocol):
     ) -> TurnResponse | None: ...
 
     async def get_campaign_state(
-        self, campaign_id: UUID
+        self, campaign_id: UUID, principal_id: UUID | None = None
     ) -> CampaignStateResponse: ...
 
     async def accept_pending(
