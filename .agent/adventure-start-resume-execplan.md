@@ -21,29 +21,29 @@
 
 担当範囲: contracts/adventures.py、application/adventures.pyとport、infrastructure/postgres/adventures.py、models.py、migration 0011、api/app.py、cli.py、関連Python tests。既存型の拡張は互換defaultを付ける。
 
-- [ ] 公開catalogとPC preset、開始request/response、一覧・player・履歴DTOを作る。
-- [ ] 開始のatomic性・並行冪等性、認可、名前/preset validationをテストして実装する。
-- [ ] GET /adventures/catalog、POST /adventures、GET /adventuresを追加する。
-- [ ] GET /campaigns/{id}/stateに本人PCのactor_id/name/HP/inventoryを追加し、GET /campaigns/{id}/historyを追加する。
-- [ ] 開始後のFake worker進行、履歴、他principal拒否、内部情報非公開を確認する。
-- [ ] APIとレスポンスの確定例を次タスクへ渡す。実装reviewを行う。
+- [x] 公開catalogとPC preset、開始request/response、一覧・player・履歴DTOを作る。
+- [x] 開始のatomic性・並行冪等性、認可、名前/preset validationをテストして実装する。
+- [x] GET /adventures/catalog、POST /adventures、GET /adventuresを追加する。
+- [x] GET /campaigns/{id}/stateに本人PCのactor_id/name/HP/inventoryを追加し、GET /campaigns/{id}/historyを追加する。
+- [x] 開始後のFake worker進行、履歴、他principal拒否、内部情報非公開を確認する。
+- [x] APIとレスポンスの確定例を次タスクへ渡す。実装reviewを行う。
 
 ## Task 2: 開始・再開のプレイ画面
 
 担当範囲: api/static/index.html、play-state.js、必要なら分離した小さなJS、tests/browser/*。API契約はTask 1の実装に合わせる。
 
-- [ ] シナリオ・preset・名前の開始フォームと、保存済み冒険一覧を追加する。UUID入力を通常導線から外す。
-- [ ] 公開状態からHP/在庫/現在地/目的/発見/行動候補/結末を描画する。
-- [ ] DB履歴の復元、古い履歴の取得、進行中Turnの追跡と完了後state再取得を接続する。
-- [ ] 開始応答喪失、reload、Turn再送、古い応答、完了済み冒険、401をbrowser unit testで検証する。
-- [ ] 既存の見た目とアクセシビリティを維持し、実装reviewを行う。
+- [x] シナリオ・preset・名前の開始フォームと、保存済み冒険一覧を追加する。UUID入力を通常導線から外す。
+- [x] 公開状態からHP/在庫/現在地/目的/発見/行動候補/結末を描画する。
+- [x] DB履歴の復元、古い履歴の取得、進行中Turnの追跡と完了後state再取得を接続する。
+- [x] 開始応答喪失、reload、Turn再送、古い応答、完了済み冒険、401をbrowser unit testで検証する。
+- [x] 既存の見た目とアクセシビリティを維持し、実装reviewを行う。
 
 ## Task 3: 実環境確認・文書・統合
 
 - [x] Dockerの古いsocketを可逆的に退避し、既存PostgreSQLコンテナの復旧を確認する。
-- [ ] README/API docsを更新する。開発環境だけで使う認証、Fakeの制約、開始・再開の操作を明記する。
-- [ ] 専用test DBで全pytest、Ruff、mypy、JS tests、build、git diff --checkを実行する。
-- [ ] test DBと分離した検証DBでAPI/Fake workersを起動し、desktop/mobileの実browserで開始→進行→reload→再開→結末を確認する。
+- [x] README/API docsを更新する。開発環境だけで使う認証、Fakeの制約、開始・再開の操作を明記する。
+- [x] 専用test DBで全pytest、Ruff、mypy、JS tests、build、git diff --checkを実行する。
+- [x] test DBと分離した検証DBでAPI/Fake workersを起動し、desktop/mobileの実browserで開始→進行→reload→再開→結末を確認する。
 - [ ] 最終review後、mainへfast-forwardしpush、remote SHAを照合する。
 
 ## 検証環境と記録
@@ -57,3 +57,8 @@ worktree: .worktrees/adventure-start-resume、branch: codex/adventure-start-resu
 
 - 2026-09-22: Docker/runとdocker-secrets-engineの古いsocketを同時に退避してDocker Engine 29.8.0を復旧。既存ai-rpg-test-postgresを起動し、pg_isready成功、ai_rpg_testが空であることを確認。DB volume・設定・他のコンテナは変更していない。
 - 実browser用にai_rpg_stage2_browserを新規作成。既存ai_rpg_browserのデータと統合test DBから分離する。
+- 最初の全pytestは507 passed/3 failed。追加テーブルとUUID入力廃止に対する既存テストの期待値を修正し、再実行で510 passed（481.95秒、skipなし）。Ruff、mypy（61 files）、lock整合性とwheel/sdist buildも成功。
+- Chromeで斥候の開始→入口→広間→奥→代償付き成功、2Turn後のreload、別ブラウザセッションから3Turnの履歴・結末復元を確認。390px幅で横スクロールなし。守護者の開始応答を保存後に故意に破棄し、reload・同一要求再送後も冒険が重複しないことを確認。
+- 最終reviewで、古いTurn再試行ボタンが後続の未確認要求を失わせる問題と、履歴復旧時に入力が欠落・重複する問題を再現。4d3644aで要求の所有権照合と入力・結果を一組として扱う履歴管理へ修正。追加テストの失敗から成功を確認し、限定再reviewで両指摘の解消を確認した。
+- 修正後のJS全47 tests、API/HTML連携16 tests、wheel/sdist再buildと差分checkが成功。Python/DB処理は不変のため全DB suiteは繰り返していない。実Chromeでも、未到達Turnのreload・再送で入力が復元され、未使用の旧再試行ボタンが無効になることを確認。履歴GETの初回503→次Turn完了→履歴再取得で2Turnの入力・結果・描写が一度ずつ正順に並ぶことを確認した。
+- ブラウザログイン、実モデル、敵の反撃は未実装・対象外。検証DBとDocker socketの退避データは残す。検証専用API/Fake workerは作業終了時に停止する。
