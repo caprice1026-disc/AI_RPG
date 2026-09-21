@@ -291,7 +291,9 @@
         <h3>現在地</h3><p id="scene-title">—</p><p id="scene-description" class="hint"></p>
         <h3>目的</h3><p id="objective-value">—</p>
         <h3>発見</h3><ul id="facts-list" class="public-list"></ul>
-        <h3>行動候補</h3><div id="available-actions" class="choices"></div>
+        <h3 id="actions-heading">行動候補</h3>
+        <p id="actions-hint" class="hint">候補を選ぶと入力欄に入ります。内容を確認して「送信」を押してください。</p>
+        <div id="available-actions" class="choices" role="group" aria-labelledby="actions-heading" aria-describedby="actions-hint"></div>
         <section id="ending" class="recovery" hidden aria-labelledby="ending-title">
           <h3 id="ending-title"></h3><p id="ending-summary"></p>
         </section>
