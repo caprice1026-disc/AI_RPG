@@ -19,10 +19,10 @@ LLMの創造性と、決定的なゲームルール・永続状態・障害復�
 
 AI_RPGは、LLMにゲーム状態を直接変更させないAI TRPGバックエンドです。LLMはプレイヤー入力から意図を抽出し、確定済み結果を描写します。判定、乱数、HPや在庫の変更、イベント履歴は、型付きのGame EngineとPostgreSQL transactionが担当します。
 
-現在のMVPでは、Fake LLMを使って次の一往復を実PostgreSQL上で再現できます。
+現在のMVPでは、Fake LLMを使い、固定短編「廃礼拝堂の聖印」を入口から三つの結末まで実PostgreSQL上で進められます。
 
 ```text
-プレイヤー入力 → 意図抽出 → 技能判定／攻撃／回復 → atomic保存 → 結果描写 → SSE更新
+プレイヤー入力 → 意図抽出 → 技能判定／攻撃／Scenario進行 → atomic保存 → 結果描写 → 状態表示
 ```
 
 > [!IMPORTANT]
@@ -51,6 +51,7 @@ AI_RPGは、LLMにゲーム状態を直接変更させないAI TRPGバックエ�
 - 完了済みTurnだけから組み立てる、公開範囲を限定した複数Turn Context
 - Campaignの正本versionと最新Turnを再読込し、通信断後も同じrequestを追跡できる最小プレイ画面
 - 登録済み参照だけを使う攻撃、HP下限／上限、回復ポーションと在庫消費
+- version付きScenario定義と、探索の成否からScene／公開情報／Endingへ進む固定短編
 - Campaign event sequenceをcursorにしたSSEと、接続失敗時のGET polling fallback
 - PostgreSQL migrationとSQLAlchemy 2の型付きmodel／query
 - timeout、Schema不正、worker交代、予算切れ、deadline到達時の回収とfallback
@@ -92,7 +93,7 @@ flowchart LR
 .\.venv\Scripts\uv.exe build
 ```
 
-2026-09-18時点で、実PostgreSQLを指定した全スイートは`232 passed`です。変更時は下記の専用DBで全件を再実行してください。
+変更時は下記の専用DBで全スイートを再実行してください。
 
 PostgreSQL統合テストには、名前が`ai_rpg_test`で始まる専用の空DBを指定します。fixtureは既存テーブルがあるDBを拒否します。
 Alembicは空DBだけでなく、既存revisionからheadへの更新もテストします。
@@ -154,13 +155,14 @@ Discoveryはprocess起動時に取得し、失敗した場合はAPIを起動し�
 
 `ai-rpg api --dev-principal <UUID>`はOIDCを迂回するローカル開発専用の明示的な起動方法です。通常のAPI起動やworkerへ暗黙適用されません。将来のブラウザログイン／server sessionは同じprincipal契約を生成する別adapterとして追加します。それまではbundled play screenからBearer loginはできず、ローカル開発では`--dev-principal`が必要です。
 
-## Fake LLMで一往復を試す
+## Fake LLMで動作を試す
 
 実モデルのAPIキーは不要です。上記の専用PostgreSQLを用意し、次の受入テストを実行します。fixtureがmigration、Campaign／PC／Scene／技能条件、認証principal、固定ダイス、Fake応答を用意します。
 
 ```powershell
 $env:AIRPG_TEST_DATABASE_URL = "postgresql+psycopg://USER:PASSWORD@HOST:PORT/ai_rpg_test_local"
 .\.venv\Scripts\python.exe -m pytest tests\integration\postgres\test_migrations.py -q -p no:cacheprovider -k "fake_llm_skill_check_round_trip_reopens_turn_acceptance or narrative_route_commits_zero_actions_in_one_llm_call or narrative_escalation_reuses_first_call_as_mechanical_intent or narration_timeout_survives_worker_replacement_and_falls_back"
+.\.venv\Scripts\python.exe -m pytest tests\integration\postgres\test_migrations.py -q -p no:cacheprovider -k "ruined_chapel"
 ```
 
 この受入テストは、次のシナリオを自動確認します。
@@ -201,9 +203,26 @@ $env:AIRPG_DATABASE_URL = "postgresql+psycopg://airpg:airpg@localhost/airpg"
 .\.venv\Scripts\ai-rpg.exe narration-worker --fake
 ```
 
-Turnを投入し、返された`turn_id`をGETすると進行状態と描写を確認できます。
+`seed-dev`はCampaign、主人公、ゴブリン、装備、三つのScene、技能条件、`ruined_chapel` runを冪等に作成し、IDをJSONで表示します。再実行しても進行済みのScene、flag、Ending、HP、在庫は開始状態へ戻しません。
 
-ブラウザでは`http://127.0.0.1:8000/`を開き、Campaign IDとActor IDを入力すれば同じ一往復を試せます。開発fixtureは一つのSceneで`hero`を公開し、`goblin`を公開かつ攻撃到達可能として明示します。`iron_sword`と`healing_potion`はhero所有のprivate inventoryです。「周囲を注意深く観察する」「鉄の剣でゴブリンを攻撃する」「回復ポーションを飲む」を試せます。
+解決workerはFake LLMで入力を登録済み行動へ対応させ、Engineの判定後にSceneと公開情報を進めます。描写workerは確定済み結果から文章を保存します。各Turnの後に次の入力を送ってください。
+
+| Scene | 代表入力 | 処理 |
+| --- | --- | --- |
+| 入口 | `礼拝堂に入る` | 広間へ進む |
+| 広間 | `広間を調べる` | perception判定。成功なら手掛かり、失敗なら警戒状態を公開する |
+| 奥の部屋 | `守衛と交渉する` | persuasion判定で聖印の回収を試みる |
+| 奥の部屋 | `聖印へ忍び寄る` | stealth判定で聖印の回収を試みる |
+| 奥の部屋 | `ゴブリンを攻撃する` | HPが0になるまで攻撃する |
+| 奥の部屋 | `撤退する` | 回収を断念して終了する |
+
+結末は`recovered`（回収成功）、`costly_success`（代償付き成功）、`retreated`（撤退）の三つです。広間で警戒された場合は、奥の部屋を突破しても`costly_success`になります。探索の失敗で進行は止まりません。
+
+`GET /campaigns/{campaign_id}/state`の`adventure`には、目的、現在Scene、公開済み事実、利用可能な登録済み行動、完了後のEndingが入ります。生の内部flag名や未達条件は返しません。完了後の新規Turnは`409 ADVENTURE_COMPLETED`になります。
+
+ブラウザでは`http://127.0.0.1:8000/`を開き、Campaign IDとActor IDを入力して同じ入力を送れます。開発fixtureは全Sceneで`hero`を公開し、`goblin`は奥の部屋だけで公開かつ攻撃到達可能にします。`iron_sword`と`healing_potion`はhero所有のprivate inventoryです。
+
+この段階では、シナリオ選択を含む開始・再開画面、実LLMによる短編調整、敵の反撃、ブラウザログインを実装していません。開発fixture、Fake worker、既存の開発用principalで固定短編の進行を検証する範囲です。
 
 画面は`GET /campaigns/{campaign_id}/state`から正本のstate versionと最新Turnを取得し、Campaign切替、別タブ更新、reload後に状態を同期します。409時は古い行動を新versionで自動実行せず、再確認を促します。turn ID発行前の確定的な4xx入力エラーではpendingを消し、修正後は新しいrequest IDで送信します。通信断・不明なPOST結果・5xx・turn ID発行後の失敗では、同じrequest IDとbodyを保持して同じ内容だけを再送します。受付済みの`turn_id`が分かっている場合はPOSTせずGET／SSE追跡を再開します。SSEが失敗またはtimeoutした場合はSSEを閉じてGET Pollingだけへ引き継ぎ、古いCampaignや世代の更新は表示しません。開発用principalを指定せずAPIを起動した場合は401を表示し、認証を暗黙に迂回しません。
 
@@ -220,13 +239,16 @@ $body = @{
   request_id = $requestId
   expected_state_version = 0
   actor_id = "10000000-0000-0000-0000-000000000031"
-  content = @{ kind = "text"; text = "周囲を注意深く観察する" }
+  content = @{ kind = "text"; text = "礼拝堂に入る" }
 } | ConvertTo-Json -Depth 4
 $turn = Invoke-RestMethod -Method Post `
   -Uri "http://127.0.0.1:8000/campaigns/10000000-0000-0000-0000-000000000001/turns" `
   -ContentType "application/json" -Body $body
 Invoke-RestMethod `
   -Uri "http://127.0.0.1:8000/campaigns/10000000-0000-0000-0000-000000000001/turns/$($turn.turn_id)"
+$state = Invoke-RestMethod `
+  -Uri "http://127.0.0.1:8000/campaigns/10000000-0000-0000-0000-000000000001/state"
+$state.adventure | ConvertTo-Json -Depth 5
 ```
 
 `--once`を付けるとworkerは一回だけ取得を試みて終了します。processを停止・再起動しても、Turn、予算、lease、確定済み結果はPostgreSQLから引き継がれます。`--dev-principal`は開発時だけ明示的に有効化する認証差し替えです。通常起動ではbundled play screenからの未認証requestは引き続き401になりますが、事前登録済みidentityの有効なBearer requestは認証されます。
@@ -273,6 +295,11 @@ data: {"id":12,"type":"turn.updated","schema_version":1,"payload":{"turn":{...}}
 - [x] 最小のプレイヤー向け画面
 - [x] 攻撃・回復・アイテム使用のAPI経路
 - [x] SSEによるリアルタイム更新
+- [x] 固定短編の開始、探索、Scene遷移、三つの結末
+- [ ] シナリオ選択を含む開始・再開画面
+- [ ] 実LLMによる短編プレイの調整
+- [ ] 敵の反撃を含む戦闘ループ
+- [ ] ブラウザログイン
 
 ## コントリビューション
 
@@ -303,7 +330,8 @@ src/ai_rpg/
 ├── domain/           # Command、Result、Event
 ├── engine/           # 決定的なゲームルール
 ├── infrastructure/   # PostgreSQLと外部adapter
-└── llm/              # Structured outputとFake transport
+├── llm/              # Structured outputとFake transport
+└── scenarios/        # version付き固定Scenario定義
 
 migrations/           # Alembic migration
 tests/                # Unit、contract、PostgreSQL integration

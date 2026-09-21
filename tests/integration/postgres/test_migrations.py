@@ -85,7 +85,7 @@ from ai_rpg.infrastructure.postgres.repositories import (
     PostgresPublicEventRepository,
     PostgresTurnRepository,
 )
-from ai_rpg.llm import ProviderRefusalError, ScriptedFakeTransport
+from ai_rpg.llm import DevelopmentFakeTransport, ProviderRefusalError, ScriptedFakeTransport
 from ai_rpg.scenarios import BUILTIN_SCENARIOS
 
 URL = os.getenv("AIRPG_TEST_DATABASE_URL")
@@ -1532,7 +1532,11 @@ def test_oidc_bearer_round_trip_uses_registered_identity_and_campaign_membership
         registered, unregistered, disabled, nonmember, tokens = runner.run(exercise())
 
     assert registered.status_code == 200
-    assert registered.json() == {"state_version": 0, "latest_turn": None}
+    assert registered.json() == {
+        "state_version": 0,
+        "latest_turn": None,
+        "adventure": None,
+    }
     for response in (unregistered, disabled):
         assert response.status_code == 401
         assert response.json() == {"detail": {"code": "UNAUTHENTICATED"}}
@@ -4181,6 +4185,7 @@ def test_fake_llm_skill_check_round_trip_reopens_turn_acceptance(
             assert campaign_state.json() == {
                 "state_version": completed.json()["committed_state_version"],
                 "latest_turn": completed.json(),
+                "adventure": None,
             }
             assert replay.status_code == 202
             assert replay.json() == completed.json()
@@ -7803,6 +7808,293 @@ def test_adventure_state_projects_development_fixture(database: Engine) -> None:
     assert [action.action_ref for action in state.adventure.available_actions] == [
         "enter_chapel"
     ]
+
+
+def _play_ruined_chapel(
+    database: Engine,
+    *,
+    player_inputs: tuple[str, ...],
+    rolls: list[int],
+    retry_narration_turn: int | None = None,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], dict[str, Any], int]:
+    from ai_rpg.runtime import seed_development_fixture
+
+    url = database.url.render_as_string(hide_password=False)
+    fixture = seed_development_fixture(url)
+    random_source = _SequenceRandom(rolls)
+
+    async def play() -> tuple[
+        list[dict[str, Any]], list[dict[str, Any]], dict[str, Any]
+    ]:
+        async with _postgres_sessions(url) as factory:
+            authorization = PostgresAuthorizationPolicy(factory)
+
+            def unit_of_work_factory() -> PostgresUnitOfWork:
+                return PostgresUnitOfWork(factory)
+
+            principal = AuthenticatedPrincipal(
+                principal_id=fixture.principal_id,
+                issuer="integration-test",
+                subject="development-player",
+                authenticated_at=datetime.now(UTC),
+                auth_context=frozenset(),
+            )
+
+            async def authenticate() -> AuthenticatedPrincipal:
+                return principal
+
+            app = create_app(
+                turn_service=TurnService(
+                    authorization,
+                    unit_of_work_factory,
+                    RuntimePolicy(3, 1, 3),
+                ),
+                turn_query_service=TurnQueryService(
+                    authorization,
+                    unit_of_work_factory,
+                    BUILTIN_SCENARIOS,
+                ),
+                principal_provider=authenticate,
+            )
+            fake_transport = DevelopmentFakeTransport()
+            resolution_worker = SkillCheckResolutionWorker(
+                unit_of_work_factory,
+                fake_transport,
+                MvpV1Ruleset(DiceEngine(random_source)),
+                WorkerPhasePolicy(60, 3, 120, "fake-intent"),
+                scenario_progressor=ScenarioProgressor(BUILTIN_SCENARIOS),
+                rng_source="seeded_test",
+            )
+            narration_worker = NarrationWorker(
+                unit_of_work_factory,
+                fake_transport,
+                WorkerPhasePolicy(60, 3, 120, "fake-narration"),
+            )
+
+            states: list[dict[str, Any]] = []
+            turns: list[dict[str, Any]] = []
+            transport = ASGITransport(app=app)
+            async with AsyncClient(transport=transport, base_url="http://test") as client:
+                initial_state = await client.get(
+                    f"/campaigns/{fixture.campaign_id}/state"
+                )
+                assert initial_state.status_code == 200
+                states.append(initial_state.json())
+
+                for ordinal, player_text in enumerate(player_inputs, start=1):
+                    accepted = await client.post(
+                        f"/campaigns/{fixture.campaign_id}/turns",
+                        json={
+                            "request_id": str(UUID(int=8000 + ordinal)),
+                            "expected_state_version": states[-1]["state_version"],
+                            "actor_id": str(fixture.actor_id),
+                            "content": {"kind": "text", "text": player_text},
+                        },
+                    )
+                    assert accepted.status_code == 202
+                    turn_id = UUID(accepted.json()["turn_id"])
+
+                    assert await resolution_worker.run_once(turn_id)
+                    assert await narration_worker.run_once(turn_id)
+                    if retry_narration_turn == ordinal:
+                        assert not await narration_worker.run_once(turn_id)
+
+                    completed = await client.get(
+                        f"/campaigns/{fixture.campaign_id}/turns/{turn_id}"
+                    )
+                    assert completed.status_code == 200
+                    turns.append(completed.json())
+
+                    state = await client.get(f"/campaigns/{fixture.campaign_id}/state")
+                    assert state.status_code == 200
+                    states.append(state.json())
+
+                rejected = await client.post(
+                    f"/campaigns/{fixture.campaign_id}/turns",
+                    json={
+                        "request_id": str(UUID(int=8999)),
+                        "expected_state_version": states[-1]["state_version"],
+                        "actor_id": str(fixture.actor_id),
+                        "content": {"kind": "text", "text": "さらに進む"},
+                    },
+                )
+                return states, turns, {
+                    "status_code": rejected.status_code,
+                    "body": rejected.json(),
+                }
+
+    with asyncio.Runner(loop_factory=asyncio.SelectorEventLoop) as runner:
+        states, turns, rejected = runner.run(play())
+    return states, turns, rejected, random_source.calls
+
+
+def _ruined_chapel_scene_refs(states: list[dict[str, Any]]) -> list[str | None]:
+    return [
+        None
+        if state["adventure"]["current_scene"] is None
+        else state["adventure"]["current_scene"]["scene_ref"]
+        for state in states
+    ]
+
+
+def _ruined_chapel_counts(database: Engine) -> tuple[int, int, int, int]:
+    with database.connect() as connection:
+        return (
+            connection.scalar(text("SELECT count(*) FROM actions")),
+            connection.scalar(text("SELECT count(*) FROM events")),
+            connection.scalar(
+                text("SELECT count(*) FROM events WHERE type='ScenarioProgressed'")
+            ),
+            connection.scalar(text("SELECT count(*) FROM mvp_scenario_flags")),
+        )
+
+
+def test_ruined_chapel_recovered_after_successful_search_and_negotiation(
+    database: Engine,
+) -> None:
+    states, turns, rejected, random_calls = _play_ruined_chapel(
+        database,
+        player_inputs=("礼拝堂に入る", "広間を調べる", "守衛と交渉する"),
+        rolls=[20, 20],
+        retry_narration_turn=2,
+    )
+
+    assert _ruined_chapel_scene_refs(states) == [
+        "entrance",
+        "hall",
+        "sanctum",
+        None,
+    ]
+    assert [state["state_version"] for state in states] == [0, 1, 2, 3]
+    assert states[2]["adventure"]["discovered_facts"] == [
+        "広間で聖印へ続く手掛かりを見つけた。"
+    ]
+    assert states[-1]["adventure"]["ending"] == {
+        "ending_ref": "recovered",
+        "title": "回収成功",
+        "summary": "銀の聖印を無事に回収した。",
+    }
+    assert [turn["committed_state_version"] for turn in turns] == [1, 2, 3]
+    assert all(
+        turn["route"] == "mechanical"
+        and turn["resolution_status"] == "committed"
+        and turn["narration_status"] == "completed"
+        for turn in turns
+    )
+    assert _ruined_chapel_counts(database) == (3, 11, 3, 1)
+    assert random_calls == 2
+    assert rejected == {
+        "status_code": 409,
+        "body": {"detail": {"code": "ADVENTURE_COMPLETED"}},
+    }
+
+
+def test_ruined_chapel_costly_success_after_failed_search_and_negotiation(
+    database: Engine,
+) -> None:
+    states, turns, rejected, random_calls = _play_ruined_chapel(
+        database,
+        player_inputs=("礼拝堂に入る", "広間を調べる", "守衛と交渉する"),
+        rolls=[1, 20],
+    )
+
+    assert _ruined_chapel_scene_refs(states) == [
+        "entrance",
+        "hall",
+        "sanctum",
+        None,
+    ]
+    assert [state["state_version"] for state in states] == [0, 1, 2, 3]
+    assert states[2]["adventure"]["discovered_facts"] == [
+        "礼拝堂の守衛に侵入を警戒されている。"
+    ]
+    assert states[-1]["adventure"]["ending"] == {
+        "ending_ref": "costly_success",
+        "title": "代償付き成功",
+        "summary": "代償を払いながらも銀の聖印を回収した。",
+    }
+    assert [turn["committed_state_version"] for turn in turns] == [1, 2, 3]
+    assert _ruined_chapel_counts(database) == (3, 11, 3, 1)
+    assert random_calls == 2
+    assert rejected["status_code"] == 409
+    assert rejected["body"] == {"detail": {"code": "ADVENTURE_COMPLETED"}}
+
+
+def test_ruined_chapel_can_end_by_retreating(database: Engine) -> None:
+    states, turns, rejected, random_calls = _play_ruined_chapel(
+        database,
+        player_inputs=("礼拝堂に入る", "広間を調べる", "撤退する"),
+        rolls=[20],
+    )
+
+    assert _ruined_chapel_scene_refs(states) == [
+        "entrance",
+        "hall",
+        "sanctum",
+        None,
+    ]
+    assert [state["state_version"] for state in states] == [0, 1, 2, 3]
+    assert states[-1]["adventure"]["discovered_facts"] == [
+        "広間で聖印へ続く手掛かりを見つけた。"
+    ]
+    assert states[-1]["adventure"]["ending"] == {
+        "ending_ref": "retreated",
+        "title": "撤退",
+        "summary": "銀の聖印の回収を断念し、廃礼拝堂から撤退した。",
+    }
+    assert [turn["committed_state_version"] for turn in turns] == [1, 2, 3]
+    assert _ruined_chapel_counts(database) == (3, 10, 3, 1)
+    assert random_calls == 1
+    assert rejected["status_code"] == 409
+    assert rejected["body"] == {"detail": {"code": "ADVENTURE_COMPLETED"}}
+
+
+def test_ruined_chapel_combat_recovers_relic_when_goblin_reaches_zero_hp(
+    database: Engine,
+) -> None:
+    states, turns, rejected, random_calls = _play_ruined_chapel(
+        database,
+        player_inputs=(
+            "礼拝堂に入る",
+            "広間を調べる",
+            "ゴブリンを攻撃する",
+            "ゴブリンを攻撃する",
+        ),
+        rolls=[20, 20, 6, 20, 6],
+    )
+
+    assert _ruined_chapel_scene_refs(states) == [
+        "entrance",
+        "hall",
+        "sanctum",
+        "sanctum",
+        None,
+    ]
+    assert [state["state_version"] for state in states] == [0, 1, 2, 3, 4]
+    assert states[-1]["adventure"]["discovered_facts"] == [
+        "広間で聖印へ続く手掛かりを見つけた。"
+    ]
+    assert states[-1]["adventure"]["ending"] == {
+        "ending_ref": "recovered",
+        "title": "回収成功",
+        "summary": "銀の聖印を無事に回収した。",
+    }
+    assert [turn["committed_state_version"] for turn in turns] == [1, 2, 3, 4]
+    with database.connect() as connection:
+        assert connection.scalar(
+            text(
+                "SELECT current_hp FROM mvp_characters "
+                "WHERE campaign_id=:campaign AND entity_id=:target"
+            ),
+            {
+                "campaign": "10000000-0000-0000-0000-000000000001",
+                "target": "10000000-0000-0000-0000-000000000032",
+            },
+        ) == 0
+    assert _ruined_chapel_counts(database) == (4, 18, 3, 1)
+    assert random_calls == 5
+    assert rejected["status_code"] == 409
+    assert rejected["body"] == {"detail": {"code": "ADVENTURE_COMPLETED"}}
 
 
 def test_independent_cli_processes_complete_fake_round_trip(database: Engine) -> None:

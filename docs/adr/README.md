@@ -15,6 +15,7 @@
 | [0009](0009-turn-routing.md) | Turnルーティング |
 | [0010](0010-authenticated-principal.md) | 認証済みprincipal境界 |
 | [0011](0011-scene-entity-scope.md) | Scene entityの公開範囲と攻撃到達可能性 |
+| [0012](0012-scenario-definitions-and-progress.md) | Scenario定義と実行状態の分離 |
 
 ## 共通方針
 

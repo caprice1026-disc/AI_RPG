@@ -2,7 +2,7 @@
 
 版: 0.2 / 2026-09-14 / レビュー用実装案
 
-> **決定の更新:** 本書の暫定値と対象外事項のうち、MVP ruleset、実行時設定、Turn routing、principal境界、Scene entityの公開範囲は [Architecture Decision Records](adr/README.md) で決定済みである。矛盾する場合は採用状態のADRを優先する。
+> **決定の更新:** 本書の暫定値と対象外事項のうち、MVP ruleset、実行時設定、Turn routing、principal境界、Scene entityの公開範囲、Scenario定義と実行状態は [Architecture Decision Records](adr/README.md) で決定済みである。矛盾する場合は採用状態のADRを優先する。
 
 ## 1 今回の具体化
 
@@ -98,7 +98,9 @@ class NarrativeInput(GMInput):
 
 
 class MechanicalInput(GMInput):
-    supported_action_types: list[Literal["attack", "skill_check", "use_item"]]
+    supported_action_types: list[
+        Literal["attack", "skill_check", "use_item", "scenario_action"]
+    ]
     supported_skill_refs: list[Ref]
 
 
@@ -121,8 +123,13 @@ class UseItemIntent(Contract):
     target_ref: Ref | None
 
 
+class ScenarioActionIntent(Contract):
+    kind: Literal["scenario_action"]
+    action_ref: Ref
+
+
 ActionIntent = Annotated[
-    AttackIntent | SkillCheckIntent | UseItemIntent,
+    AttackIntent | SkillCheckIntent | UseItemIntent | ScenarioActionIntent,
     Field(discriminator="kind"),
 ]
 
@@ -209,8 +216,13 @@ class UseItemCommand(CommandBase):
     effect_ref: Ref
 
 
+class ScenarioActionCommand(CommandBase):
+    kind: Literal["scenario_action"]
+    action_ref: Ref
+
+
 Command = Annotated[
-    AttackCommand | SkillCheckCommand | UseItemCommand,
+    AttackCommand | SkillCheckCommand | UseItemCommand | ScenarioActionCommand,
     Field(discriminator="kind"),
 ]
 
@@ -345,6 +357,40 @@ class TurnResponse(Contract):
         return self
 
 
+class AdventureScene(Contract):
+    scene_ref: Ref
+    title: ShortText
+    description: ShortText
+
+
+class AdventureAction(Contract):
+    action_ref: Ref
+    label: ShortText
+
+
+class AdventureEnding(Contract):
+    ending_ref: Ref
+    title: ShortText
+    summary: ShortText
+
+
+class AdventureState(Contract):
+    scenario_ref: Ref
+    title: ShortText
+    objective: ShortText
+    status: Literal["active", "completed"]
+    current_scene: AdventureScene | None
+    discovered_facts: list[ShortText]
+    available_actions: list[AdventureAction]
+    ending: AdventureEnding | None
+
+
+class CampaignStateResponse(Contract):
+    state_version: NonNegativeInt
+    latest_turn: TurnResponse | None
+    adventure: AdventureState | None = None
+
+
 class RNGMetadata(Contract):
     source: Literal["secure", "seeded_test", "recorded_replay"]
     implementation_version: ShortText
@@ -359,6 +405,13 @@ class DiceRolledPayload(Contract):
 
 class ActionResolvedPayload(Contract):
     result: ActionResult
+
+
+class ScenarioProgressedPayload(Contract):
+    from_scene_id: UUID
+    to_scene_id: UUID | None
+    add_flags: tuple[str, ...]
+    ending_ref: str | None
 
 
 class NarrationGeneratedPayload(Contract):
@@ -416,6 +469,14 @@ class ActionResolvedEvent(ActionEventBase):
     payload: ActionResolvedPayload
 
 
+class ScenarioProgressedEvent(EventBase):
+    type: Literal["ScenarioProgressed"]
+    scene_id: UUID
+    turn_id: UUID
+    action_id: None = None
+    payload: ScenarioProgressedPayload
+
+
 class NarrationGeneratedEvent(EventBase):
     type: Literal["GMNarrationGenerated"]
     scene_id: UUID
@@ -426,7 +487,8 @@ class NarrationGeneratedEvent(EventBase):
 
 DomainEventV1 = Annotated[
     DiceRolledEvent | DamageAppliedEvent | HealingAppliedEvent |
-    ItemConsumedEvent | ActionResolvedEvent | NarrationGeneratedEvent,
+    ItemConsumedEvent | ActionResolvedEvent | ScenarioProgressedEvent |
+    NarrationGeneratedEvent,
     Field(discriminator="type"),
 ]
 ```
@@ -435,7 +497,7 @@ Provider情報はすべてデータであり、ContextFragmentのcontentをsyste
 
 ActionResultのfactsは演出用の公開事実であり、Canonical更新命令ではない。正確なダメージ、回復、在庫消費はEngineの型付きStateChangeに記録する。ApplicationはStateChangeをCanonical mutationとEventへ一度だけ投影し、Infrastructureは保存前値をlock下で照合してSQLへ変換する。ルール固有のイベントpayloadは(type, schema_version)ごとの型レジストリで検証する。HPの上下限、技能一覧、攻撃・アイテム・ダイス規則は [ADR-0007](adr/0007-mvp-ruleset.md) の `mvp_v1` に属する。
 
-DomainEventV1は今回具体化した6種の初期型。ActionResolvedは各Actionの最終結果を表し、DiceRolled、DamageApplied、HealingApplied、ItemConsumedは個別の出来事を表す。ActionResolved内のStateChangeと個別Eventを二重適用しない。MVPではEngineの結果を一度だけCanonicalへ適用し、イベントは記録と表示に使う。PlayerMessageAdded、SceneChanged、WorldFactChanged等は各機能実装時に専用型を追加する。Actionに属さない将来イベントはEventBaseから定義できる。
+DomainEventV1は今回具体化した7種の初期型。ActionResolvedは各Actionの最終結果、ScenarioProgressedは同じMechanical commitで確定したScene、flag、Endingの変化を表す。DiceRolled、DamageApplied、HealingApplied、ItemConsumedは個別の出来事を表す。ActionResolved内のStateChangeと個別Eventを二重適用しない。MVPではEngineの結果とScenario進行を一度だけCanonicalへ適用し、イベントは記録と表示に使う。PlayerMessageAdded、WorldFactChanged等は各機能実装時に専用型を追加する。Actionに属さない将来イベントはEventBaseから定義できる。
 
 ## 3 DBの関連と制約
 
@@ -503,6 +565,22 @@ CREATE TABLE mvp_scene_entities (
     FOREIGN KEY (campaign_id, entity_id) REFERENCES entities(campaign_id, id),
     CONSTRAINT scene_entity_reachable_is_public
         CHECK (NOT is_attack_reachable OR is_public)
+);
+
+-- migration 0009_scenario_progress: version固定のScenario runと獲得済みflag。
+CREATE TABLE mvp_scenario_runs (
+    campaign_id uuid PRIMARY KEY REFERENCES campaigns(id),
+    scenario_ref text NOT NULL CHECK (scenario_ref ~ '^[a-z][a-z0-9_]{0,63}$'),
+    scenario_version integer NOT NULL CHECK (scenario_version > 0),
+    status text NOT NULL CHECK (status IN ('active','completed')),
+    ending_ref text CHECK (ending_ref IS NULL OR ending_ref ~ '^[a-z][a-z0-9_]{0,63}$'),
+    CHECK ((status = 'completed') = (ending_ref IS NOT NULL))
+);
+
+CREATE TABLE mvp_scenario_flags (
+    campaign_id uuid NOT NULL REFERENCES mvp_scenario_runs(campaign_id),
+    flag_ref text NOT NULL CHECK (flag_ref ~ '^[a-z][a-z0-9_]{0,63}$'),
+    PRIMARY KEY (campaign_id, flag_ref)
 );
 
 CREATE TABLE turns (
@@ -585,7 +663,9 @@ CREATE TABLE actions (
     turn_id uuid NOT NULL,
     ordinal integer NOT NULL CHECK (ordinal > 0),
     actor_id uuid NOT NULL,
-    kind text NOT NULL CHECK (kind IN ('attack','skill_check','use_item')),
+    kind text NOT NULL CHECK (
+        kind IN ('attack','skill_check','use_item','scenario_action')
+    ),
     target_id uuid,
     item_id uuid, -- attackではweapon_id、use_itemではitem_idを投影
     schema_version integer NOT NULL DEFAULT 1 CHECK (schema_version > 0),
@@ -669,11 +749,13 @@ COMMIT;
 | Event／Actionを通常のUPDATE／DELETEで変更しない | 追記専用トリガー |
 | committedと確定バージョン・日時が一致する | TurnのCHECK |
 | `is_attack_reachable`のEntityは公開される | `mvp_scene_entities.scene_entity_reachable_is_public` CHECK |
+| 完了runだけがEndingを持つ | `mvp_scenario_runs`のstatus／ending CHECK |
 | payloadの型、JSONと列の一致 | Pydanticの検証＋単一Repositoryの投影処理 |
 | Actorの操作権、Itemの所有、Targetの合法性 | 認証済みprincipalとEngine／Application |
+| Scenario version、現在Scene、登録済み行動、flag条件が一致する | Applicationの型付き定義と進行検証 |
 | Actionのordinalが1から連続する、意図された全件が保存される | 確定処理で1..Nと件数を検証 |
 | 状態遷移、確定済みTurnの解決内容を変更しない | Applicationの条件付きUPDATE。必要に応じDB権限・トリガーを追加 |
-| 状態更新・Action・Event・Turnが同時にcommitされる | 同一DBトランザクションのRepository |
+| 状態更新・Action・Event・Scenario進行・Turnが同時にcommitされる | 同一DBトランザクションのRepository |
 | LLMがDBを書けない | LLMに接続情報や書込toolを渡さない。Application専用接続で仲介 |
 
 FKは認可ではない。会員がactiveか、Actorを操作できるか、Sceneが現在activeかは毎回Applicationで確認する。公開APIからevents.payloadやnarration_inputを丸ごと返さず、認可された公開DTOに変換する。
@@ -681,6 +763,10 @@ FKは認可ではない。会員がactiveか、Actorを操作できるか、Scen
 `mvp_scene_entities` はScene membership、LLMのpublic visibility、粗いattack reachabilityのCanonical relationである。`snapshot(campaign_id, scene_id)` はこのSceneの`scene_entities`を含める。workerは同じ可視集合をLLMの`allowed_entity_refs`、参照解決、公開状態、描写入力に使う。Actor自身とActorが所有するinventory／equipmentは所有権で可視にするが、後者は`actor_private`でありScene-publicにはしない。攻撃対象は`is_public`かつ`is_attack_reachable`で、active refを持つCharacterだけに限る。
 
 migration `0008_scene_entities` はtableと制約だけを追加する。既存deploymentへ過去履歴や現在のEntityからrelation行を推測して作るbackfillは行わない。既存Entityは明示的なrelation行が作られるまで、そのSceneのpublic visibilityやattack reachabilityを得ない。
+
+Scenario定義はversion付きの型付きJSONを正本とし、DBには`mvp_scenario_runs`、`mvp_scenario_flags`、既存の`scenes.status`だけを保存する。定義SceneとCampaign Sceneは一意な`sequence`で対応させる。`ScenarioProgressed`、flag追加、Scene切替またはEnding、Action、Turnは同じMechanical commitで確定し、描写再試行では更新しない。Scenario runを持たない既存Campaignの`CampaignStateResponse.adventure`は`null`になる。
+
+migration `0009_scenario_progress` は一般的なbackfillを行わない。downgradeではrunとflagを削除し、再度upgradeしても失われた進行を復元しない。`0010_scenario_action_kind`のdowngradeは、保存済み`scenario_action`が残っている場合に失敗させる。
 
 履歴トリガーはDB所有者やTRUNCATEへの防御を意味しない。本番用接続は非所有者として必要なSELECT／INSERT／限定UPDATEのみ許可し、DDL／TRUNCATE権限を与えない。ここでGRANT対象ロール名はまだ固定しない。
 
@@ -713,7 +799,7 @@ JSONのCommandにはメタデータがあるが、Engineの中核は型付き引
 1. Campaign行、次にTurn行をFOR UPDATEで取得する。全更新経路でこのロック順を統一する。
 2. すでにcommittedなら既存結果を返す。状態がresolvingで、worker_epochが自身の取得値と一致し、leaseが有効なことを検証する。
 3. 現在のstate_versionが計算元と一致することを確認する。不一致なら結果を破棄し、CONTEXT_CONFLICTとして失敗を記録する。黙って新状態で再ロールしない。
-4. Canonicalが変化する場合だけstate_versionを1増やし、PC等のCanonicalテーブルを更新する。変更がなければ同じversionを使う。
+4. PC等のCanonicalまたはScenario進行が変化する場合だけstate_versionを1増やし、Canonicalテーブル、flag、Scene、runを更新する。同じcommitで両方が変化しても一度だけ増やす。変更がなければ同じversionを使う。
 5. Turnをcommittedへ更新し、committed_at、committed_state_version、描写用の公開スナップショットnarration_inputを保存する。
 6. 順序付きActionと結果を全件INSERTする。トリガーのためTurn確定UPDATEを先に実行するが、外部からはcommitまでどちらも見えない。
 7. campaigns.event_sequenceを必要件数だけ加算し、その範囲でDomain EventsをINSERTする。
@@ -761,7 +847,10 @@ commit後の送信直前に停止しても復旧できるよう、eventsをCampa
 | 二つ目のActionが一つ目の結果で実行不能 | not_applicableを保存しTurnはcommitted |
 | 非公開または到達不能なEntityを攻撃targetにする | 初期plan検証で拒否し、RNG／Engine／Actionを作らない |
 | 初期plan中の一つでも参照・所有・Scene条件が不正 | plan全体を適用せず、先行ActionのRNG／Engine／Actionを作らない |
-| イベントINSERT時にDB例外 | Canonical／Action／Turn確定もrollback |
+| 登録済みScenario action、技能判定、攻撃で進行する | Scene／flag／EndingとScenarioProgressedを同じMechanical commitで確定 |
+| 描写workerを同じTurnで再実行 | ScenarioProgressed、flag、state_versionを追加しない |
+| 完了済みScenarioへ新しいrequest_idを送る | 409 ADVENTURE_COMPLETED、Action追加なし |
+| イベントINSERT時にDB例外 | Canonical／Scenario進行／Action／Turn確定もrollback |
 | commit応答喪失後の再送 | 既存Turnを返し再ロールなし |
 
 このDDLは認可やEngineを含む完成したアプリケーションではない。DB実行検証とトランザクション・競合テストを通してからマイグレーション化する。本文のPythonは構造検証用で、特定LLMプロバイダーが受け付けるJSON Schemaサブセットへの変換はアダプターの責務とする。
