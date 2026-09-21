@@ -29,6 +29,7 @@ from ai_rpg.config import get_settings
 from ai_rpg.contracts import CampaignStateResponse, PlayerTurnInput, TurnResponse
 from ai_rpg.infrastructure.database import create_session_factory
 from ai_rpg.infrastructure.postgres import PostgresAuthorizationPolicy, PostgresUnitOfWork
+from ai_rpg.scenarios import BUILTIN_SCENARIOS
 
 PrincipalProvider = Callable[..., Awaitable[AuthenticatedPrincipal]]
 ApplicationError = (
@@ -139,7 +140,9 @@ def create_app(
                 ),
             )
         if turn_query_service is None:
-            turn_query_service = TurnQueryService(authorization, unit_of_work_factory)
+            turn_query_service = TurnQueryService(
+                authorization, unit_of_work_factory, BUILTIN_SCENARIOS
+            )
         if event_stream_service is None:
             event_stream_service = EventStreamService(
                 authorization, unit_of_work_factory

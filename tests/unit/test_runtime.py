@@ -7,7 +7,24 @@ import pytest
 from ai_rpg.application import RuleBasedTurnRouter, ScenarioProgressor
 from ai_rpg.config import Settings
 from ai_rpg.llm import DevelopmentFakeTransport, OpenAIResponsesTransport
-from ai_rpg.runtime import build_provider_transport, build_resolution_worker
+from ai_rpg.runtime import (
+    DEVELOPMENT_FIXTURE,
+    build_provider_transport,
+    build_resolution_worker,
+)
+
+
+def test_development_fixture_exposes_all_scenario_scenes() -> None:
+    fixture = DEVELOPMENT_FIXTURE
+
+    assert fixture.scene_id == fixture.entrance_scene_id
+    assert len(
+        {
+            fixture.entrance_scene_id,
+            fixture.hall_scene_id,
+            fixture.sanctum_scene_id,
+        }
+    ) == 3
 
 
 @pytest.mark.asyncio

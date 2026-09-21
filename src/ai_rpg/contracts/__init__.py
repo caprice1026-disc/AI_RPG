@@ -11,10 +11,22 @@ from ai_rpg.contracts.llm_decisions import (
     make_decision_types,
 )
 from ai_rpg.contracts.player_turn import ChoiceInput, PlayerTurnInput, TextInput
-from ai_rpg.contracts.responses import CampaignStateResponse, TurnRecovery, TurnResponse
+from ai_rpg.contracts.responses import (
+    AdventureAction,
+    AdventureEnding,
+    AdventureScene,
+    AdventureState,
+    CampaignStateResponse,
+    TurnRecovery,
+    TurnResponse,
+)
 
 __all__ = [
     "ActionIntent",
+    "AdventureAction",
+    "AdventureEnding",
+    "AdventureScene",
+    "AdventureState",
     "AttackIntent",
     "CampaignStateResponse",
     "ChoiceInput",

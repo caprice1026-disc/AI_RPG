@@ -1471,6 +1471,7 @@ def test_oidc_bearer_round_trip_uses_registered_identity_and_campaign_membership
             turn_query_service=TurnQueryService(
                 authorization,
                 unit_of_work_factory,
+                BUILTIN_SCENARIOS,
             ),
             event_stream_service=EventStreamService(
                 authorization,
@@ -4071,7 +4072,9 @@ def test_fake_llm_skill_check_round_trip_reopens_turn_acceptance(
                 unit_of_work_factory,
                 RuntimePolicy(3, 1, 3),
             )
-            query_service = TurnQueryService(authorization, unit_of_work_factory)
+            query_service = TurnQueryService(
+                authorization, unit_of_work_factory, BUILTIN_SCENARIOS
+            )
             principal = AuthenticatedPrincipal(
                 principal_id=UUID(PRINCIPAL_A),
                 issuer="integration-test",
@@ -7498,10 +7501,62 @@ def test_development_fixture_is_idempotent(database: Engine) -> None:
 
     url = database.url.render_as_string(hide_password=False)
     first = seed_development_fixture(url)
+    with database.begin() as connection:
+        connection.execute(
+            text(
+                "UPDATE scenes SET status='closed' "
+                "WHERE campaign_id=:campaign"
+            ),
+            {"campaign": first.campaign_id},
+        )
+        connection.execute(
+            text(
+                "UPDATE mvp_scenario_runs SET status='completed',ending_ref='retreated' "
+                "WHERE campaign_id=:campaign"
+            ),
+            {"campaign": first.campaign_id},
+        )
+        connection.execute(
+            text(
+                "INSERT INTO mvp_scenario_flags(campaign_id,flag_ref) "
+                "VALUES(:campaign,'alerted')"
+            ),
+            {"campaign": first.campaign_id},
+        )
+        connection.execute(
+            text(
+                "UPDATE mvp_characters SET current_hp=3 "
+                "WHERE campaign_id=:campaign AND entity_id=:actor"
+            ),
+            {"campaign": first.campaign_id, "actor": first.actor_id},
+        )
+        connection.execute(
+            text(
+                "UPDATE mvp_inventory SET quantity=1 "
+                "WHERE campaign_id=:campaign AND owner_id=:actor "
+                "AND item_id=:potion"
+            ),
+            {
+                "campaign": first.campaign_id,
+                "actor": first.actor_id,
+                "potion": first.healing_potion_id,
+            },
+        )
     second = seed_development_fixture(url)
 
     assert second == first
     with database.connect() as connection:
+        assert connection.execute(
+            text(
+                "SELECT id,sequence,status FROM scenes "
+                "WHERE campaign_id=:campaign ORDER BY sequence"
+            ),
+            {"campaign": first.campaign_id},
+        ).all() == [
+            (first.entrance_scene_id, 1, "closed"),
+            (first.hall_scene_id, 2, "closed"),
+            (first.sanctum_scene_id, 3, "closed"),
+        ]
         assert set(
             connection.execute(
                 text(
@@ -7510,9 +7565,36 @@ def test_development_fixture_is_idempotent(database: Engine) -> None:
                 )
             )
         ) == {
-            (first.campaign_id, first.scene_id, first.actor_id, True, False),
-            (first.campaign_id, first.scene_id, first.target_id, True, True),
+            *(
+                (first.campaign_id, scene_id, first.actor_id, True, False)
+                for scene_id in (
+                    first.entrance_scene_id,
+                    first.hall_scene_id,
+                    first.sanctum_scene_id,
+                )
+            ),
+            (
+                first.campaign_id,
+                first.sanctum_scene_id,
+                first.target_id,
+                True,
+                True,
+            ),
         }
+        assert connection.execute(
+            text(
+                "SELECT scenario_ref,scenario_version,status,ending_ref "
+                "FROM mvp_scenario_runs WHERE campaign_id=:campaign"
+            ),
+            {"campaign": first.campaign_id},
+        ).one() == ("ruined_chapel", 1, "completed", "retreated")
+        assert connection.execute(
+            text(
+                "SELECT flag_ref FROM mvp_scenario_flags "
+                "WHERE campaign_id=:campaign"
+            ),
+            {"campaign": first.campaign_id},
+        ).scalars().all() == ["alerted"]
         assert connection.scalar(
             text("SELECT count(*) FROM campaigns WHERE id=:id"),
             {"id": first.campaign_id},
@@ -7539,14 +7621,69 @@ def test_development_fixture_is_idempotent(database: Engine) -> None:
             ),
             {"campaign": first.campaign_id, "actor": first.actor_id},
         ).scalar_one() == 2
-        assert connection.execute(
+        assert set(connection.execute(
             text(
-                "SELECT difficulty,public_description FROM mvp_scene_skill_checks "
-                "WHERE campaign_id=:campaign AND scene_id=:scene "
-                "AND check_ref='observe_room'"
+                "SELECT scene_id,skill_ref,difficulty FROM mvp_scene_skill_checks "
+                "WHERE campaign_id=:campaign"
             ),
-            {"campaign": first.campaign_id, "scene": first.scene_id},
-        ).one() == ("normal", "床に新しい足跡が残っている。")
+            {"campaign": first.campaign_id},
+        )) == {
+            (first.hall_scene_id, "perception", "normal"),
+            (first.sanctum_scene_id, "persuasion", "normal"),
+            (first.sanctum_scene_id, "stealth", "normal"),
+        }
+        assert connection.scalar(
+            text(
+                "SELECT current_hp FROM mvp_characters "
+                "WHERE campaign_id=:campaign AND entity_id=:actor"
+            ),
+            {"campaign": first.campaign_id, "actor": first.actor_id},
+        ) == 3
+        assert connection.scalar(
+            text(
+                "SELECT quantity FROM mvp_inventory "
+                "WHERE campaign_id=:campaign AND owner_id=:actor AND item_id=:potion"
+            ),
+            {
+                "campaign": first.campaign_id,
+                "actor": first.actor_id,
+                "potion": first.healing_potion_id,
+            },
+        ) == 1
+
+
+def test_adventure_state_projects_development_fixture(database: Engine) -> None:
+    from ai_rpg.runtime import seed_development_fixture
+
+    url = database.url.render_as_string(hide_password=False)
+    fixture = seed_development_fixture(url)
+
+    async def fetch() -> object:
+        async with _postgres_sessions(url) as factory:
+            service = TurnQueryService(
+                PostgresAuthorizationPolicy(factory),
+                lambda: PostgresUnitOfWork(factory),
+                BUILTIN_SCENARIOS,
+            )
+            principal = AuthenticatedPrincipal(
+                principal_id=fixture.principal_id,
+                issuer="integration-test",
+                subject="development-player",
+                authenticated_at=datetime.now(UTC),
+                auth_context=frozenset(),
+            )
+            return await service.get_campaign_state(principal, fixture.campaign_id)
+
+    with asyncio.Runner(loop_factory=asyncio.SelectorEventLoop) as runner:
+        state = runner.run(fetch())
+
+    assert state.adventure is not None
+    assert state.adventure.objective == "廃礼拝堂の奥から銀の聖印を回収する"
+    assert state.adventure.current_scene is not None
+    assert state.adventure.current_scene.scene_ref == "entrance"
+    assert [action.action_ref for action in state.adventure.available_actions] == [
+        "enter_chapel"
+    ]
 
 
 def test_independent_cli_processes_complete_fake_round_trip(database: Engine) -> None:
@@ -7562,7 +7699,18 @@ def test_independent_cli_processes_complete_fake_round_trip(database: Engine) ->
         capture_output=True,
         text=True,
     )
-    assert json.loads(seed.stdout)["campaign_id"] == str(DEVELOPMENT_FIXTURE.campaign_id)
+    seed_payload = json.loads(seed.stdout)
+    assert seed_payload["campaign_id"] == str(DEVELOPMENT_FIXTURE.campaign_id)
+    assert seed_payload["scene_id"] == str(DEVELOPMENT_FIXTURE.entrance_scene_id)
+    assert seed_payload["principal_id"] == str(DEVELOPMENT_FIXTURE.principal_id)
+    assert seed_payload["actor_id"] == str(DEVELOPMENT_FIXTURE.actor_id)
+    assert seed_payload["entrance_scene_id"] == str(
+        DEVELOPMENT_FIXTURE.entrance_scene_id
+    )
+    assert seed_payload["hall_scene_id"] == str(DEVELOPMENT_FIXTURE.hall_scene_id)
+    assert seed_payload["sanctum_scene_id"] == str(
+        DEVELOPMENT_FIXTURE.sanctum_scene_id
+    )
 
     with socket.socket() as listener:
         listener.bind(("127.0.0.1", 0))
@@ -7611,7 +7759,7 @@ def test_independent_cli_processes_complete_fake_round_trip(database: Engine) ->
                     "request_id": str(request_id),
                     "expected_state_version": 0,
                     "actor_id": str(DEVELOPMENT_FIXTURE.actor_id),
-                    "content": {"kind": "text", "text": "周囲を注意深く観察する"},
+                    "content": {"kind": "text", "text": "礼拝堂に入る"},
                 },
             )
         assert accepted.status_code == 202
@@ -7632,7 +7780,9 @@ def test_independent_cli_processes_complete_fake_round_trip(database: Engine) ->
                 capture_output=True,
                 text=True,
             )
-            assert json.loads(completed.stdout)["processed"] is expected_processed
+            assert (
+                json.loads(completed.stdout)["processed"] is expected_processed
+            ), command
 
         with Client(base_url=base_url) as client:
             response = client.get(
@@ -7641,7 +7791,7 @@ def test_independent_cli_processes_complete_fake_round_trip(database: Engine) ->
         assert response.status_code == 200
         assert response.json()["resolution_status"] == "committed"
         assert response.json()["narration_status"] == "completed"
-        assert response.json()["action_results"][0]["result"]["outcome"] == "success"
+        assert response.json()["action_results"][0]["result"]["outcome"] == "neutral"
         with database.connect() as connection:
             assert connection.scalar(
                 text("SELECT count(*) FROM actions WHERE turn_id=:turn"),

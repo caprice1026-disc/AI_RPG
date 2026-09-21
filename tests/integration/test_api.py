@@ -187,7 +187,28 @@ async def test_get_turn_returns_public_response() -> None:
 async def test_get_campaign_state_returns_authoritative_version_and_latest_turn() -> None:
     turn_service = AsyncMock()
     query_service = AsyncMock()
-    state = CampaignStateResponse(state_version=4, latest_turn=_pending_response())
+    state = CampaignStateResponse.model_validate(
+        {
+            "state_version": 4,
+            "latest_turn": _pending_response(),
+            "adventure": {
+                "scenario_ref": "ruined_chapel",
+                "title": "廃礼拝堂の聖印",
+                "objective": "廃礼拝堂の奥から銀の聖印を回収する",
+                "status": "active",
+                "current_scene": {
+                    "scene_ref": "entrance",
+                    "title": "入口",
+                    "description": "崩れかけた廃礼拝堂の入口に立っている。",
+                },
+                "discovered_facts": [],
+                "available_actions": [
+                    {"action_ref": "enter_chapel", "label": "礼拝堂に入る"}
+                ],
+                "ending": None,
+            },
+        }
+    )
     query_service.get_campaign_state.return_value = state
     app = create_app(
         turn_service=turn_service,
@@ -201,6 +222,7 @@ async def test_get_campaign_state_returns_authoritative_version_and_latest_turn(
 
     assert response.status_code == 200
     assert response.json() == state.model_dump(mode="json")
+    assert response.json()["adventure"]["current_scene"]["scene_ref"] == "entrance"
     principal, campaign_id = query_service.get_campaign_state.await_args.args
     assert principal.principal_id == PRINCIPAL_ID
     assert campaign_id == CAMPAIGN_ID

@@ -114,6 +114,9 @@ def main(argv: Sequence[str] | None = None) -> None:
                 {
                     "campaign_id": str(fixture.campaign_id),
                     "scene_id": str(fixture.scene_id),
+                    "entrance_scene_id": str(fixture.entrance_scene_id),
+                    "hall_scene_id": str(fixture.hall_scene_id),
+                    "sanctum_scene_id": str(fixture.sanctum_scene_id),
                     "principal_id": str(fixture.principal_id),
                     "actor_id": str(fixture.actor_id),
                 }

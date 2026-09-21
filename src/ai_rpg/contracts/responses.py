@@ -10,6 +10,7 @@ from ai_rpg.contracts.common import (
     InputText,
     NarrationText,
     NonNegativeInt,
+    Ref,
     ShortText,
 )
 from ai_rpg.contracts.context import ContextFragment, EntityRef, OutputLimits
@@ -93,8 +94,37 @@ class TurnResponse(Contract):
         return self
 
 
+class AdventureScene(Contract):
+    scene_ref: Ref
+    title: ShortText
+    description: ShortText
+
+
+class AdventureAction(Contract):
+    action_ref: Ref
+    label: ShortText
+
+
+class AdventureEnding(Contract):
+    ending_ref: Ref
+    title: ShortText
+    summary: ShortText
+
+
+class AdventureState(Contract):
+    scenario_ref: Ref
+    title: ShortText
+    objective: ShortText
+    status: Literal["active", "completed"]
+    current_scene: AdventureScene | None
+    discovered_facts: list[ShortText]
+    available_actions: list[AdventureAction]
+    ending: AdventureEnding | None
+
+
 class CampaignStateResponse(Contract):
     """プレイ再開に必要なCampaignの正本versionと最新Turn。"""
 
     state_version: NonNegativeInt
     latest_turn: TurnResponse | None
+    adventure: AdventureState | None = None

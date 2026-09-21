@@ -26,23 +26,33 @@ from ai_rpg.infrastructure.database import create_session_factory
 from ai_rpg.infrastructure.postgres import PostgresUnitOfWork
 from ai_rpg.llm import DevelopmentFakeTransport, OpenAIResponsesTransport
 from ai_rpg.llm.structured import ProviderTransport
-from ai_rpg.scenarios import BUILTIN_SCENARIOS
+from ai_rpg.scenarios import BUILTIN_SCENARIOS, SkillScenarioAction
 
 
 @dataclass(frozen=True, slots=True)
 class DevelopmentFixture:
     campaign_id: UUID
-    scene_id: UUID
+    entrance_scene_id: UUID
+    hall_scene_id: UUID
+    sanctum_scene_id: UUID
     principal_id: UUID
     actor_id: UUID
     target_id: UUID
     weapon_id: UUID
     healing_potion_id: UUID
 
+    @property
+    def scene_id(self) -> UUID:
+        """既存の開発用呼び出し向け入口Scene alias。"""
+
+        return self.entrance_scene_id
+
 
 DEVELOPMENT_FIXTURE = DevelopmentFixture(
     campaign_id=UUID("10000000-0000-0000-0000-000000000001"),
-    scene_id=UUID("10000000-0000-0000-0000-000000000011"),
+    entrance_scene_id=UUID("10000000-0000-0000-0000-000000000011"),
+    hall_scene_id=UUID("10000000-0000-0000-0000-000000000012"),
+    sanctum_scene_id=UUID("10000000-0000-0000-0000-000000000013"),
     principal_id=UUID("10000000-0000-0000-0000-000000000021"),
     actor_id=UUID("10000000-0000-0000-0000-000000000031"),
     target_id=UUID("10000000-0000-0000-0000-000000000032"),
@@ -84,6 +94,12 @@ def seed_development_fixture(database_url: str) -> DevelopmentFixture:
     """Fake一往復に必要な固定fixtureを冪等に投入する。"""
 
     fixture = DEVELOPMENT_FIXTURE
+    scenario = BUILTIN_SCENARIOS.get("ruined_chapel", 1)
+    scene_ids = {
+        1: fixture.entrance_scene_id,
+        2: fixture.hall_scene_id,
+        3: fixture.sanctum_scene_id,
+    }
     engine = create_engine(database_url)
     try:
         with engine.begin() as connection:
@@ -126,25 +142,43 @@ def seed_development_fixture(database_url: str) -> DevelopmentFixture:
             connection.execute(
                 text(
                     "INSERT INTO scenes(id,campaign_id,sequence,status) "
-                    "VALUES(:scene,:campaign,1,'active') "
+                    "VALUES(:scene,:campaign,:sequence,:status) "
                     "ON CONFLICT (id) DO NOTHING"
                 ),
-                {"scene": fixture.scene_id, "campaign": fixture.campaign_id},
+                [
+                    {
+                        "scene": scene_ids[scene.sequence],
+                        "campaign": fixture.campaign_id,
+                        "sequence": scene.sequence,
+                        "status": "active" if scene.sequence == 1 else "planned",
+                    }
+                    for scene in scenario.scenes
+                ],
             )
             connection.execute(
                 text(
                     "INSERT INTO mvp_scene_entities("
                     "campaign_id,scene_id,entity_id,is_public,is_attack_reachable"
-                    ") VALUES(:campaign,:scene,:actor,true,false),"
-                    "(:campaign,:scene,:target,true,true) "
+                    ") VALUES(:campaign,:scene,:entity,true,:reachable) "
                     "ON CONFLICT (campaign_id,scene_id,entity_id) DO NOTHING"
                 ),
-                {
-                    "campaign": fixture.campaign_id,
-                    "scene": fixture.scene_id,
-                    "actor": fixture.actor_id,
-                    "target": fixture.target_id,
-                },
+                [
+                    *(
+                        {
+                            "campaign": fixture.campaign_id,
+                            "scene": scene_id,
+                            "entity": fixture.actor_id,
+                            "reachable": False,
+                        }
+                        for scene_id in scene_ids.values()
+                    ),
+                    {
+                        "campaign": fixture.campaign_id,
+                        "scene": fixture.sanctum_scene_id,
+                        "entity": fixture.target_id,
+                        "reachable": True,
+                    },
+                ],
             )
             connection.execute(
                 text(
@@ -188,21 +222,51 @@ def seed_development_fixture(database_url: str) -> DevelopmentFixture:
                 text(
                     "INSERT INTO mvp_skill_modifiers("
                     "campaign_id,character_id,skill_ref,modifier"
-                    ") VALUES(:campaign,:actor,'perception',2) "
+                    ") VALUES(:campaign,:actor,:skill,2) "
                     "ON CONFLICT (campaign_id,character_id,skill_ref) DO NOTHING"
                 ),
-                {"campaign": fixture.campaign_id, "actor": fixture.actor_id},
+                [
+                    {
+                        "campaign": fixture.campaign_id,
+                        "actor": fixture.actor_id,
+                        "skill": skill_ref,
+                    }
+                    for skill_ref in ("perception", "persuasion", "stealth")
+                ],
             )
             connection.execute(
                 text(
                     "INSERT INTO mvp_scene_skill_checks("
                     "campaign_id,scene_id,check_ref,skill_ref,difficulty,public_description"
-                    ") VALUES("
-                    ":campaign,:scene,'observe_room','perception','normal',"
-                    "'床に新しい足跡が残っている。'"
-                    ") ON CONFLICT (campaign_id,scene_id,check_ref) DO NOTHING"
+                    ") VALUES(:campaign,:scene,:check,:skill,:difficulty,:description) "
+                    "ON CONFLICT (campaign_id,scene_id,check_ref) DO NOTHING"
                 ),
-                {"campaign": fixture.campaign_id, "scene": fixture.scene_id},
+                [
+                    {
+                        "campaign": fixture.campaign_id,
+                        "scene": scene_ids[scene.sequence],
+                        "check": action.action_ref,
+                        "skill": action.skill_ref,
+                        "difficulty": action.check_ref,
+                        "description": action.label,
+                    }
+                    for scene in scenario.scenes
+                    for action in scene.actions
+                    if isinstance(action, SkillScenarioAction)
+                ],
+            )
+            connection.execute(
+                text(
+                    "INSERT INTO mvp_scenario_runs("
+                    "campaign_id,scenario_ref,scenario_version,status,ending_ref"
+                    ") VALUES(:campaign,:scenario,:version,'active',NULL) "
+                    "ON CONFLICT (campaign_id) DO NOTHING"
+                ),
+                {
+                    "campaign": fixture.campaign_id,
+                    "scenario": scenario.scenario_ref,
+                    "version": scenario.version,
+                },
             )
     finally:
         engine.dispose()
