@@ -82,8 +82,13 @@ async def test_play_screen_is_served_with_accessible_core_controls() -> None:
 
     assert response.status_code == 200
     assert response.headers["content-type"].startswith("text/html")
-    assert '<label for="campaign-id">Campaign ID</label>' in response.text
-    assert '<label for="actor-id">Actor ID</label>' in response.text
+    assert '<input id="campaign-id" type="hidden">' in response.text
+    assert '<input id="actor-id" type="hidden">' in response.text
+    assert '<label for="scenario-select">シナリオ</label>' in response.text
+    assert '<label for="preset-select">冒険者のタイプ</label>' in response.text
+    assert '<label for="player-name">冒険者の名前</label>' in response.text
+    assert 'id="start-adventure"' in response.text
+    assert 'id="adventure-list"' in response.text
     assert '<label for="action-text">行動を入力</label>' in response.text
     assert 'id="send-action"' in response.text
     assert 'role="status"' in response.text

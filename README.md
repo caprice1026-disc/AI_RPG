@@ -19,7 +19,7 @@ LLMの創造性と、決定的なゲームルール・永続状態・障害復�
 
 AI_RPGは、LLMにゲーム状態を直接変更させないAI TRPGバックエンドです。LLMはプレイヤー入力から意図を抽出し、確定済み結果を描写します。判定、乱数、HPや在庫の変更、イベント履歴は、型付きのGame EngineとPostgreSQL transactionが担当します。
 
-現在のMVPでは、Fake LLMを使い、固定短編「廃礼拝堂の聖印」を入口から三つの結末まで実PostgreSQL上で進められます。
+現在のMVPでは、ブラウザでシナリオとプリセットPCを選び、固定短編「廃礼拝堂の聖印」を始められます。Fake LLMで入口から三つの結末まで進め、保存済みの冒険一覧から続きを再開できます。
 
 ```text
 プレイヤー入力 → 意図抽出 → 技能判定／攻撃／Scenario進行 → atomic保存 → 結果描写 → 状態表示
@@ -49,7 +49,8 @@ AI_RPGは、LLMにゲーム状態を直接変更させないAI TRPGバックエ�
 - Fake transportによる通常描写とMechanicalへの昇格
 - OpenAI Responses APIのStructured Outputs adapter（object envelope、単発request、暗黙retryなし）
 - 完了済みTurnだけから組み立てる、公開範囲を限定した複数Turn Context
-- Campaignの正本versionと最新Turnを再読込し、通信断後も同じrequestを追跡できる最小プレイ画面
+- UUID入力が不要な冒険の開始、保存済み冒険の再開、DB由来のHP・所持品・履歴表示
+- 開始要求とTurnの送信結果が不明な場合も、同じrequestを再送して追跡するプレイ画面
 - 登録済み参照だけを使う攻撃、HP下限／上限、回復ポーションと在庫消費
 - version付きScenario定義と、探索の成否からScene／公開情報／Endingへ進む固定短編
 - Campaign event sequenceをcursorにしたSSEと、接続失敗時のGET polling fallback
@@ -153,7 +154,7 @@ HTTP statusの意味は次のとおりです。
 
 Discoveryはprocess起動時に取得し、失敗した場合はAPIを起動しません。JWKSは300秒cacheし、未知の`kid`では直近取得から30秒のcooldown経過後に再取得してIssuer側の鍵rotationへ追随します。必要なJWKS取得に接続できない場合は503、既知鍵での署名不一致や更新後も鍵を選択できないtokenは、他の不正credentialと同じ401になります。
 
-`ai-rpg api --dev-principal <UUID>`はOIDCを迂回するローカル開発専用の明示的な起動方法です。通常のAPI起動やworkerへ暗黙適用されません。将来のブラウザログイン／server sessionは同じprincipal契約を生成する別adapterとして追加します。それまではbundled play screenからBearer loginはできず、ローカル開発では`--dev-principal`が必要です。
+`ai-rpg api --dev-principal`はOIDCを迂回するローカル開発専用の明示的な起動方法です。UUIDを省略すると固定の開発principalを使い、`--dev-principal <UUID>`で別の開発principalも指定できます。通常のAPI起動やworkerへ暗黙適用されません。このモードでは接続者を同じプレイヤーとして扱うため、APIを外部公開しないでください。将来のブラウザログイン／server sessionは同じprincipal契約を生成する別adapterとして追加します。それまではbundled play screenからBearer loginはできず、ローカル開発では`--dev-principal`が必要です。
 
 ## Fake LLMで動作を試す
 
@@ -177,24 +178,24 @@ $env:AIRPG_TEST_DATABASE_URL = "postgresql+psycopg://USER:PASSWORD@HOST:PORT/ai_
 
 ### APIとworkerを別processで動かす
 
-実際のprocess分離を試す場合は、テストDBとは別に開発DBを用意します。
+ブラウザで遊ぶ場合は、テストDBとは別に開発DBを用意します。次の作成コマンドは初回だけ実行してください。保存先のvolumeを残せば、コンテナ停止後も冒険を再開できます。
 
 ```powershell
-docker run --rm --name ai-rpg-dev-postgres `
+docker run --name ai-rpg-dev-postgres `
   -e POSTGRES_USER=airpg `
   -e POSTGRES_PASSWORD=airpg `
   -e POSTGRES_DB=airpg `
-  -p 5432:5432 -d postgres:16
+  -v ai-rpg-dev-data:/var/lib/postgresql/data `
+  -p 127.0.0.1:5432:5432 -d postgres:16
 $env:AIRPG_DATABASE_URL = "postgresql+psycopg://airpg:airpg@localhost/airpg"
-.\.venv\Scripts\ai-rpg.exe seed-dev
+.\.venv\Scripts\python.exe -m alembic upgrade head
 ```
 
 続いて3つのPowerShellを開き、同じ`AIRPG_DATABASE_URL`を設定して起動します。
 
 ```powershell
 # Terminal 1: 開発principalを明示したAPI
-.\.venv\Scripts\ai-rpg.exe api `
-  --dev-principal 10000000-0000-0000-0000-000000000021
+.\.venv\Scripts\ai-rpg.exe api --dev-principal
 
 # Terminal 2: 解決worker
 .\.venv\Scripts\ai-rpg.exe resolution-worker --fake
@@ -203,7 +204,13 @@ $env:AIRPG_DATABASE_URL = "postgresql+psycopg://airpg:airpg@localhost/airpg"
 .\.venv\Scripts\ai-rpg.exe narration-worker --fake
 ```
 
-`seed-dev`はCampaign、主人公、ゴブリン、装備、三つのScene、技能条件、`ruined_chapel` runを冪等に作成し、IDをJSONで表示します。再実行しても進行済みのScene、flag、Ending、HP、在庫は開始状態へ戻しません。
+`http://127.0.0.1:8000/`を開き、シナリオ、プリセットPC、名前を選んで「冒険を始める」を押します。CampaignやActorのUUIDを入力する必要はありません。行動候補を押すと入力欄へ文章が入るので、内容を確認して「送信」を押してください。現在地、目的、HP、所持品、発見済み情報は、GMの文章から推測せず保存済みの状態を表示します。
+
+ブラウザを閉じた後は、同じ開発principalで起動し、「保存済みの冒険」の一覧で冒険を選びます。入力と描写の履歴もDBから復元します。古い履歴は追加で読み込めます。完了した冒険は結末と履歴を読み返せ、新しい冒険は別の進行状態として開始します。
+
+APIとworkerは各TerminalのCtrl+Cで停止できます。DBを停止する場合は`docker stop ai-rpg-dev-postgres`、再開する場合は`docker start ai-rpg-dev-postgres`を使います。DB volumeを削除すると保存済みの冒険も失われます。
+
+既存の固定IDを使う開発・検証では、引き続き`ai-rpg seed-dev`を利用できます。このコマンドは固定Campaign、主人公、ゴブリン、装備、三つのScene、技能条件、`ruined_chapel` runを冪等に作成し、IDをJSONで表示します。再実行しても進行済みのScene、flag、Ending、HP、在庫は開始状態へ戻しません。通常のブラウザ開始には不要です。
 
 解決workerはFake LLMで入力を登録済み行動へ対応させ、Engineの判定後にSceneと公開情報を進めます。描写workerは確定済み結果から文章を保存します。各Turnの後に次の入力を送ってください。
 
@@ -220,9 +227,9 @@ $env:AIRPG_DATABASE_URL = "postgresql+psycopg://airpg:airpg@localhost/airpg"
 
 `GET /campaigns/{campaign_id}/state`の`adventure`には、目的、現在Scene、公開済み事実、利用可能な登録済み行動、完了後のEndingが入ります。生の内部flag名や未達条件は返しません。完了後の新規Turnは`409 ADVENTURE_COMPLETED`になります。
 
-ブラウザでは`http://127.0.0.1:8000/`を開き、Campaign IDとActor IDを入力して同じ入力を送れます。開発fixtureは全Sceneで`hero`を公開し、`goblin`は奥の部屋だけで公開かつ攻撃到達可能にします。`iron_sword`と`healing_potion`はhero所有のprivate inventoryです。
+冒険では全Sceneで`hero`を公開し、`goblin`は奥の部屋だけで公開かつ攻撃到達可能にします。`iron_sword`と`healing_potion`はhero所有のprivate inventoryです。
 
-この段階では、シナリオ選択を含む開始・再開画面、実LLMによる短編調整、敵の反撃、ブラウザログインを実装していません。開発fixture、Fake worker、既存の開発用principalで固定短編の進行を検証する範囲です。
+段階2は開始・再開・状態表示までです。実LLMによる短編調整、敵の反撃、ブラウザログインは後続の実装です。Fake workerは登録済み行動に対応する入力を処理しますが、自由な会話や言い換えを理解する実モデルではありません。まず画面の行動候補を使って進めてください。
 
 画面は`GET /campaigns/{campaign_id}/state`から正本のstate versionと最新Turnを取得し、Campaign切替、別タブ更新、reload後に状態を同期します。409時は古い行動を新versionで自動実行せず、再確認を促します。turn ID発行前の確定的な4xx入力エラーではpendingを消し、修正後は新しいrequest IDで送信します。通信断・不明なPOST結果・5xx・turn ID発行後の失敗では、同じrequest IDとbodyを保持して同じ内容だけを再送します。受付済みの`turn_id`が分かっている場合はPOSTせずGET／SSE追跡を再開します。SSEが失敗またはtimeoutした場合はSSEを閉じてGET Pollingだけへ引き継ぎ、古いCampaignや世代の更新は表示しません。開発用principalを指定せずAPIを起動した場合は401を表示し、認証を暗黙に迂回しません。
 

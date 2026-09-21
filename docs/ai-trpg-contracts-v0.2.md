@@ -385,10 +385,27 @@ class AdventureState(Contract):
     ending: AdventureEnding | None
 
 
+class InventoryItem(Contract):
+    item_id: UUID
+    item_ref: Ref | None = None
+    name: ShortText
+    quantity: NonNegativeInt
+    equipped: StrictBool
+
+
+class PlayerState(Contract):
+    actor_id: UUID
+    name: ShortText
+    current_hp: NonNegativeInt
+    max_hp: NonNegativeInt
+    inventory: list[InventoryItem] = Field(default_factory=list)
+
+
 class CampaignStateResponse(Contract):
     state_version: NonNegativeInt
     latest_turn: TurnResponse | None
     adventure: AdventureState | None = None
+    player: PlayerState | None = None
 
 
 class RNGMetadata(Contract):
@@ -860,3 +877,23 @@ commit後の送信直前に停止しても復旧できるよう、eventsをCampa
 ## 9 参照
 
 Pydanticのkindによるunionと未知フィールドの扱いは、公式の[Unions](https://docs.pydantic.dev/latest/concepts/unions/)と[Models](https://docs.pydantic.dev/latest/concepts/models/)に基づく。DBの複合FK・CHECK・UNIQUE・NULLの扱いはPostgreSQL公式の[Constraints](https://www.postgresql.org/docs/current/ddl-constraints.html)を参照。
+
+## 10 段階2の冒険開始と公開状態
+
+冒険の開始・一覧・履歴APIも、既存の認証adapterが返す内部principalを使う。OIDC subjectをゲームデータへ複製せず、payloadでprincipalや初期HPを指定させない。HTTP契約の正本は`src/ai_rpg/contracts/adventures.py`と`responses.py`に置く。
+
+| API | 公開内容 |
+| --- | --- |
+| `GET /adventures/catalog` | シナリオのref/version/title/objectiveと、presetのref/name/description/max_hp |
+| `POST /adventures` | request_id、scenario_ref、scenario_version、preset_ref、player_nameを受け、campaign_idとactor_idを返す |
+| `GET /adventures` | 本人が現在参加し、操作PCを持つ冒険の一覧。開始時刻、名前、シナリオ、進行状態を含む |
+| `GET /campaigns/{campaign_id}/state` | 正本version、最新Turn、公開AdventureState、本人PCのPlayerState |
+| `GET /campaigns/{campaign_id}/history` | 保存済み入力文と公開TurnResponseの時系列ページ |
+
+開始はCampaign、membership、PCと初期所持品、Scene、ScenarioRun、冪等性記録を同じtransactionで保存する。認証principalとrequest_idが同じ再送では、最初に作成したcampaign_idとactor_idを返す。同じrequest_idで開始内容を変更した場合は`409 IDEMPOTENCY_CONFLICT`とし、別の冒険を作らない。PC名は1〜40文字で、空白だけの名前や制御文字を拒否する。
+
+公開状態はCampaignロック下で読み、PCのHPと在庫を描写文から推測しない。NPC能力値、他人の所持品、内部flags、未訪問Sceneの条件は返さない。履歴も認可済みCampaignに限定し、Choice入力は保存されたラベルを表示文として復元する。過去の描写に含まれる数値は当時の記録であり、現在の正本値と区別する。
+
+履歴の`limit`は1〜100、既定値は50。最初のrequestで最新のページを返し、ページ内の`items`は古い順に並べる。各itemは`created_at`、`player_input`、`turn`を持つ。`next_before_turn_id`がnullでなければ、その値を次のrequestの`before_turn_id`に渡して古いページを読む。未完了Turnも含めて返すため、ブラウザは保存済み履歴の表示と進行中Turnの追跡を両立させる。
+
+ブラウザは開始要求の送信前にrequest_idとpayloadを保存する。通信結果が不明なら同じ要求を再送し、受付を確認するまで別の開始要求を作らない。Turnの既存の再送・409再確認規約も維持する。段階2の行動候補はラベルを既存のtext入力へ渡す補助機能であり、サーバー側の進行条件・権限検証を省略しない。登録済みactionへの直接bindingは後続段階とする。
