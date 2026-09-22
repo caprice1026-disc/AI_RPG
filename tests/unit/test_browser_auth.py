@@ -12,6 +12,7 @@ import jwt
 import pytest
 from cryptography.hazmat.primitives.asymmetric import rsa
 from fastapi import HTTPException, Request
+from tests.integration.test_api import _public_event
 
 from ai_rpg.api.app import create_app
 from ai_rpg.api.auth import OidcConfiguration, OidcJwtVerifier
@@ -273,3 +274,27 @@ async def test_public_client_can_use_keycloak_metadata_without_none_method():
             response = await ui.get("/auth/login")
             assert response.status_code == 303
             assert parse_qs(urlsplit(response.headers["location"]).query)["client_id"] == ["public"]
+
+
+@pytest.mark.asyncio
+async def test_open_sse_stops_when_identity_is_disabled_during_poll(setup_auth):
+    setup = setup_auth
+    count = 0
+
+    async def poll(*args):
+        nonlocal count
+        count += 1
+        if count > 1:
+            setup.store.disabled = True
+        return (_public_event(count),)
+
+    app = create_app(principal_provider=setup.auth, browser_auth=setup.auth,
+                     event_stream_service=SimpleNamespace(poll=poll), event_poll_seconds=0)
+    async with setup.client, httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url=ORIGIN,
+    ) as client:
+        await login(client, setup)
+        response = await client.get(f"/campaigns/{uuid4()}/events")
+        assert response.status_code == 200
+        assert "id: 1\n" in response.text
+        assert "id: 2\n" not in response.text

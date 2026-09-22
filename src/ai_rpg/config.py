@@ -89,7 +89,17 @@ class Settings(BaseSettings):
     @field_validator("auth_app_origin")
     @classmethod
     def normalize_app_origin(cls, value: str | None) -> str | None:
-        return value.rstrip("/") if value is not None else None
+        if value is None:
+            return None
+        # Validate before normalizing so userinfo/path are not silently discarded.
+        # The model validator separately enforces the explicit loopback opt-in.
+        validate_auth_url(value, allow_loopback=True, origin=True)
+        parsed = urlsplit(value)
+        host = (parsed.hostname or "").encode("idna").decode("ascii")
+        authority = f"[{host}]" if ":" in host else host
+        if parsed.port is not None and parsed.port != {"http": 80, "https": 443}[parsed.scheme]:
+            authority += f":{parsed.port}"
+        return f"{parsed.scheme}://{authority}"
 
     @model_validator(mode="before")
     @classmethod

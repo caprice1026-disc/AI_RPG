@@ -48,7 +48,7 @@ callback失敗、provider不通、未登録、logout、CSRF/Origin、Bearer互�
 
 ## Task 3: 少人数試遊の受け渡しとフィードバック
 
-説明なしで開始できる短いonboarding、開始/継続/結末と再挑戦、困った場面・意図違い・待ち時間の任意フィードバックを用意する。個人情報の不要な送信を避け、本人の冒険にだけ記録できるAPIと管理CLIのexportを最小構成で追加する。段階5の試遊手順、登録・失効・必要設定・未検証範囲をdocsへ記す。既存IdP指定がなければローカルIdPで本物のcode flowを確認する。
+説明なしで開始できる短いonboarding、開始/継続/結末と再挑戦、困った場面・意図違い・待ち時間の任意フィードバックを用意する。感想は画面上の自由記入欄からテキストファイルに保存する方式とし、収集専用DB/APIを増やさない。秘密値・subject・会話全文を自動添付しない。段階5の試遊手順、登録・失効・必要設定・未検証範囲をdocsへ記す。既存IdP指定がなければローカルIdPで本物のcode flowを確認する。
 
 ## Task 4: Vueのリッチな画面へ移行
 
@@ -57,6 +57,8 @@ ImageGenでゲーム画面conceptと礼拝堂artを作成し、Vue 3/Vite/TypeSc
 開始/再開、HP/在庫/目的/発見、履歴、選択肢、自由入力、戦闘反撃、結末、ログイン/失効/再送/feedbackを移植する。通信応答喪失・reload・古い応答・401・409・二重送信をVueテストで実行する。既存play-stateの回復規約を再利用し、互換テストを維持/移植してから旧HTMLを廃止する。
 
 frontend/にsourceとpackage-lockを置き、build済assetはFastAPI static配下へ同梱する。Python単独のインストールでも画面を表示できる。Node依存はfrontend開発時だけ必要。型検証・component tests・buildを確認する。
+
+実装分担: frontend/とVueテストをsubagent、FastAPIのstatic配信・旧画面削除判断・docs・実ブラウザをmainが担当する。build先はsrc/ai_rpg/api/static/vue、baseは/static/vue/。UIに表示する冒険・数値・候補はAPIの実データのみ。conceptの架空の冒険名は採用しない。
 
 ## Task 5: 実ブラウザ試遊、改善、統合
 

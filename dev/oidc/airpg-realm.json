@@ -21,6 +21,7 @@
   "users": [{
     "id": "00000000-0000-0000-0000-000000000501",
     "username": "adventurer",
+    "email": "adventurer@example.invalid",
     "enabled": true,
     "emailVerified": true,
     "firstName": "Local",
@@ -29,6 +30,7 @@
   }, {
     "id": "00000000-0000-0000-0000-000000000502",
     "username": "unregistered",
+    "email": "unregistered@example.invalid",
     "enabled": true,
     "emailVerified": true,
     "firstName": "Local",

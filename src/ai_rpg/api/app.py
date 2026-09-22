@@ -370,7 +370,9 @@ def create_app(
                         )
                     except AuthorizationError:
                         return
-                    if credential_expired():
+                    if credential_expired() or (
+                        browser_auth is not None and not await browser_auth.stream_is_valid(request)
+                    ):
                         return
                 emitted = False
                 for event in events:

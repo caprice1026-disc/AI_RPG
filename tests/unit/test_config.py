@@ -200,3 +200,15 @@ def test_browser_auth_only_allows_explicit_loopback_http() -> None:
 
 def test_browser_auth_is_opt_in() -> None:
     assert not Settings().browser_auth_enabled
+
+
+@pytest.mark.parametrize(("origin", "canonical"), [
+    ("HTTPS://GAME.EXAMPLE:443/", "https://game.example"),
+    ("https://game.example:8443", "https://game.example:8443"),
+    ("http://LOCALHOST:80", "http://localhost"),
+    ("http://[::1]:8035", "http://[::1]:8035"),
+])
+def test_browser_origin_matches_browser_serialization(origin, canonical):
+    settings = Settings(auth_client_id="web", auth_app_origin=origin,
+                        auth_allow_insecure_loopback=True)
+    assert settings.auth_app_origin == canonical
