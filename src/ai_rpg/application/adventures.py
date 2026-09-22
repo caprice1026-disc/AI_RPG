@@ -49,7 +49,7 @@ class AdventureService:
         self._store = store
 
     def catalog(self) -> AdventureCatalogResponse:
-        scenario = BUILTIN_SCENARIOS.get("ruined_chapel", 1)
+        scenario = BUILTIN_SCENARIOS.get("ruined_chapel", 2)
         return AdventureCatalogResponse(
             scenarios=[
                 ScenarioSummary(

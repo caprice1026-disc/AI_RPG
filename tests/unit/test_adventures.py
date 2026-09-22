@@ -50,9 +50,9 @@ async def test_catalog_exposes_only_public_scenario_and_preset_fields() -> None:
     assert data["scenarios"] == [
         {
             "scenario_ref": "ruined_chapel",
-            "scenario_version": 1,
+            "scenario_version": 2,
             "title": "廃礼拝堂の聖印",
-            "objective": "廃礼拝堂の奥から銀の聖印を回収する",
+            "objective": "廃礼拝堂の銀の聖印を回収し、村の共同庫へ持ち帰る",
         }
     ]
     assert {p["preset_ref"] for p in data["presets"]} == {"scout", "guardian"}
@@ -80,7 +80,7 @@ def test_invalid_player_name_is_rejected(name: str) -> None:
     [
         {"preset_ref": "wizard"},
         {"scenario_ref": "unknown"},
-        {"scenario_version": 2},
+        {"scenario_version": 999},
         {"principal_id": str(uuid4())},
         {"current_hp": 999},
         {"player_name": " "},

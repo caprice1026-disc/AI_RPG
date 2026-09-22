@@ -167,9 +167,7 @@ def test_scenario_definition_accepts_conditional_ending_override() -> None:
     [(0, 0), (1, 0), (1, 1)],
     ids=["direct", "skill", "attack"],
 )
-def test_scenario_action_conditions_are_typed_tuples(
-    scene_index: int, action_index: int
-) -> None:
+def test_scenario_action_conditions_are_typed_tuples(scene_index: int, action_index: int) -> None:
     payload = valid_payload()
     action = payload["scenes"][scene_index]["actions"][action_index]
     action["required_flags"] = ["found"]
@@ -260,9 +258,7 @@ def test_scenario_definition_rejects_invalid_ending_override(change: str) -> Non
 
 
 def test_ruined_chapel_json_is_a_package_resource() -> None:
-    resource = (
-        files("ai_rpg.scenarios").joinpath("ruined_chapel.json").read_text(encoding="utf-8")
-    )
+    resource = files("ai_rpg.scenarios").joinpath("ruined_chapel.json").read_text(encoding="utf-8")
     assert json.loads(resource)["scenario_ref"] == "ruined_chapel"
 
 
@@ -293,3 +289,96 @@ def test_scenario_definition_rejects_invalid_graph(change: str) -> None:
     payload = invalid_payload(change)
     with pytest.raises(ValidationError):
         ScenarioDefinition.model_validate(payload)
+
+
+def combat_payload() -> dict[str, Any]:
+    payload = valid_payload()
+    payload["scenes"][1]["npc_notes"] = ["The guard is standing by the door."]
+    payload["scenes"][1]["combat"] = {
+        "enemy_ref": "guard",
+        "started_flag": "blocked",
+        "defeat_ending_ref": "retreated",
+        "damage_expression": "1d4",
+    }
+    return payload
+
+
+def test_existing_scenes_default_to_no_combat_or_npc_notes() -> None:
+    scenario = BUILTIN_SCENARIOS.get("ruined_chapel", 1)
+    for scene in scenario.scenes:
+        assert scene.npc_notes == ()
+        assert scene.combat is None
+
+
+@pytest.mark.parametrize("damage_expression", ["1d4", "1d6"])
+def test_scenario_accepts_bounded_combat_and_public_npc_notes(damage_expression: str) -> None:
+    payload = combat_payload()
+    payload["scenes"][1]["combat"]["damage_expression"] = damage_expression
+
+    scene = ScenarioDefinition.model_validate(payload).scenes[1]
+
+    assert scene.npc_notes == ("The guard is standing by the door.",)
+    assert scene.combat is not None
+    assert scene.combat.enemy_ref == "guard"
+    assert scene.combat.started_flag == "blocked"
+    assert scene.combat.defeat_ending_ref == "retreated"
+    assert scene.combat.damage_expression == damage_expression
+    assert scene.combat.damage_bonus == 0
+
+
+@pytest.mark.parametrize(
+    ("field", "message"),
+    [
+        ("enemy_ref", "Combat enemy"),
+        ("started_flag", "Combat started_flag"),
+        ("defeat_ending_ref", "Combat defeat_ending_ref"),
+    ],
+)
+def test_scenario_rejects_unknown_combat_references(field: str, message: str) -> None:
+    payload = combat_payload()
+    payload["scenes"][1]["combat"][field] = "missing"
+
+    with pytest.raises(ValidationError, match=message):
+        ScenarioDefinition.model_validate(payload)
+
+
+def test_combat_enemy_must_match_an_attack_in_its_own_scene() -> None:
+    payload = combat_payload()
+    payload["scenes"][0]["combat"] = payload["scenes"][1].pop("combat")
+
+    with pytest.raises(ValidationError, match="Combat enemy"):
+        ScenarioDefinition.model_validate(payload)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("enemy_ref", "Invalid Ref"),
+        ("started_flag", "Invalid Ref"),
+        ("defeat_ending_ref", "Invalid Ref"),
+        ("damage_expression", "1d20"),
+        ("damage_expression", "1d4+2"),
+        ("damage_bonus", -1),
+        ("damage_bonus", True),
+        ("damage_bonus", "1"),
+    ],
+)
+def test_scenario_rejects_unbounded_combat_values(field: str, value: Any) -> None:
+    payload = combat_payload()
+    payload["scenes"][1]["combat"][field] = value
+
+    with pytest.raises(ValidationError) as error:
+        ScenarioDefinition.model_validate(payload)
+
+    assert error.value.errors()[0]["loc"] == ("scenes", 1, "combat", field)
+
+
+@pytest.mark.parametrize("note", ["", "x" * 501])
+def test_scenario_npc_notes_are_short_text(note: str) -> None:
+    payload = valid_payload()
+    payload["scenes"][0]["npc_notes"] = [note]
+
+    with pytest.raises(ValidationError) as error:
+        ScenarioDefinition.model_validate(payload)
+
+    assert error.value.errors()[0]["loc"] == ("scenes", 0, "npc_notes", 0)

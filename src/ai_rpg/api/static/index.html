@@ -287,12 +287,17 @@
       <div class="public-state">
         <h3>冒険者</h3><p id="player-value">—</p>
         <h3>HP</h3><p id="hp-value">—</p>
+        <section id="combat" hidden aria-labelledby="enemy-heading" aria-live="polite">
+          <h3 id="enemy-heading">敵</h3>
+          <p id="combat-status"></p><p id="enemy-name"></p>
+          <h3>敵のHP</h3><p id="enemy-hp"></p>
+        </section>
         <h3>持ち物</h3><ul id="inventory-list" class="public-list"></ul>
         <h3>現在地</h3><p id="scene-title">—</p><p id="scene-description" class="hint"></p>
         <h3>目的</h3><p id="objective-value">—</p>
         <h3>発見</h3><ul id="facts-list" class="public-list"></ul>
         <h3 id="actions-heading">行動候補</h3>
-        <p id="actions-hint" class="hint">候補を選ぶと入力欄に入ります。内容を確認して「送信」を押してください。</p>
+        <p id="actions-hint" class="hint">候補を選ぶと、その行動を送信します。</p>
         <div id="available-actions" class="choices" role="group" aria-labelledby="actions-heading" aria-describedby="actions-hint"></div>
         <section id="ending" class="recovery" hidden aria-labelledby="ending-title">
           <h3 id="ending-title"></h3><p id="ending-summary"></p>
@@ -323,7 +328,8 @@
       "scenario-description", "preset-description", "start-status", "retry-start",
       "refresh-adventures", "adventure-list", "adventures-status", "load-history", "story-heading",
       "player-value", "hp-value", "inventory-list", "scene-title", "scene-description",
-      "objective-value", "facts-list", "available-actions", "ending", "ending-title", "ending-summary"
+      "objective-value", "facts-list", "available-actions", "ending", "ending-title", "ending-summary",
+      "combat", "combat-status", "enemy-name", "enemy-hp"
     ].map(id => [id, document.getElementById(id)]));
 
     const labels = {
@@ -379,7 +385,7 @@
       const pending = AiRpgPending.load(localStorage);
       document.querySelectorAll(".choice").forEach(button => {
         if (button.dataset.turnId) button.disabled = blocked || button.dataset.turnId !== latestTurnId;
-        if (button.dataset.action) button.disabled = blocked;
+        if (button.dataset.action) button.disabled = blocked || !!pending;
         if (button.dataset.requestId && (button.dataset.requestId !== pending?.body.request_id ||
             button.dataset.campaignId !== pending?.campaignId)) button.disabled = true;
       });
@@ -508,6 +514,11 @@
       ui["story-heading"].textContent = adventure?.title || "物語";
       ui["player-value"].textContent = player?.name || "—";
       ui["hp-value"].textContent = player ? `${player.current_hp} / ${player.max_hp}` : "—";
+      const combat = adventureCompleted ? null : adventure?.combat;
+      ui.combat.hidden = !combat;
+      ui["combat-status"].textContent = combat ? (combat.active ? "戦闘中" : "戦闘なし") : "";
+      ui["enemy-name"].textContent = combat?.enemy_name || "";
+      ui["enemy-hp"].textContent = combat ? `${combat.current_hp} / ${combat.max_hp}` : "";
       ui["scene-title"].textContent = adventure?.current_scene?.title || "—";
       ui["scene-description"].textContent = adventure?.current_scene?.description || "";
       ui["objective-value"].textContent = adventure?.objective || "—";
@@ -522,6 +533,7 @@
           ui[id].append(item);
         }
       }
+      for (const button of ui["available-actions"].children) button.disabled = true;
       ui["available-actions"].replaceChildren();
       const selection = selectionGeneration;
       const version = stateVersion;
@@ -533,8 +545,7 @@
         button.textContent = action.label;
         button.addEventListener("click", () => {
           if (button.disabled || selection !== selectionGeneration || version !== stateVersion) return;
-          ui["action-text"].value = action.label;
-          ui["action-text"].focus();
+          return submitTurn({ kind: "scenario_action", action_ref: action.action_ref }, action.label);
         });
         ui["available-actions"].append(button);
       }
@@ -760,21 +771,32 @@
       return nodes;
     }
 
+    function resultBox(result) {
+      const lines = [];
+      if (result.facts) lines.push(...result.facts);
+      if (result.dice) {
+        for (const die of result.dice) {
+          lines.push(`${die.expression}: ${die.rolls.join(", ")} ${die.modifier >= 0 ? "+" : ""}${die.modifier} = ${die.total}`);
+        }
+      }
+      if (result.reason) lines.push(`適用なし: ${result.reason}`);
+      const box = document.createElement("div");
+      box.className = "result-box";
+      box.textContent = lines.join("\n") || "判定結果が確定しました。";
+      return box;
+    }
+
     function renderTurnOutput(turn, target) {
       for (const action of turn.action_results || []) {
-        const result = action.result;
-        const lines = [];
-        if (result.facts) lines.push(...result.facts);
-        if (result.dice) {
-          for (const die of result.dice) {
-            lines.push(`${die.expression}: ${die.rolls.join(", ")} ${die.modifier >= 0 ? "+" : ""}${die.modifier} = ${die.total}`);
-          }
-        }
-        if (result.reason) lines.push(`適用なし: ${result.reason}`);
-        const box = document.createElement("div");
-        box.className = "result-box";
-        box.textContent = lines.join("\n") || "判定結果が確定しました。";
-        addMessage("RESULT", "system", box, "", target);
+        addMessage("RESULT", "system", resultBox(action.result), "", target);
+      }
+      if (turn.enemy_reactions?.length) {
+        const section = document.createElement("section");
+        const heading = document.createElement("h3");
+        heading.textContent = "敵の反撃";
+        section.append(heading);
+        for (const reaction of turn.enemy_reactions) section.append(resultBox(reaction.result));
+        addMessage("RESULT", "system", section, "", target);
       }
       if (turn.narration) addMessage("GM", "gm", turn.narration, "", target);
       if (turn.choices?.length) {
@@ -1104,6 +1126,11 @@
         }
         if (knownVersion !== null && current.state_version !== knownVersion) {
           showError("世界の状態が更新されました。行動内容を確認してから再送してください。");
+          return;
+        }
+        if (content.kind === "scenario_action" &&
+            !current.adventure?.available_actions?.some(action => action.action_ref === content.action_ref)) {
+          showError("その行動は現在利用できません。最新の行動候補から選び直してください。");
           return;
         }
         const draft = AiRpgPending.create({

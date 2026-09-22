@@ -10,7 +10,13 @@ from ai_rpg.application.narration_grounding import (
 )
 from ai_rpg.contracts.context import EntityRef, OutputLimits
 from ai_rpg.contracts.responses import MechanicalNarrationDraft, MechanicalNarrationInput
-from ai_rpg.domain.results import AppliedResult, DiceResult, ResolvedAction
+from ai_rpg.domain.results import (
+    AppliedResult,
+    DamageApplied,
+    DiceResult,
+    ResolvedAction,
+    ResolvedEnemyReaction,
+)
 
 
 def _source() -> MechanicalNarrationInput:
@@ -73,3 +79,44 @@ def test_grounding_does_not_trust_numbers_claimed_by_player() -> None:
 
     with pytest.raises(NarrationGroundingError):
         validate_mechanical_narration(source, draft)
+
+
+def _source_with_reaction() -> MechanicalNarrationInput:
+    reaction = ResolvedEnemyReaction(
+        reaction_id=UUID(int=424242),
+        actor_id=UUID(int=313131),
+        target_id=UUID(int=212121),
+        result=AppliedResult(
+            kind="applied", outcome="success", facts=["The enemy dealt 8 damage"],
+            dice=[],
+            state_changes=[DamageApplied(
+                kind="damage_applied", target_id=UUID(int=212121),
+                amount=8, hp_before=17, hp_after=9,
+            )],
+        ),
+    )
+    return _source().model_copy(update={"enemy_reactions": [reaction]})
+
+
+def test_grounding_accepts_saved_reaction_damage_and_hp() -> None:
+    validate_mechanical_narration(
+        _source_with_reaction(),
+        MechanicalNarrationDraft(
+            narration="@goblin retaliated for 8 damage; HP dropped from 17 to 9.", choices=[],
+        ),
+    )
+
+
+@pytest.mark.parametrize("narration", [
+    "The enemy dealt 99 damage.",
+    "The reaction identifier grants 424242 damage.",
+    "Actor 313131 retaliated.",
+    "Target 212121 was hit.",
+    "@dragon retaliated for 8 damage.",
+    "00000000-0000-0000-0000-000000067932 retaliated for 8 damage.",
+])
+def test_reaction_grounding_rejects_invented_numbers_ids_and_unknown_refs(narration: str) -> None:
+    with pytest.raises(NarrationGroundingError):
+        validate_mechanical_narration(
+            _source_with_reaction(), MechanicalNarrationDraft(narration=narration, choices=[]),
+        )

@@ -70,9 +70,7 @@ class MvpV1Ruleset:
             raise ValueError("攻撃対象は行動不能です")
 
         attack_modifier = (
-            f"+{command.attack_bonus}"
-            if command.attack_bonus >= 0
-            else str(command.attack_bonus)
+            f"+{command.attack_bonus}" if command.attack_bonus >= 0 else str(command.attack_bonus)
         )
         attack_roll = self.dice.roll(f"1d20{attack_modifier}")
         if attack_roll.total < target.defense:
@@ -129,7 +127,10 @@ class MvpV1Ruleset:
         return AppliedResult(
             kind="applied",
             outcome="success",
-            facts=[f"回復ポーションで{healing_roll.total}回復した"],
+            facts=[
+                f"回復ポーションでHPが{hp_after - target.current_hp}回復した"
+                f"（{target.current_hp}→{hp_after}）"  # noqa: RUF001
+            ],
             dice=[healing_roll],
             state_changes=[
                 HealingApplied(

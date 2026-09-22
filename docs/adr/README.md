@@ -17,6 +17,7 @@
 | [0011](0011-scene-entity-scope.md) | Scene entityの公開範囲と攻撃到達可能性 |
 | [0012](0012-scenario-definitions-and-progress.md) | Scenario定義と実行状態の分離 |
 | [0013](0013-pydantic-ai-orchestration.md) | 用途別Pydantic AI Agentとモデル切替 |
+| [0014](0014-registered-actions-and-enemy-reactions.md) | 登録済み行動の直接実行と敵の反撃 |
 
 ## 共通方針
 

@@ -5,7 +5,7 @@ from uuid import UUID
 
 from pydantic import Field
 
-from ai_rpg.contracts.common import Contract, InputText, NonNegativeInt
+from ai_rpg.contracts.common import Contract, InputText, NonNegativeInt, Ref
 
 
 class TextInput(Contract):
@@ -18,7 +18,14 @@ class ChoiceInput(Contract):
     choice_id: UUID
 
 
-PlayerContent: TypeAlias = Annotated[TextInput | ChoiceInput, Field(discriminator="kind")]
+class ScenarioActionInput(Contract):
+    kind: Literal["scenario_action"]
+    action_ref: Ref
+
+
+PlayerContent: TypeAlias = Annotated[
+    TextInput | ChoiceInput | ScenarioActionInput, Field(discriminator="kind")
+]
 
 
 class PlayerTurnInput(Contract):

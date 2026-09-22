@@ -19,6 +19,7 @@ from ai_rpg.contracts import (
     CampaignStateResponse,
     TurnResponse,
 )
+from ai_rpg.contracts.responses import AdventureCombatState
 from ai_rpg.scenarios import ScenarioCatalog
 
 
@@ -45,9 +46,7 @@ class TurnQueryService:
         campaign_id: UUID,
         turn_id: UUID,
     ) -> TurnResponse:
-        if not await self._authorization.can_access_campaign(
-            principal.principal_id, campaign_id
-        ):
+        if not await self._authorization.can_access_campaign(principal.principal_id, campaign_id):
             raise AuthorizationError("Campaignを参照する権限がありません")
         async with self._unit_of_work_factory() as unit_of_work:
             response = await unit_of_work.turns.get_response(campaign_id, turn_id)
@@ -61,9 +60,7 @@ class TurnQueryService:
         principal: AuthenticatedPrincipal,
         campaign_id: UUID,
     ) -> CampaignStateResponse:
-        if not await self._authorization.can_access_campaign(
-            principal.principal_id, campaign_id
-        ):
+        if not await self._authorization.can_access_campaign(principal.principal_id, campaign_id):
             raise AuthorizationError("Campaignを参照する権限がありません")
         async with self._unit_of_work_factory() as unit_of_work:
             response = await unit_of_work.turns.get_campaign_state(
@@ -71,9 +68,47 @@ class TurnQueryService:
             )
             scenario = await unit_of_work.scenarios.snapshot(campaign_id)
             if scenario is not None:
-                response = response.model_copy(
-                    update={"adventure": self._adventure_state(scenario)}
-                )
+                adventure = self._adventure_state(scenario)
+                if scenario.status == "active":
+                    combat = self._scenario_progressor.scene_for(scenario).combat
+                    if combat is not None:
+                        active = next(s for s in scenario.scenes if s.status == "active")
+                        canonical = await unit_of_work.canonical.snapshot(campaign_id, active.id)
+                        public_ids = {
+                            r["entity_id"] for r in canonical.scene_entities if r["is_public"]
+                        }
+                        enemy = next(
+                            (
+                                e
+                                for e in canonical.entities
+                                if e["ref"] == combat.enemy_ref
+                                and e["kind"] == "npc"
+                                and e["archived_at"] is None
+                                and e["id"] in public_ids
+                            ),
+                            None,
+                        )
+                        character = next(
+                            (
+                                c
+                                for c in canonical.characters
+                                if enemy is not None and c["entity_id"] == enemy["id"]
+                            ),
+                            None,
+                        )
+                        if enemy is not None and character is not None:
+                            adventure = adventure.model_copy(
+                                update={
+                                    "combat": AdventureCombatState(
+                                        enemy_ref=combat.enemy_ref,
+                                        enemy_name=str(enemy["label"]),
+                                        current_hp=int(str(character["current_hp"])),
+                                        max_hp=int(str(character["max_hp"])),
+                                        active=combat.started_flag in scenario.flags,
+                                    )
+                                }
+                            )
+                response = response.model_copy(update={"adventure": adventure})
             await unit_of_work.commit()
         return response
 
@@ -86,9 +121,7 @@ class TurnQueryService:
         if snapshot.status == "active":
             context = self._scenario_progressor.public_context_for(snapshot)
             active = next(scene for scene in snapshot.scenes if scene.status == "active")
-            scene = next(
-                scene for scene in definition.scenes if scene.sequence == active.sequence
-            )
+            scene = next(scene for scene in definition.scenes if scene.sequence == active.sequence)
             current_scene = AdventureScene(
                 scene_ref=scene.scene_ref,
                 title=context.scene_title,
@@ -102,9 +135,7 @@ class TurnQueryService:
             status = "active"
         elif snapshot.status == "completed":
             discovered_facts = [
-                flag.public_fact
-                for flag in definition.flags
-                if flag.flag_ref in snapshot.flags
+                flag.public_fact for flag in definition.flags if flag.flag_ref in snapshot.flags
             ]
             ending_definition = next(
                 (

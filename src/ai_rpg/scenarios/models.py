@@ -4,7 +4,7 @@ from typing import Annotated, Literal, Self, TypeAlias
 
 from pydantic import Field, model_validator
 
-from ai_rpg.contracts.common import Contract, PositiveInt, Ref, ShortText
+from ai_rpg.contracts.common import Contract, NonNegativeInt, PositiveInt, Ref, ShortText
 
 SUPPORTED_SKILL_REFS = frozenset({"perception", "persuasion", "stealth"})
 
@@ -58,12 +58,22 @@ ScenarioActionDefinition: TypeAlias = Annotated[
 ]
 
 
+class ScenarioCombatDefinition(Contract):
+    enemy_ref: Ref
+    started_flag: Ref
+    defeat_ending_ref: Ref
+    damage_expression: Literal["1d4", "1d6"]
+    damage_bonus: NonNegativeInt = 0
+
+
 class SceneDefinition(Contract):
     scene_ref: Ref
     sequence: PositiveInt
     title: ShortText
     description: ShortText
     actions: tuple[ScenarioActionDefinition, ...]
+    npc_notes: tuple[ShortText, ...] = ()
+    combat: ScenarioCombatDefinition | None = None
 
 
 class ScenarioFlagDefinition(Contract):
@@ -110,6 +120,18 @@ class ScenarioDefinition(Contract):
         known_flags = set(flag_refs)
         known_endings = set(ending_refs)
         for scene in self.scenes:
+            if scene.combat is not None:
+                combat = scene.combat
+                if not any(
+                    isinstance(action, AttackScenarioAction)
+                    and action.target_ref == combat.enemy_ref
+                    for action in scene.actions
+                ):
+                    raise ValueError("Combat enemy must match an attack target in the same scene")
+                if combat.started_flag not in known_flags:
+                    raise ValueError("Combat started_flag references an unknown flag")
+                if combat.defeat_ending_ref not in known_endings:
+                    raise ValueError("Combat defeat_ending_ref references an unknown ending")
             for action in scene.actions:
                 required_flags = set(action.required_flags)
                 disabled_flags = set(action.disabled_flags)

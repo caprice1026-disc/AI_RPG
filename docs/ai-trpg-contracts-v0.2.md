@@ -57,7 +57,14 @@ class ChoiceInput(Contract):
     choice_id: UUID
 
 
-PlayerContent = Annotated[TextInput | ChoiceInput, Field(discriminator="kind")]
+class ScenarioActionInput(Contract):
+    kind: Literal["scenario_action"]
+    action_ref: Ref
+
+
+PlayerContent = Annotated[
+    TextInput | ChoiceInput | ScenarioActionInput, Field(discriminator="kind")
+]
 
 
 class PlayerTurnInput(Contract):
@@ -290,10 +297,18 @@ class ResolvedAction(Contract):
     result: ActionResult
 
 
+class ResolvedEnemyReaction(Contract):
+    reaction_id: UUID
+    actor_id: UUID
+    target_id: UUID
+    result: AppliedResult
+
+
 class MechanicalNarrationInput(Contract):
     player_text: InputText
     committed_state_version: NonNegativeInt
     resolved_actions: list[ResolvedAction]
+    enemy_reactions: list[ResolvedEnemyReaction] = Field(default_factory=list)
     public_state_after: list[ContextFragment]
     allowed_entity_refs: list[EntityRef]
     output_limits: OutputLimits
@@ -339,6 +354,7 @@ class TurnResponse(Contract):
     narration: NarrationText | None
     choices: list[Choice]
     action_results: list[ResolvedAction]
+    enemy_reactions: list[ResolvedEnemyReaction] = Field(default_factory=list)
     recovery: TurnRecovery
 
     @model_validator(mode="after")
@@ -347,7 +363,9 @@ class TurnResponse(Contract):
             raise ValueError("committed status requires committed_state_version only")
         if self.resolution_status == "committed" and self.route is None:
             raise ValueError("committed turn requires route")
-        if self.action_results and (self.route != "mechanical" or self.resolution_status != "committed"):
+        if (self.action_results or self.enemy_reactions) and (
+            self.route != "mechanical" or self.resolution_status != "committed"
+        ):
             raise ValueError("action results require committed mechanical turn")
         done = self.narration_status in ("completed", "fallback")
         if done != (self.narration is not None):
@@ -376,6 +394,14 @@ class AdventureEnding(Contract):
     summary: ShortText
 
 
+class AdventureCombatState(Contract):
+    enemy_ref: Ref
+    enemy_name: ShortText
+    current_hp: NonNegativeInt
+    max_hp: NonNegativeInt
+    active: StrictBool
+
+
 class AdventureState(Contract):
     scenario_ref: Ref
     title: ShortText
@@ -385,6 +411,7 @@ class AdventureState(Contract):
     discovered_facts: list[ShortText]
     available_actions: list[AdventureAction]
     ending: AdventureEnding | None
+    combat: AdventureCombatState | None = None
 
 
 class InventoryItem(Contract):
@@ -496,6 +523,20 @@ class ScenarioProgressedEvent(EventBase):
     payload: ScenarioProgressedPayload
 
 
+class EnemyReaction(Contract):
+    command: AttackCommand
+    result: AppliedResult
+    rng: tuple[RNGMetadata, ...]
+
+
+class EnemyReactionResolvedEvent(EventBase):
+    type: Literal["EnemyReactionResolved"]
+    scene_id: UUID
+    turn_id: UUID
+    action_id: None = None
+    payload: EnemyReaction
+
+
 class NarrationGeneratedEvent(EventBase):
     type: Literal["GMNarrationGenerated"]
     scene_id: UUID
@@ -507,7 +548,7 @@ class NarrationGeneratedEvent(EventBase):
 DomainEventV1 = Annotated[
     DiceRolledEvent | DamageAppliedEvent | HealingAppliedEvent |
     ItemConsumedEvent | ActionResolvedEvent | ScenarioProgressedEvent |
-    NarrationGeneratedEvent,
+    NarrationGeneratedEvent | EnemyReactionResolvedEvent,
     Field(discriminator="type"),
 ]
 ```
@@ -516,7 +557,7 @@ Provider情報はすべてデータであり、ContextFragmentのcontentをsyste
 
 ActionResultのfactsは演出用の公開事実であり、Canonical更新命令ではない。正確なダメージ、回復、在庫消費はEngineの型付きStateChangeに記録する。ApplicationはStateChangeをCanonical mutationとEventへ一度だけ投影し、Infrastructureは保存前値をlock下で照合してSQLへ変換する。ルール固有のイベントpayloadは(type, schema_version)ごとの型レジストリで検証する。HPの上下限、技能一覧、攻撃・アイテム・ダイス規則は [ADR-0007](adr/0007-mvp-ruleset.md) の `mvp_v1` に属する。
 
-DomainEventV1は今回具体化した7種の初期型。ActionResolvedは各Actionの最終結果、ScenarioProgressedは同じMechanical commitで確定したScene、flag、Endingの変化を表す。DiceRolled、DamageApplied、HealingApplied、ItemConsumedは個別の出来事を表す。ActionResolved内のStateChangeと個別Eventを二重適用しない。MVPではEngineの結果とScenario進行を一度だけCanonicalへ適用し、イベントは記録と表示に使う。PlayerMessageAdded、WorldFactChanged等は各機能実装時に専用型を追加する。Actionに属さない将来イベントはEventBaseから定義できる。
+DomainEventV1は8種の型を持つ。ActionResolvedは各Actionの最終結果、ScenarioProgressedは同じMechanical commitで確定したScene、flag、Endingの変化を表す。DiceRolled、DamageApplied、HealingApplied、ItemConsumedはプレイヤーActionの個別の出来事を表す。EnemyReactionResolvedはプレイヤーActionに属さない敵の反撃で、Command・Result・RNGをpayloadに保持する。ActionResolved内のStateChangeと個別Eventを二重適用しない。MVPではプレイヤーと敵のEngine結果、Scenario進行を一度だけCanonicalへ適用し、イベントは記録と表示に使う。PlayerMessageAdded、WorldFactChanged等は各機能実装時に専用型を追加する。
 
 ## 3 DBの関連と制約
 
@@ -612,9 +653,10 @@ CREATE TABLE turns (
     input_schema_version integer NOT NULL DEFAULT 1 CHECK (input_schema_version > 0),
     input_payload jsonb NOT NULL CHECK (jsonb_typeof(input_payload) = 'object'),
     request_hash bytea NOT NULL CHECK (octet_length(request_hash) = 32),
-    input_kind text NOT NULL CHECK (input_kind IN ('text','choice')),
+    input_kind text NOT NULL CHECK (input_kind IN ('text','choice','scenario_action')),
     input_text text,
     selected_choice_id uuid,
+    selected_action_ref text,
     expected_state_version bigint NOT NULL CHECK (expected_state_version >= 0),
     committed_state_version bigint CHECK (committed_state_version >= 0),
     route text CHECK (route IN ('narrative','mechanical')),
@@ -641,8 +683,13 @@ CREATE TABLE turns (
     FOREIGN KEY (campaign_id, actor_id) REFERENCES entities(campaign_id, id),
     CHECK (
         (input_kind = 'text' AND input_text IS NOT NULL
-            AND length(input_text) BETWEEN 1 AND 8000 AND selected_choice_id IS NULL)
-        OR (input_kind = 'choice' AND input_text IS NULL AND selected_choice_id IS NOT NULL)
+            AND length(input_text) BETWEEN 1 AND 8000 AND selected_choice_id IS NULL
+            AND selected_action_ref IS NULL)
+        OR (input_kind = 'choice' AND input_text IS NULL AND selected_choice_id IS NOT NULL
+            AND selected_action_ref IS NULL)
+        OR (input_kind = 'scenario_action' AND input_text IS NOT NULL
+            AND length(input_text) BETWEEN 1 AND 8000 AND selected_choice_id IS NULL
+            AND selected_action_ref IS NOT NULL AND length(selected_action_ref) BETWEEN 1 AND 120)
     ),
     CHECK ((resolution_status = 'committed') = (committed_state_version IS NOT NULL)),
     CHECK ((resolution_status = 'committed') = (committed_at IS NOT NULL)),
@@ -786,6 +833,10 @@ migration `0008_scene_entities` はtableと制約だけを追加する。既存d
 Scenario定義はversion付きの型付きJSONを正本とし、DBには`mvp_scenario_runs`、`mvp_scenario_flags`、既存の`scenes.status`だけを保存する。定義SceneとCampaign Sceneは一意な`sequence`で対応させる。`ScenarioProgressed`、flag追加、Scene切替またはEnding、Action、Turnは同じMechanical commitで確定し、描写再試行では更新しない。Scenario runを持たない既存Campaignの`CampaignStateResponse.adventure`は`null`になる。
 
 migration `0009_scenario_progress` は一般的なbackfillを行わない。downgradeではrunとflagを削除し、再度upgradeしても失われた進行を復元しない。`0010_scenario_action_kind`のdowngradeは、保存済み`scenario_action`が残っている場合に失敗させる。
+
+[ADR-0014](adr/0014-registered-actions-and-enemy-reactions.md)の登録行動入力はmigration `0012_registered_action_input`で追加する。Turnへ`selected_action_ref`とサーバー側label（`input_text`）を保存する。受付・解決時に現在Sceneと条件を再検証し、意図抽出LLMを呼ばない。既存requestのexact replayは現Sceneの再検証より優先する。登録行動入力が残るdowngradeは拒否する。
+
+短編v2のcombat設定から敵を特定し、先行するプレイヤー行動を反映してEngineで最大1回の反撃を計算する。反撃はプレイヤーActionの件数上限とは別であり、プレイヤーのactor一致制約を緩めない。Applicationで親・対象・RNG・HP連鎖・描写結果の一致を確認し、`EnemyReactionResolved`、HP、Scenario進行、Turnを同一transactionで保存する。反撃Eventを再生してHPを再更新しない。旧Turnの`enemy_reactions`は空、旧Scenarioの`combat`はnullとなる。
 
 履歴トリガーはDB所有者やTRUNCATEへの防御を意味しない。本番用接続は非所有者として必要なSELECT／INSERT／限定UPDATEのみ許可し、DDL／TRUNCATE権限を与えない。ここでGRANT対象ロール名はまだ固定しない。
 

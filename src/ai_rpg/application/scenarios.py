@@ -27,26 +27,31 @@ class ScenarioActionUnavailableError(ValueError):
 
 
 @dataclass(frozen=True, slots=True)
+class ScenarioPublicAction:
+    action_ref: str
+    label: str
+    kind: str
+    skill_ref: str | None = None
+    target_ref: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
 class ScenarioPublicContext:
     scene_title: str
     scene_description: str
     objective: str
     discovered_facts: tuple[str, ...]
     available_actions: tuple[tuple[str, str], ...]
+    action_details: tuple[ScenarioPublicAction, ...] = ()
+    npc_notes: tuple[str, ...] = ()
 
 
-ScenarioActionBinding: TypeAlias = (
-    DirectScenarioAction | SkillScenarioAction | AttackScenarioAction
-)
+ScenarioActionBinding: TypeAlias = DirectScenarioAction | SkillScenarioAction | AttackScenarioAction
 ScenarioOutcome: TypeAlias = Literal["success", "failure", "neutral"]
 
 
-def _action_is_available(
-    action: ScenarioActionBinding, flags: frozenset[str]
-) -> bool:
-    return set(action.required_flags) <= flags and flags.isdisjoint(
-        action.disabled_flags
-    )
+def _action_is_available(action: ScenarioActionBinding, flags: frozenset[str]) -> bool:
+    return set(action.required_flags) <= flags and flags.isdisjoint(action.disabled_flags)
 
 
 class ScenarioProgressor:
@@ -59,6 +64,18 @@ class ScenarioProgressor:
         except KeyError as error:
             raise ScenarioStateError("Scenario定義と保存versionが一致しません") from error
 
+    def bind_registered_action(
+        self, snapshot: ScenarioRunSnapshot, action_ref: str
+    ) -> ScenarioActionBinding:
+        _definition, scene, _active = self._current_scene(snapshot)
+        for action in scene.actions:
+            if action.action_ref == action_ref and _action_is_available(action, snapshot.flags):
+                return action
+        raise ScenarioActionUnavailableError("現在実行できる登録済み行動ではありません")
+
+    def scene_for(self, snapshot: ScenarioRunSnapshot) -> SceneDefinition:
+        return self._current_scene(snapshot)[1]
+
     def public_context_for(self, snapshot: ScenarioRunSnapshot) -> ScenarioPublicContext:
         definition, scene, _active = self._current_scene(snapshot)
         return ScenarioPublicContext(
@@ -66,15 +83,25 @@ class ScenarioProgressor:
             scene_description=scene.description,
             objective=definition.objective,
             discovered_facts=tuple(
-                flag.public_fact
-                for flag in definition.flags
-                if flag.flag_ref in snapshot.flags
+                flag.public_fact for flag in definition.flags if flag.flag_ref in snapshot.flags
             ),
             available_actions=tuple(
                 (action.action_ref, action.label)
                 for action in scene.actions
                 if _action_is_available(action, snapshot.flags)
             ),
+            action_details=tuple(
+                ScenarioPublicAction(
+                    action.action_ref,
+                    action.label,
+                    action.kind,
+                    action.skill_ref if isinstance(action, SkillScenarioAction) else None,
+                    action.target_ref if isinstance(action, AttackScenarioAction) else None,
+                )
+                for action in scene.actions
+                if _action_is_available(action, snapshot.flags)
+            ),
+            npc_notes=scene.npc_notes,
         )
 
     def bind_scenario_action(
@@ -84,8 +111,7 @@ class ScenarioProgressor:
         matches = tuple(
             action
             for action in scene.actions
-            if isinstance(action, DirectScenarioAction)
-            and action.action_ref == action_ref
+            if isinstance(action, DirectScenarioAction) and action.action_ref == action_ref
         )
         if len(matches) != 1:
             return None
@@ -115,8 +141,7 @@ class ScenarioProgressor:
         matches = tuple(
             action
             for action in scene.actions
-            if isinstance(action, AttackScenarioAction)
-            and action.target_ref == target_ref
+            if isinstance(action, AttackScenarioAction) and action.target_ref == target_ref
         )
         if len(matches) != 1:
             return None
@@ -163,15 +188,13 @@ class ScenarioProgressor:
                 if candidate.scene_ref == effect.next_scene_ref
             )
             to_scene_id = next(
-                runtime.id
-                for runtime in snapshot.scenes
-                if runtime.sequence == target.sequence
+                runtime.id for runtime in snapshot.scenes if runtime.sequence == target.sequence
             )
 
         return ScenarioProgressUpdate(
             from_scene_id=active.id,
             to_scene_id=to_scene_id,
-            add_flags=effect.add_flags,
+            add_flags=tuple(flag for flag in effect.add_flags if flag not in snapshot.flags),
             ending_ref=ending_ref,
         )
 

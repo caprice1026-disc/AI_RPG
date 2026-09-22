@@ -9,6 +9,7 @@ from ai_rpg.application.ports import ScenarioRunSnapshot, ScenarioSceneSnapshot
 from ai_rpg.application.scenarios import (
     ScenarioActionUnavailableError,
     ScenarioProgressor,
+    ScenarioPublicAction,
     ScenarioPublicContext,
     ScenarioStateError,
 )
@@ -288,9 +289,7 @@ def test_public_context_filters_unavailable_actions_without_exposing_conditions(
         }
     )
 
-    context = conditional.public_context_for(
-        sanctum_snapshot(flags={"clue_found"})
-    )
+    context = conditional.public_context_for(sanctum_snapshot(flags={"clue_found"}))
 
     assert context.available_actions == (
         ("negotiate_guard", "守衛と交渉する"),
@@ -331,13 +330,19 @@ def test_public_context_maps_flags_without_exposing_hidden_conditions() -> None:
             ("defeat_guard", "守衛を倒す"),
             ("retreat", "撤退する"),
         ),
+        action_details=(
+            ScenarioPublicAction("negotiate_guard", "守衛と交渉する", "skill_check", "persuasion"),
+            ScenarioPublicAction("sneak_to_relic", "聖印へ忍び寄る", "skill_check", "stealth"),
+            ScenarioPublicAction("defeat_guard", "守衛を倒す", "attack", target_ref="goblin"),
+            ScenarioPublicAction("retreat", "撤退する", "scenario_action"),
+        ),
     )
     assert "alerted" not in repr(context)
     assert "costly_success" not in repr(context)
 
 
 def test_definition_for_rejects_unregistered_version() -> None:
-    snapshot = replace(entrance_snapshot(), scenario_version=2)
+    snapshot = replace(entrance_snapshot(), scenario_version=999)
 
     with pytest.raises(ScenarioStateError, match="Scenario定義"):
         progressor.definition_for(snapshot)

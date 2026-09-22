@@ -1,5 +1,6 @@
 """Engineの確定結果を永続化単位へ投影する純粋なApplication処理。"""
 
+import re
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import cast
@@ -19,6 +20,7 @@ from ai_rpg.domain.events import (
     DiceRolledEvent,
     DiceRolledPayload,
     DomainEventV1,
+    EnemyReactionResolvedEvent,
     HealingAppliedEvent,
     ItemConsumedEvent,
     ScenarioProgressedEvent,
@@ -27,9 +29,11 @@ from ai_rpg.domain.events import (
 from ai_rpg.domain.results import (
     AppliedResult,
     DamageApplied,
+    DiceResult,
     HealingApplied,
     ItemConsumed,
     ResolvedAction,
+    ResolvedEnemyReaction,
 )
 
 
@@ -38,6 +42,7 @@ class TurnCommitContext:
     scene_id: UUID
     actor_id: UUID
     max_actions: int
+    enemy_id: UUID | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -67,6 +72,73 @@ class ResolutionProjection:
     canonical_mutations: tuple[CanonicalMutation, ...]
     scenario_update: ScenarioProgressUpdate | None
     committed_state_version: int
+
+
+def _validate_reaction_die(roll: DiceResult, expression: str) -> None:
+    normalized = expression.replace(" ", "").lower()
+    match = re.fullmatch(
+        r"([1-9]|1[0-9]|20)d([2-9]|[1-9][0-9]|100)([+-](?:0|[1-9][0-9]?|100))?",
+        normalized,
+    )
+    if match is None:
+        raise InvalidCommitBundleError("Enemy reaction has an unsupported dice expression")
+    count, sides = int(match[1]), int(match[2])
+    modifier = int(match[3] or 0)
+    if (
+        roll.expression != normalized
+        or len(roll.rolls) != count
+        or any(not 1 <= value <= sides for value in roll.rolls)
+        or roll.modifier != modifier
+        or roll.total != sum(roll.rolls) + modifier
+    ):
+        raise InvalidCommitBundleError("Enemy reaction dice do not match the command")
+
+
+def _validate_enemy_reactions(bundle: CommitBundle, turn: TurnCommitContext) -> None:
+    if len(bundle.enemy_reactions) > 1:
+        raise InvalidCommitBundleError("At most one enemy reaction is allowed")
+    if not bundle.enemy_reactions:
+        return
+    if not any(isinstance(action.result, AppliedResult) for action in bundle.actions):
+        raise InvalidCommitBundleError("Enemy reaction requires an applied player action")
+    reaction = bundle.enemy_reactions[0]
+    command, result = reaction.command, reaction.result
+    if (
+        turn.enemy_id is None
+        or command.actor_id != turn.enemy_id
+        or command.actor_id == turn.actor_id
+        or command.target_id != turn.actor_id
+        or command.campaign_id != bundle.campaign_id
+        or command.turn_id != bundle.turn_id
+        or command.ordinal != 1
+        or command.action_id in {action.command.action_id for action in bundle.actions}
+    ):
+        raise InvalidCommitBundleError("Enemy reaction identity or parents do not match the Turn")
+    first_draw = sum(
+        len(action.result.dice)
+        for action in bundle.actions
+        if isinstance(action.result, AppliedResult)
+    )
+    if len(reaction.rng) != len(result.dice) or [rng.draw_index for rng in reaction.rng] != list(
+        range(first_draw, first_draw + len(result.dice))
+    ):
+        raise InvalidCommitBundleError("Enemy reaction RNG metadata must follow player dice")
+    if result.outcome not in {"success", "failure"}:
+        raise InvalidCommitBundleError("Enemy reaction must succeed or fail")
+    success = result.outcome == "success"
+    if len(result.dice) != (2 if success else 1) or len(result.state_changes) != int(success):
+        raise InvalidCommitBundleError("Enemy reaction outcome, dice and damage do not match")
+    _validate_reaction_die(result.dice[0], f"1d20{command.attack_bonus:+d}")
+    if success:
+        _validate_reaction_die(result.dice[1], command.damage_expression)
+        damage = result.state_changes[0]
+        if (
+            not isinstance(damage, DamageApplied)
+            or damage.target_id != turn.actor_id
+            or damage.amount != max(0, result.dice[1].total + command.damage_bonus)
+            or damage.hp_after != max(0, damage.hp_before - damage.amount)
+        ):
+            raise InvalidCommitBundleError("Enemy reaction damage does not match the command")
 
 
 def _canonical_mutations(actions: tuple[ActionRecord, ...]) -> tuple[CanonicalMutation, ...]:
@@ -204,6 +276,12 @@ def _events(
                 **values(action_id),
             )
         )
+    for reaction in bundle.enemy_reactions:
+        events.append(
+            EnemyReactionResolvedEvent(
+                type="EnemyReactionResolved", payload=reaction, **values(None)
+            )
+        )
     if bundle.scenario_update is not None:
         update = bundle.scenario_update
         events.append(
@@ -248,7 +326,12 @@ def project_resolution(
         ):
             raise InvalidCommitBundleError("Action Commandの親IDが一致しません")
 
-    mutations = _canonical_mutations(actions)
+    _validate_enemy_reactions(bundle, turn)
+    reaction_actions = tuple(
+        ActionRecord(command=reaction.command, result=reaction.result, rng=reaction.rng)
+        for reaction in bundle.enemy_reactions
+    )
+    mutations = _canonical_mutations(actions + reaction_actions)
     changed = bool(mutations) or bundle.scenario_update is not None
     version = bundle.base_state_version + int(changed)
     resolved_actions = [
@@ -259,11 +342,21 @@ def project_resolution(
         )
         for action in actions
     ]
+    resolved_reactions = [
+        ResolvedEnemyReaction(
+            reaction_id=reaction.command.action_id,
+            actor_id=reaction.command.actor_id,
+            target_id=reaction.command.target_id,
+            result=reaction.result,
+        )
+        for reaction in bundle.enemy_reactions
+    ]
     narration = bundle.narration_input
     if (
         narration.committed_state_version != version
         or narration.output_limits.max_actions != turn.max_actions
         or narration.resolved_actions != resolved_actions
+        or narration.enemy_reactions != resolved_reactions
     ):
         raise InvalidCommitBundleError("描写入力が確定内容と一致しません")
 

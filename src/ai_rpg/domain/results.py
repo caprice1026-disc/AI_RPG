@@ -94,3 +94,10 @@ class ResolvedAction(Contract):
     action_id: UUID
     ordinal: PositiveInt
     result: ActionResult
+
+
+class ResolvedEnemyReaction(Contract):
+    reaction_id: UUID
+    actor_id: UUID
+    target_id: UUID
+    result: AppliedResult

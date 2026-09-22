@@ -6,8 +6,10 @@ from uuid import UUID
 from pydantic import Field, StrictBool, model_validator
 
 from ai_rpg.contracts.common import Contract, NarrationText, NonNegativeInt, PositiveInt, ShortText
+from ai_rpg.domain.commands import AttackCommand
 from ai_rpg.domain.results import (
     ActionResult,
+    AppliedResult,
     DamageApplied,
     DiceResult,
     HealingApplied,
@@ -19,6 +21,12 @@ class RNGMetadata(Contract):
     source: Literal["secure", "seeded_test", "recorded_replay"]
     implementation_version: ShortText
     draw_index: NonNegativeInt
+
+
+class EnemyReaction(Contract):
+    command: AttackCommand
+    result: AppliedResult
+    rng: tuple[RNGMetadata, ...]
 
 
 class DiceRolledPayload(Contract):
@@ -92,6 +100,14 @@ class ActionResolvedEvent(ActionEventBase):
     payload: ActionResolvedPayload
 
 
+class EnemyReactionResolvedEvent(EventBase):
+    type: Literal["EnemyReactionResolved"]
+    scene_id: UUID
+    turn_id: UUID
+    action_id: None = None
+    payload: EnemyReaction
+
+
 class ScenarioProgressedEvent(EventBase):
     type: Literal["ScenarioProgressed"]
     scene_id: UUID
@@ -114,6 +130,7 @@ DomainEventV1: TypeAlias = Annotated[
     | HealingAppliedEvent
     | ItemConsumedEvent
     | ActionResolvedEvent
+    | EnemyReactionResolvedEvent
     | ScenarioProgressedEvent
     | NarrationGeneratedEvent,
     Field(discriminator="type"),

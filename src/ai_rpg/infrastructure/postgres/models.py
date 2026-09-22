@@ -31,9 +31,7 @@ class CampaignModel(Base):
 
     id: Mapped[UUID] = mapped_column(PG_UUID(as_uuid=True), primary_key=True)
     status: Mapped[str] = mapped_column(Text, nullable=False, server_default=text("'active'"))
-    state_version: Mapped[int] = mapped_column(
-        BigInteger, nullable=False, server_default=text("0")
-    )
+    state_version: Mapped[int] = mapped_column(BigInteger, nullable=False, server_default=text("0"))
     event_sequence: Mapped[int] = mapped_column(
         BigInteger, nullable=False, server_default=text("0")
     )
@@ -70,16 +68,20 @@ class AdventureStartRequestModel(Base):
     request_id: Mapped[UUID] = mapped_column(PG_UUID(as_uuid=True), primary_key=True)
     input_payload: Mapped[dict[str, object]] = mapped_column(JSONB, nullable=False)
     campaign_id: Mapped[UUID] = mapped_column(
-        PG_UUID(as_uuid=True), ForeignKey("campaigns.id", deferrable=True, initially="DEFERRED"),
-        nullable=False, unique=True,
+        PG_UUID(as_uuid=True),
+        ForeignKey("campaigns.id", deferrable=True, initially="DEFERRED"),
+        nullable=False,
+        unique=True,
     )
     actor_id: Mapped[UUID] = mapped_column(PG_UUID(as_uuid=True), nullable=False)
 
     __table_args__ = (
         CheckConstraint("jsonb_typeof(input_payload)='object'"),
         ForeignKeyConstraint(
-            ["campaign_id", "actor_id"], ["entities.campaign_id", "entities.id"],
-            deferrable=True, initially="DEFERRED",
+            ["campaign_id", "actor_id"],
+            ["entities.campaign_id", "entities.id"],
+            deferrable=True,
+            initially="DEFERRED",
         ),
     )
 
@@ -202,6 +204,7 @@ class TurnModel(Base):
     input_kind: Mapped[str] = mapped_column(Text, nullable=False)
     input_text: Mapped[str | None] = mapped_column(Text)
     selected_choice_id: Mapped[UUID | None] = mapped_column(PG_UUID(as_uuid=True))
+    selected_action_ref: Mapped[str | None] = mapped_column(Text)
     expected_state_version: Mapped[int] = mapped_column(BigInteger, nullable=False)
     committed_state_version: Mapped[int | None] = mapped_column(BigInteger)
     route: Mapped[str | None] = mapped_column(Text)
@@ -215,24 +218,16 @@ class TurnModel(Base):
         Text, nullable=False, server_default=text("'pending'")
     )
     max_actions: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("3"))
-    llm_call_count: Mapped[int] = mapped_column(
-        Integer, nullable=False, server_default=text("0")
-    )
-    llm_call_budget: Mapped[int] = mapped_column(
-        Integer, nullable=False, server_default=text("3")
-    )
-    worker_epoch: Mapped[int] = mapped_column(
-        BigInteger, nullable=False, server_default=text("0")
-    )
+    llm_call_count: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"))
+    llm_call_budget: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("3"))
+    worker_epoch: Mapped[int] = mapped_column(BigInteger, nullable=False, server_default=text("0"))
     lease_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     resolution_attempt_count: Mapped[int] = mapped_column(
         Integer, nullable=False, server_default=text("0")
     )
     resolution_started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     resolution_deadline: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
-    resolution_next_attempt_at: Mapped[datetime | None] = mapped_column(
-        DateTime(timezone=True)
-    )
+    resolution_next_attempt_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     resolution_failure_code: Mapped[str | None] = mapped_column(Text)
     narration_worker_epoch: Mapped[int] = mapped_column(
         BigInteger, nullable=False, server_default=text("0")
@@ -257,16 +252,12 @@ class TurnModel(Base):
         UniqueConstraint("campaign_id", "created_by", "request_id"),
         UniqueConstraint("campaign_id", "id"),
         UniqueConstraint("campaign_id", "scene_id", "id"),
-        ForeignKeyConstraint(
-            ["campaign_id", "scene_id"], ["scenes.campaign_id", "scenes.id"]
-        ),
+        ForeignKeyConstraint(["campaign_id", "scene_id"], ["scenes.campaign_id", "scenes.id"]),
         ForeignKeyConstraint(
             ["campaign_id", "created_by"],
             ["campaign_members.campaign_id", "campaign_members.principal_id"],
         ),
-        ForeignKeyConstraint(
-            ["campaign_id", "actor_id"], ["entities.campaign_id", "entities.id"]
-        ),
+        ForeignKeyConstraint(["campaign_id", "actor_id"], ["entities.campaign_id", "entities.id"]),
         ForeignKeyConstraint(
             ["campaign_id", "scene_id", "actor_id", "selected_choice_id"],
             [
@@ -281,7 +272,7 @@ class TurnModel(Base):
         CheckConstraint("input_schema_version>0"),
         CheckConstraint("jsonb_typeof(input_payload)='object'"),
         CheckConstraint("octet_length(request_hash)=32"),
-        CheckConstraint("input_kind IN ('text','choice')"),
+        CheckConstraint("input_kind IN ('text','choice','scenario_action')"),
         CheckConstraint("expected_state_version>=0"),
         CheckConstraint("committed_state_version>=0"),
         CheckConstraint("route IN ('narrative','mechanical')"),
@@ -313,8 +304,12 @@ class TurnModel(Base):
         CheckConstraint("(narration_started_at IS NULL)=(narration_deadline IS NULL)"),
         CheckConstraint(
             "(input_kind='text' AND input_text IS NOT NULL AND length(input_text) "
-            "BETWEEN 1 AND 8000 AND selected_choice_id IS NULL) OR "
-            "(input_kind='choice' AND input_text IS NULL AND selected_choice_id IS NOT NULL)"
+            "BETWEEN 1 AND 8000 AND selected_choice_id IS NULL AND selected_action_ref IS NULL) OR "
+            "(input_kind='choice' AND input_text IS NULL AND selected_choice_id IS NOT NULL "
+            "AND selected_action_ref IS NULL) OR "
+            "(input_kind='scenario_action' AND input_text IS NOT NULL AND length(input_text) "
+            "BETWEEN 1 AND 8000 AND selected_choice_id IS NULL AND selected_action_ref IS NOT NULL "
+            "AND length(selected_action_ref) BETWEEN 1 AND 120)"
         ),
         CheckConstraint("(resolution_status='committed')=(committed_state_version IS NOT NULL)"),
         CheckConstraint("(resolution_status='committed')=(committed_at IS NOT NULL)"),
@@ -357,9 +352,7 @@ class TurnChoiceModel(Base):
             ["campaign_id", "scene_id", "source_turn_id"],
             ["turns.campaign_id", "turns.scene_id", "turns.id"],
         ),
-        ForeignKeyConstraint(
-            ["campaign_id", "actor_id"], ["entities.campaign_id", "entities.id"]
-        ),
+        ForeignKeyConstraint(["campaign_id", "actor_id"], ["entities.campaign_id", "entities.id"]),
         CheckConstraint("ordinal BETWEEN 1 AND 5"),
         CheckConstraint("length(label) BETWEEN 1 AND 500"),
         CheckConstraint("state_version>=0"),
@@ -377,9 +370,7 @@ class ActionModel(Base):
     kind: Mapped[str] = mapped_column(Text, nullable=False)
     target_id: Mapped[UUID | None] = mapped_column(PG_UUID(as_uuid=True))
     item_id: Mapped[UUID | None] = mapped_column(PG_UUID(as_uuid=True))
-    schema_version: Mapped[int] = mapped_column(
-        Integer, nullable=False, server_default=text("1")
-    )
+    schema_version: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("1"))
     command: Mapped[dict[str, object]] = mapped_column(JSONB, nullable=False)
     result: Mapped[dict[str, object]] = mapped_column(JSONB, nullable=False)
     result_kind: Mapped[str] = mapped_column(Text, nullable=False)
@@ -388,18 +379,10 @@ class ActionModel(Base):
     __table_args__ = (
         UniqueConstraint("turn_id", "ordinal"),
         UniqueConstraint("campaign_id", "turn_id", "id"),
-        ForeignKeyConstraint(
-            ["campaign_id", "turn_id"], ["turns.campaign_id", "turns.id"]
-        ),
-        ForeignKeyConstraint(
-            ["campaign_id", "actor_id"], ["entities.campaign_id", "entities.id"]
-        ),
-        ForeignKeyConstraint(
-            ["campaign_id", "target_id"], ["entities.campaign_id", "entities.id"]
-        ),
-        ForeignKeyConstraint(
-            ["campaign_id", "item_id"], ["entities.campaign_id", "entities.id"]
-        ),
+        ForeignKeyConstraint(["campaign_id", "turn_id"], ["turns.campaign_id", "turns.id"]),
+        ForeignKeyConstraint(["campaign_id", "actor_id"], ["entities.campaign_id", "entities.id"]),
+        ForeignKeyConstraint(["campaign_id", "target_id"], ["entities.campaign_id", "entities.id"]),
+        ForeignKeyConstraint(["campaign_id", "item_id"], ["entities.campaign_id", "entities.id"]),
         CheckConstraint("ordinal>0"),
         CheckConstraint(
             "kind IN ('attack','skill_check','use_item','scenario_action')",
@@ -436,9 +419,7 @@ class EventModel(Base):
 
     __table_args__ = (
         UniqueConstraint("campaign_id", "sequence"),
-        ForeignKeyConstraint(
-            ["campaign_id", "scene_id"], ["scenes.campaign_id", "scenes.id"]
-        ),
+        ForeignKeyConstraint(["campaign_id", "scene_id"], ["scenes.campaign_id", "scenes.id"]),
         ForeignKeyConstraint(
             ["campaign_id", "scene_id", "turn_id"],
             ["turns.campaign_id", "turns.scene_id", "turns.id"],
@@ -477,14 +458,10 @@ class MvpCharacterModel(Base):
     current_hp: Mapped[int] = mapped_column(Integer, nullable=False)
     max_hp: Mapped[int] = mapped_column(Integer, nullable=False)
     defense: Mapped[int] = mapped_column(Integer, nullable=False)
-    attack_bonus: Mapped[int] = mapped_column(
-        Integer, nullable=False, server_default=text("0")
-    )
+    attack_bonus: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"))
 
     __table_args__ = (
-        ForeignKeyConstraint(
-            ["campaign_id", "entity_id"], ["entities.campaign_id", "entities.id"]
-        ),
+        ForeignKeyConstraint(["campaign_id", "entity_id"], ["entities.campaign_id", "entities.id"]),
         CheckConstraint("defense>=0"),
         CheckConstraint("max_hp>=1"),
         CheckConstraint("current_hp BETWEEN 0 AND max_hp"),
@@ -516,14 +493,10 @@ class MvpWeaponModel(Base):
     campaign_id: Mapped[UUID] = mapped_column(PG_UUID(as_uuid=True), primary_key=True)
     entity_id: Mapped[UUID] = mapped_column(PG_UUID(as_uuid=True), primary_key=True)
     damage_expression: Mapped[str] = mapped_column(Text, nullable=False)
-    damage_bonus: Mapped[int] = mapped_column(
-        Integer, nullable=False, server_default=text("0")
-    )
+    damage_bonus: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"))
 
     __table_args__ = (
-        ForeignKeyConstraint(
-            ["campaign_id", "entity_id"], ["entities.campaign_id", "entities.id"]
-        ),
+        ForeignKeyConstraint(["campaign_id", "entity_id"], ["entities.campaign_id", "entities.id"]),
         CheckConstraint("damage_expression ~ '^[0-9]+d[0-9]+([+-][0-9]+)?$'"),
     )
 
@@ -535,18 +508,14 @@ class MvpInventoryModel(Base):
     owner_id: Mapped[UUID] = mapped_column(PG_UUID(as_uuid=True), primary_key=True)
     item_id: Mapped[UUID] = mapped_column(PG_UUID(as_uuid=True), primary_key=True)
     quantity: Mapped[int] = mapped_column(Integer, nullable=False)
-    equipped: Mapped[bool] = mapped_column(
-        Boolean, nullable=False, server_default=text("false")
-    )
+    equipped: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=text("false"))
 
     __table_args__ = (
         ForeignKeyConstraint(
             ["campaign_id", "owner_id"],
             ["mvp_characters.campaign_id", "mvp_characters.entity_id"],
         ),
-        ForeignKeyConstraint(
-            ["campaign_id", "item_id"], ["entities.campaign_id", "entities.id"]
-        ),
+        ForeignKeyConstraint(["campaign_id", "item_id"], ["entities.campaign_id", "entities.id"]),
         CheckConstraint("quantity>=0"),
         Index(
             "one_equipped_weapon",
@@ -564,20 +533,14 @@ class MvpSceneEntityModel(Base):
     campaign_id: Mapped[UUID] = mapped_column(PG_UUID(as_uuid=True), primary_key=True)
     scene_id: Mapped[UUID] = mapped_column(PG_UUID(as_uuid=True), primary_key=True)
     entity_id: Mapped[UUID] = mapped_column(PG_UUID(as_uuid=True), primary_key=True)
-    is_public: Mapped[bool] = mapped_column(
-        Boolean, nullable=False, server_default=text("true")
-    )
+    is_public: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=text("true"))
     is_attack_reachable: Mapped[bool] = mapped_column(
         Boolean, nullable=False, server_default=text("false")
     )
 
     __table_args__ = (
-        ForeignKeyConstraint(
-            ["campaign_id", "scene_id"], ["scenes.campaign_id", "scenes.id"]
-        ),
-        ForeignKeyConstraint(
-            ["campaign_id", "entity_id"], ["entities.campaign_id", "entities.id"]
-        ),
+        ForeignKeyConstraint(["campaign_id", "scene_id"], ["scenes.campaign_id", "scenes.id"]),
+        ForeignKeyConstraint(["campaign_id", "entity_id"], ["entities.campaign_id", "entities.id"]),
         CheckConstraint(
             "NOT is_attack_reachable OR is_public",
             name="scene_entity_reachable_is_public",
@@ -601,9 +564,7 @@ class MvpScenarioRunModel(Base):
         CheckConstraint("scenario_version > 0"),
         CheckConstraint("status IN ('active','completed')"),
         CheckConstraint("(status='completed') = (ending_ref IS NOT NULL)"),
-        CheckConstraint(
-            "ending_ref IS NULL OR ending_ref ~ '^[a-z][a-z0-9_]{0,63}$'"
-        ),
+        CheckConstraint("ending_ref IS NULL OR ending_ref ~ '^[a-z][a-z0-9_]{0,63}$'"),
     )
 
 
@@ -632,12 +593,8 @@ class MvpSceneSkillCheckModel(Base):
     public_description: Mapped[str] = mapped_column(Text, nullable=False)
 
     __table_args__ = (
-        ForeignKeyConstraint(
-            ["campaign_id", "scene_id"], ["scenes.campaign_id", "scenes.id"]
-        ),
-        ForeignKeyConstraint(
-            ["campaign_id", "target_id"], ["entities.campaign_id", "entities.id"]
-        ),
+        ForeignKeyConstraint(["campaign_id", "scene_id"], ["scenes.campaign_id", "scenes.id"]),
+        ForeignKeyConstraint(["campaign_id", "target_id"], ["entities.campaign_id", "entities.id"]),
         CheckConstraint("check_ref ~ '^[a-z][a-z0-9_]{0,63}$'"),
         CheckConstraint(
             "skill_ref IN ('athletics','acrobatics','perception','stealth','persuasion')"

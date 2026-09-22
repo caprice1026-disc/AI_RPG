@@ -26,4 +26,6 @@ def _load_builtin(filename: str) -> ScenarioDefinition:
     return ScenarioDefinition.model_validate_json(payload)
 
 
-BUILTIN_SCENARIOS = ScenarioCatalog([_load_builtin("ruined_chapel.json")])
+BUILTIN_SCENARIOS = ScenarioCatalog(
+    [_load_builtin("ruined_chapel.json"), _load_builtin("ruined_chapel_v2.json")]
+)

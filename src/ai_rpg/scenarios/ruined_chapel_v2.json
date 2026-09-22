@@ -1,0 +1,254 @@
+{
+  "scenario_ref": "ruined_chapel",
+  "version": 2,
+  "title": "廃礼拝堂の聖印",
+  "objective": "廃礼拝堂の銀の聖印を回収し、村の共同庫へ持ち帰る",
+  "scenes": [
+    {
+      "scene_ref": "entrance",
+      "sequence": 1,
+      "title": "依頼書のある入口",
+      "description": "崩れかけた礼拝堂の扉に依頼書が留めてある。『奥の祭壇にある銀の聖印を村の共同庫へ戻してほしい』。扉の隙間から、倒れた長椅子と奥へ続く床が見える。",
+      "actions": [
+        {
+          "action_ref": "accept_quest",
+          "label": "依頼書を読み、聖印の回収を引き受ける",
+          "public_fact": "銀の聖印を村へ持ち帰る依頼を引き受けた。",
+          "kind": "scenario_action",
+          "disabled_flags": ["quest_accepted"],
+          "success": {"add_flags": ["quest_accepted"]}
+        },
+        {
+          "action_ref": "enter_chapel",
+          "label": "扉を開けて礼拝堂に入る",
+          "public_fact": "扉を押し開け、長椅子の並ぶ広間に入った。",
+          "kind": "scenario_action",
+          "required_flags": ["quest_accepted"],
+          "success": {"next_scene_ref": "hall"}
+        },
+        {
+          "action_ref": "leave_entrance",
+          "label": "入口から村へ引き返す",
+          "public_fact": "聖印を持ち帰らず、礼拝堂の入口から引き返した。",
+          "kind": "scenario_action",
+          "success": {"ending_ref": "retreated"}
+        }
+      ]
+    },
+    {
+      "scene_ref": "hall",
+      "sequence": 2,
+      "title": "長椅子の広間",
+      "description": "傾いた長椅子が行く手を塞いでいる。壁には礼拝堂の古い案内板があり、床の奥には『記録庫』と刻まれた扉が見える。入口へ戻る道は開いている。",
+      "actions": [
+        {
+          "action_ref": "search_hall",
+          "label": "案内板と床を調べ、記録庫への道を探す",
+          "kind": "skill_check",
+          "skill_ref": "perception",
+          "check_ref": "normal",
+          "success": {
+            "next_scene_ref": "archive",
+            "add_flags": ["hall_route_found"]
+          },
+          "failure": {
+            "next_scene_ref": "archive",
+            "add_flags": ["hall_route_found", "alerted", "costly"]
+          }
+        },
+        {
+          "action_ref": "leave_hall",
+          "label": "長椅子を越えず、入口へ引き返す",
+          "public_fact": "広間から入口へ戻り、聖印の回収を断念した。",
+          "kind": "scenario_action",
+          "success": {"ending_ref": "retreated"}
+        }
+      ]
+    },
+    {
+      "scene_ref": "archive",
+      "sequence": 3,
+      "title": "雨漏りする記録庫",
+      "description": "濡れた記録帳が石の机に開かれている。銀の聖印と祭壇を描いた挿絵があり、文字の一部は雨でにじんでいる。机の向こうには、奥へ続く狭い通路がある。",
+      "actions": [
+        {
+          "action_ref": "read_archive",
+          "label": "記録帳の文字と挿絵を読み解く",
+          "kind": "skill_check",
+          "skill_ref": "perception",
+          "check_ref": "easy",
+          "success": {
+            "next_scene_ref": "passage",
+            "add_flags": ["relic_history_read"]
+          },
+          "failure": {
+            "next_scene_ref": "passage",
+            "add_flags": ["archive_fragment_read", "costly"]
+          }
+        },
+        {
+          "action_ref": "leave_archive",
+          "label": "記録帳を閉じ、来た道を戻る",
+          "public_fact": "記録庫を離れ、聖印を持たずに礼拝堂から引き返した。",
+          "kind": "scenario_action",
+          "success": {"ending_ref": "retreated"}
+        }
+      ]
+    },
+    {
+      "scene_ref": "passage",
+      "sequence": 4,
+      "title": "祭壇前の通路",
+      "description": "狭い通路の先に半開きの扉がある。扉越しに足音と低い声が聞こえる。足元には崩れた石が散らばり、記録庫への帰り道を確かめる余地がある。",
+      "npc_notes": [
+        "扉の向こうから、ゴブリンの『ここは俺が見張っている』という声が聞こえる。"
+      ],
+      "actions": [
+        {
+          "action_ref": "prepare_return_route",
+          "label": "足元の石を避け、帰り道を確かめる",
+          "public_fact": "扉から記録庫へ引き返す道を確かめた。",
+          "kind": "scenario_action",
+          "disabled_flags": ["route_prepared"],
+          "success": {"add_flags": ["route_prepared"]}
+        },
+        {
+          "action_ref": "listen_at_door",
+          "label": "扉の向こうの声に耳を澄ませる",
+          "kind": "skill_check",
+          "skill_ref": "perception",
+          "check_ref": "normal",
+          "disabled_flags": ["listened_at_door"],
+          "success": {"add_flags": ["listened_at_door", "guard_words_heard"]},
+          "failure": {"add_flags": ["listened_at_door"]}
+        },
+        {
+          "action_ref": "approach_sanctum",
+          "label": "半開きの扉から祭壇の部屋へ進む",
+          "public_fact": "扉を抜け、銀の聖印とゴブリンのいる祭壇の部屋へ進んだ。",
+          "kind": "scenario_action",
+          "required_flags": ["route_prepared"],
+          "success": {"next_scene_ref": "sanctum"}
+        },
+        {
+          "action_ref": "leave_passage",
+          "label": "扉に入らず、礼拝堂から撤退する",
+          "public_fact": "祭壇の部屋には入らず、来た道を戻って撤退した。",
+          "kind": "scenario_action",
+          "success": {"ending_ref": "retreated"}
+        }
+      ]
+    },
+    {
+      "scene_ref": "sanctum",
+      "sequence": 5,
+      "title": "ゴブリンの守る祭壇",
+      "description": "銀の聖印が石の祭壇に置かれている。ゴブリンが通路の正面に立ち、こちらに顔を向けている。壁沿いには傾いた長椅子が並び、背後の扉は通路へ通じている。",
+      "npc_notes": [
+        "ゴブリンは自分を祭壇の見張りだと名乗っている。",
+        "ゴブリンは銀の聖印を指し、『それを持っていく理由を聞かせろ』と言っている。"
+      ],
+      "combat": {
+        "enemy_ref": "goblin",
+        "started_flag": "combat_started",
+        "defeat_ending_ref": "defeated",
+        "damage_expression": "1d4",
+        "damage_bonus": 0
+      },
+      "actions": [
+        {
+          "action_ref": "negotiate_guard",
+          "label": "聖印を村へ戻す理由を話し、守衛と交渉する",
+          "kind": "skill_check",
+          "skill_ref": "persuasion",
+          "check_ref": "normal",
+          "disabled_flags": ["combat_started"],
+          "success": {"next_scene_ref": "return", "add_flags": ["guard_agreed"]},
+          "failure": {
+            "next_scene_ref": "return",
+            "add_flags": ["guard_agreed", "costly"]
+          }
+        },
+        {
+          "action_ref": "sneak_to_relic",
+          "label": "壁沿いの長椅子を使って祭壇へ忍び寄る",
+          "kind": "skill_check",
+          "skill_ref": "stealth",
+          "check_ref": "hard",
+          "disabled_flags": ["combat_started"],
+          "success": {"next_scene_ref": "return", "add_flags": ["passed_guard"]},
+          "failure": {
+            "next_scene_ref": "return",
+            "add_flags": ["passed_guard", "noticed_by_guard", "costly"]
+          }
+        },
+        {
+          "action_ref": "defeat_guard",
+          "label": "武器でゴブリンと戦う",
+          "kind": "attack",
+          "target_ref": "goblin",
+          "defeated": {"next_scene_ref": "return", "add_flags": ["guard_defeated"]}
+        },
+        {
+          "action_ref": "retreat",
+          "label": "背後の扉から撤退する",
+          "public_fact": "銀の聖印を残し、背後の扉から通路を抜けて撤退した。",
+          "kind": "scenario_action",
+          "success": {"ending_ref": "retreated"}
+        }
+      ]
+    },
+    {
+      "scene_ref": "return",
+      "sequence": 6,
+      "title": "聖印の回収と帰還",
+      "description": "祭壇の前から、通路へ戻る扉が見える。記録庫と広間を通れば礼拝堂の入口に出られる。礼拝堂の外には村へ続く道がある。",
+      "actions": [
+        {
+          "action_ref": "recover_relic",
+          "label": "祭壇から銀の聖印を回収する",
+          "public_fact": "祭壇の銀の聖印を手に取り、持ち帰る支度をした。",
+          "kind": "scenario_action",
+          "disabled_flags": ["relic_recovered"],
+          "success": {"add_flags": ["relic_recovered"]}
+        },
+        {
+          "action_ref": "return_relic",
+          "label": "来た道を戻り、聖印を村の共同庫へ届ける",
+          "public_fact": "礼拝堂を出て村へ戻り、銀の聖印を共同庫へ届けた。",
+          "kind": "scenario_action",
+          "required_flags": ["relic_recovered"],
+          "success": {
+            "ending_ref": "recovered",
+            "overrides": [
+              {"requires_flags": ["costly"], "ending_ref": "costly_success"}
+            ]
+          }
+        }
+      ]
+    }
+  ],
+  "flags": [
+    {"flag_ref": "quest_accepted", "public_fact": "銀の聖印を村へ持ち帰る依頼を引き受けた。"},
+    {"flag_ref": "hall_route_found", "public_fact": "長椅子の間を調べ、記録庫へ続く道を見つけた。"},
+    {"flag_ref": "alerted", "public_fact": "広間の長椅子を動かした物音が礼拝堂の奥まで響いた。"},
+    {"flag_ref": "costly", "public_fact": "礼拝堂で足止めされ、予定より時間を費やした。"},
+    {"flag_ref": "relic_history_read", "public_fact": "記録帳には、銀の聖印は村の共有物であり、共同庫に保管してよいと書かれていた。"},
+    {"flag_ref": "archive_fragment_read", "public_fact": "にじんだ文字は読み切れなかったが、挿絵から聖印のある祭壇と通路の位置がわかった。"},
+    {"flag_ref": "route_prepared", "public_fact": "祭壇前の扉から記録庫へ引き返す道を確かめた。"},
+    {"flag_ref": "listened_at_door", "public_fact": "祭壇前の扉越しに声を聞き取ろうと耳を澄ませた。"},
+    {"flag_ref": "guard_words_heard", "public_fact": "ゴブリンが『この聖印は誰のものなのか、話を聞きたい』と独り言を口にした。"},
+    {"flag_ref": "guard_agreed", "public_fact": "話し合いの末、ゴブリンは銀の聖印を持ち出すことに同意した。"},
+    {"flag_ref": "passed_guard", "public_fact": "ゴブリンの立つ通路を抜け、銀の聖印に手が届く位置へ進んだ。"},
+    {"flag_ref": "noticed_by_guard", "public_fact": "ゴブリンに見つかって声を上げられ、長椅子を回り込んで祭壇へ抜けるのに手間取った。"},
+    {"flag_ref": "combat_started", "public_fact": "ゴブリンとの戦闘が始まった。"},
+    {"flag_ref": "guard_defeated", "public_fact": "ゴブリンは倒れ、祭壇への道が開いた。"},
+    {"flag_ref": "relic_recovered", "public_fact": "祭壇から銀の聖印を回収し、持ち帰る支度をした。"}
+  ],
+  "endings": [
+    {"ending_ref": "recovered", "title": "聖印の帰還", "summary": "銀の聖印を回収し、村の共同庫へ無事に届けた。"},
+    {"ending_ref": "costly_success", "title": "長い道のりの末に", "summary": "礼拝堂で時間を費やしたが、銀の聖印を回収して村の共同庫へ届けた。"},
+    {"ending_ref": "retreated", "title": "撤退", "summary": "銀の聖印の回収を断念し、礼拝堂から引き返した。"},
+    {"ending_ref": "defeated", "title": "祭壇での敗北", "summary": "ゴブリンとの戦闘で行動不能となり、聖印の回収を果たせなかった。"}
+  ]
+}

@@ -157,6 +157,7 @@ def test_ruleset_healing_potion_caps_hp_and_consumes_one_item() -> None:
 
     assert result.outcome == "success"
     assert result.dice[0].total == 6
+    assert result.facts == ["回復ポーションでHPが2回復した（8→10）"]  # noqa: RUF001
     assert result.state_changes == [
         HealingApplied(
             kind="healing_applied",

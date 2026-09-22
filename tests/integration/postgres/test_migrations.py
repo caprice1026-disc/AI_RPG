@@ -975,7 +975,7 @@ def _guard_empty_database(url: str) -> Generator[str, None, None]:
             if "alembic_version" in _public_tables(cleanup_engine):
                 if "actions" in _public_tables(cleanup_engine):
                     with cleanup_engine.begin() as connection:
-                        connection.execute(text("TRUNCATE TABLE events,actions CASCADE"))
+                        connection.execute(text("TRUNCATE TABLE turns,events,actions CASCADE"))
                 cleanup_engine.dispose()
                 _run_alembic(url, "downgrade", "base")
                 cleanup_engine = create_engine(url)
@@ -1200,7 +1200,7 @@ def test_scenario_commit_action_kind_migration_is_forward_only_with_live_rows(
         )
         with engine.connect() as connection:
             assert connection.scalar(text("SELECT version_num FROM alembic_version")) == (
-                "0011_adventure_starts"
+                "0012_registered_action_input"
             )
             assert connection.scalar(
                 text("SELECT kind FROM actions WHERE id=:action"),
@@ -6385,11 +6385,16 @@ def test_scenario_worker_context_exposes_only_current_public_data(
         "scene_description": "銀の聖印を守るゴブリンが待ち構えている。",
         "objective": "廃礼拝堂の奥から銀の聖印を回収する",
         "discovered_facts": ["礼拝堂の守衛に侵入を警戒されている。"],
+        "npc_notes": [],
         "available_actions": [
-            {"action_ref": "negotiate_guard", "label": "守衛と交渉する"},
-            {"action_ref": "sneak_to_relic", "label": "聖印へ忍び寄る"},
-            {"action_ref": "defeat_guard", "label": "守衛を倒す"},
-            {"action_ref": "retreat", "label": "撤退する"},
+            {"action_ref": "negotiate_guard", "label": "守衛と交渉する",
+             "kind": "skill_check", "skill_ref": "persuasion", "target_ref": None},
+            {"action_ref": "sneak_to_relic", "label": "聖印へ忍び寄る",
+             "kind": "skill_check", "skill_ref": "stealth", "target_ref": None},
+            {"action_ref": "defeat_guard", "label": "守衛を倒す",
+             "kind": "attack", "skill_ref": None, "target_ref": "goblin"},
+            {"action_ref": "retreat", "label": "撤退する",
+             "kind": "scenario_action", "skill_ref": None, "target_ref": None},
         ],
     }
     serialized = json.dumps(llm_input, ensure_ascii=False)

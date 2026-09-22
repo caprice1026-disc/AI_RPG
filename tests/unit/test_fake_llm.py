@@ -154,3 +154,35 @@ async def test_development_fake_does_not_invent_unavailable_scenario_action() ->
         "kind": "clarification_required",
         "question": "現在の場面で可能な行動を指定してください。",
     }
+
+
+@pytest.mark.asyncio
+async def test_development_fake_can_heal_during_scenario_combat() -> None:
+    data = {
+        "player_text": "回復ポーションを飲む",
+        "supported_action_types": ["use_item"],
+        "scene_view": {
+            "content": json.dumps(
+                {"available_actions": [{"action_ref": "retreat", "label": "撤退する"}]}
+            )
+        },
+    }
+    decision = await DevelopmentFakeLLM().request("fake", "intent", "", json.dumps(data), {})
+    assert decision == {
+        "kind": "action_plan",
+        "actions": [{"kind": "use_item", "item_ref": "healing_potion", "target_ref": None}],
+    }
+
+
+@pytest.mark.asyncio
+async def test_development_fake_narrates_enemy_and_scenario_results() -> None:
+    data = {
+        "resolved_actions": [{"result": {"facts": ["攻撃は失敗"]}}],
+        "enemy_reactions": [{"result": {"facts": ["4ダメージを与えた"]}}],
+        "public_state_after": [{"source": "scenario_ending", "content": "祭壇での敗北"}],
+    }
+    result = await DevelopmentFakeLLM().request(
+        "fake", "result_narration", "", json.dumps(data), {}
+    )
+    assert "敵の反撃" in result["narration"] and "4ダメージ" in result["narration"]
+    assert "祭壇での敗北" in result["narration"]

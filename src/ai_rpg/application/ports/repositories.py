@@ -10,7 +10,7 @@ from uuid import UUID
 from ai_rpg.contracts import CampaignStateResponse, PlayerTurnInput, PublicEvent, TurnResponse
 from ai_rpg.contracts.responses import MechanicalNarrationInput
 from ai_rpg.domain.commands import Command
-from ai_rpg.domain.events import RNGMetadata
+from ai_rpg.domain.events import EnemyReaction, RNGMetadata
 from ai_rpg.domain.results import ActionResult
 
 
@@ -30,6 +30,10 @@ class ChoiceNotAvailableError(Exception):
     """指定Choiceが現在のTurn受付には利用できない。"""
 
     code = "CHOICE_NOT_AVAILABLE"
+
+
+class ScenarioActionNotAvailableError(ChoiceNotAvailableError):
+    code = "SCENARIO_ACTION_NOT_AVAILABLE"
 
 
 class IdempotencyConflictError(Exception):
@@ -111,6 +115,7 @@ class ResolutionWorkItem:
     player_text: str
     recent_messages: tuple[RecentMessage, ...]
     route: Literal["narrative", "mechanical"] | None
+    selected_action_ref: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -178,6 +183,7 @@ class CommitBundle:
     actions: tuple[ActionRecord, ...]
     narration_input: MechanicalNarrationInput
     scenario_update: ScenarioProgressUpdate | None = None
+    enemy_reactions: tuple[EnemyReaction, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)

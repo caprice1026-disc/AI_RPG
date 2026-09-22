@@ -50,6 +50,7 @@ def validate_mechanical_narration(
 
     allowed_numbers: set[str] = set()
     _collect_numbers(source.resolved_actions, allowed_numbers)
+    _collect_numbers([reaction.result for reaction in source.enemy_reactions], allowed_numbers)
     _collect_numbers([fragment.content for fragment in source.public_state_after], allowed_numbers)
 
     output_text = "\n".join(

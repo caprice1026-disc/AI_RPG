@@ -3,12 +3,13 @@
 import asyncio
 import json
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from typing import Literal
 from uuid import UUID, uuid4
 
 from pydantic import ValidationError
 
+from ai_rpg.application.combat import resolve_enemy_reaction
 from ai_rpg.application.entity_refs import EntityRefMap
 from ai_rpg.application.narration_grounding import (
     NarrationGroundingError,
@@ -38,7 +39,7 @@ from ai_rpg.application.ports.llm import (
     ResultNarrator,
 )
 from ai_rpg.application.ports.repositories import ScenarioProgressUpdate
-from ai_rpg.application.routing import RuleBasedTurnRouter, TurnRouter
+from ai_rpg.application.routing import RouteDecision, RuleBasedTurnRouter, TurnRouter
 from ai_rpg.application.scenarios import (
     ScenarioActionBinding,
     ScenarioActionUnavailableError,
@@ -74,10 +75,11 @@ from ai_rpg.domain.results import (
     ItemConsumed,
     NotApplicableResult,
     ResolvedAction,
+    ResolvedEnemyReaction,
 )
 from ai_rpg.engine import MvpV1Ruleset
 from ai_rpg.llm.budget import CallBudgetExceeded
-from ai_rpg.scenarios import DirectScenarioAction
+from ai_rpg.scenarios import AttackScenarioAction, DirectScenarioAction, SkillScenarioAction
 
 
 class ResolutionInputError(ValueError):
@@ -234,7 +236,11 @@ class SkillCheckResolutionWorker:
 
         route = work.route
         if route is None:
-            route_decision = self._router.decide(work.player_text)
+            route_decision = (
+                RouteDecision("mechanical", "registered_action_v1", ("registered_action",))
+                if work.selected_action_ref is not None
+                else self._router.decide(work.player_text)
+            )
             async with self._unit_of_work_factory() as unit_of_work:
                 recorded = await unit_of_work.turns.record_initial_route(
                     work.turn_id,
@@ -260,20 +266,27 @@ class SkillCheckResolutionWorker:
     ) -> bool:
 
         try:
-            context = self._mechanical_input(work, snapshot)
-            async with asyncio.timeout(self._policy.request_timeout_seconds):
-                if not await _reserve_call(
-                    self._unit_of_work_factory, work.turn_id, "resolution", work.worker_epoch
-                ):
-                    raise CallBudgetExceeded("LLM呼び出し予算を使い切りました")
-                decision = await self._llm.extract_intent(context, model_id=self._policy.model_id)
-            if decision.kind == "clarification_required":
-                return await self._finalize_not_applied(work, decision.question)
-            if decision.kind != "action_plan":
-                raise ResolutionInputError("ActionPlanが必要です")
+            intents: Sequence[object]
+            if work.selected_action_ref is not None:
+                intents = [self._registered_intent(work, snapshot)]
+            else:
+                context = self._mechanical_input(work, snapshot)
+                async with asyncio.timeout(self._policy.request_timeout_seconds):
+                    if not await _reserve_call(
+                        self._unit_of_work_factory, work.turn_id, "resolution", work.worker_epoch
+                    ):
+                        raise CallBudgetExceeded("LLM呼び出し予算を使い切りました")
+                    decision = await self._llm.extract_intent(
+                        context, model_id=self._policy.model_id
+                    )
+                if decision.kind == "clarification_required":
+                    return await self._finalize_not_applied(work, decision.question)
+                if decision.kind != "action_plan":
+                    raise ResolutionInputError("ActionPlanが必要です")
+                intents = decision.actions
 
             records, resolved, public_state, scenario_update = self._resolve_actions(
-                work, snapshot, decision.actions
+                work, snapshot, intents
             )
         except TimeoutError:
             return await self._handle_failure(work, "MODEL_TIMEOUT")
@@ -296,6 +309,49 @@ class SkillCheckResolutionWorker:
             return await self._handle_failure(work, "UNKNOWN")
         return await self._commit_mechanical(
             work, snapshot, records, resolved, public_state, scenario_update
+        )
+
+    def _registered_intent(
+        self, work: ResolutionWorkItem, snapshot: CanonicalSnapshot
+    ) -> AttackIntent | SkillCheckIntent | ScenarioActionIntent:
+        if snapshot.scenario_run is None or self._scenario_progressor is None:
+            raise ResolutionInputError("Scenario runがありません")
+        assert work.selected_action_ref is not None
+        try:
+            binding = self._scenario_progressor.bind_registered_action(
+                snapshot.scenario_run, work.selected_action_ref
+            )
+        except ScenarioActionUnavailableError as error:
+            raise ResolutionInputError(str(error)) from error
+        if isinstance(binding, DirectScenarioAction):
+            return ScenarioActionIntent(kind="scenario_action", action_ref=binding.action_ref)
+        if isinstance(binding, SkillScenarioAction):
+            return SkillCheckIntent(
+                kind="skill_check",
+                skill_ref=binding.skill_ref,
+                objective=binding.label,
+                target_ref=None,
+            )
+        assert isinstance(binding, AttackScenarioAction)
+        equipped = {
+            row["item_id"]
+            for row in snapshot.inventory
+            if row["owner_id"] == work.actor_id
+            and row["equipped"]
+            and _stored_int(row["quantity"]) > 0
+        }
+        weapons = {row["entity_id"] for row in snapshot.equipment}
+        weapon_refs = sorted(
+            str(row["ref"])
+            for row in snapshot.entities
+            if row["id"] in equipped & weapons
+            and row["ref"] is not None
+            and row["archived_at"] is None
+        )
+        return AttackIntent(
+            kind="attack",
+            target_ref=binding.target_ref,
+            weapon_ref=weapon_refs[0] if weapon_refs else None,
         )
 
     async def _resolve_narrative(
@@ -335,9 +391,7 @@ class SkillCheckResolutionWorker:
                 ChoiceDraft(self._choice_id_factory(), ordinal, choice.label)
                 for ordinal, choice in enumerate(decision.choices, start=1)
             )
-            return await self._commit_narrative(
-                work, snapshot, decision.narration, choices
-            )
+            return await self._commit_narrative(work, snapshot, decision.narration, choices)
 
         try:
             preflight = self._preflight_actions(work, snapshot, decision.actions)
@@ -394,8 +448,7 @@ class SkillCheckResolutionWorker:
         except AuthorizationError:
             return await self._finalize_not_applied(
                 work,
-                "Actorの操作権が更新されたため応答を確定しませんでした。"
-                "もう一度入力してください。",
+                "Actorの操作権が更新されたため応答を確定しませんでした。もう一度入力してください。",
             )
         except StateVersionConflictError:
             return await self._finalize_not_applied(
@@ -419,22 +472,64 @@ class SkillCheckResolutionWorker:
         public_state: list[ContextFragment],
         scenario_update: ScenarioProgressUpdate | None,
     ) -> bool:
+        combat = resolve_enemy_reaction(
+            work,
+            snapshot,
+            records,
+            scenario_update,
+            ruleset=self._ruleset,
+            progressor=self._scenario_progressor,
+            reaction_id_factory=self._action_id_factory,
+            rng_source=self._rng_source,
+            rng_implementation_version=self._rng_implementation_version,
+        )
+        if combat.scenario_update != scenario_update and combat.scenario_update is not None:
+            assert snapshot.scenario_run is not None
+            public_state.append(
+                self._scenario_public_state_after(snapshot.scenario_run, combat.scenario_update)
+            )
+        scenario_update = combat.scenario_update
+        for reaction in combat.reactions:
+            for change in reaction.result.state_changes:
+                if isinstance(change, DamageApplied):
+                    actor_ref = next(
+                        str(e["ref"]) for e in snapshot.entities if e["id"] == work.actor_id
+                    )
+                    public_state.append(
+                        ContextFragment(
+                            source=f"entity:{actor_ref}",
+                            trust_level="derived",
+                            access_scope="public",
+                            content=f"敵の反撃後の @{actor_ref} HP {change.hp_after}",
+                        )
+                    )
+        narration_reactions = [
+            ResolvedEnemyReaction(
+                reaction_id=r.command.action_id,
+                actor_id=r.command.actor_id,
+                target_id=r.command.target_id,
+                result=r.result,
+            )
+            for r in combat.reactions
+        ]
+        results = [a.result for a in records] + [r.result for r in combat.reactions]
         state_changed = scenario_update is not None or any(
-            isinstance(action.result, AppliedResult)
+            isinstance(result, AppliedResult)
             and any(
                 isinstance(change, ItemConsumed)
                 or (
                     isinstance(change, (DamageApplied, HealingApplied))
                     and change.hp_before != change.hp_after
                 )
-                for change in action.result.state_changes
+                for change in result.state_changes
             )
-            for action in records
+            for result in results
         )
         narration_input = MechanicalNarrationInput(
             player_text=work.player_text,
             committed_state_version=snapshot.state_version + int(state_changed),
             resolved_actions=resolved,
+            enemy_reactions=narration_reactions,
             public_state_after=public_state,
             allowed_entity_refs=self._allowed_entity_refs(work, snapshot),
             output_limits=OutputLimits(max_actions=work.max_actions, max_choices=5),
@@ -448,6 +543,7 @@ class SkillCheckResolutionWorker:
             actions=records,
             narration_input=narration_input,
             scenario_update=scenario_update,
+            enemy_reactions=combat.reactions,
         )
         try:
             async with self._unit_of_work_factory() as unit_of_work:
@@ -456,8 +552,7 @@ class SkillCheckResolutionWorker:
         except AuthorizationError:
             return await self._finalize_not_applied(
                 work,
-                "Actorの操作権が更新されたため行動を確定しませんでした。"
-                "もう一度入力してください。",
+                "Actorの操作権が更新されたため行動を確定しませんでした。もう一度入力してください。",
             )
         except StateVersionConflictError:
             return await self._finalize_not_applied(
@@ -479,9 +574,7 @@ class SkillCheckResolutionWorker:
         require_completed_narration: bool,
     ) -> bool:
         async with self._unit_of_work_factory() as unit_of_work:
-            response = await unit_of_work.turns.get_response(
-                work.campaign_id, work.turn_id
-            )
+            response = await unit_of_work.turns.get_response(work.campaign_id, work.turn_id)
             await unit_of_work.rollback()
         if response is None or response.resolution_status != "committed":
             return False
@@ -521,8 +614,7 @@ class SkillCheckResolutionWorker:
         if supported_skills:
             supported_actions.append("skill_check")
         if any(
-            row["owner_id"] == work.actor_id
-            and _stored_int(row["quantity"]) > 0
+            row["owner_id"] == work.actor_id and _stored_int(row["quantity"]) > 0
             for row in snapshot.inventory
         ):
             supported_actions.append("use_item")
@@ -551,9 +643,7 @@ class SkillCheckResolutionWorker:
     @staticmethod
     def _visible_entity_ids(work: ResolutionWorkItem, snapshot: CanonicalSnapshot) -> set[UUID]:
         scene_public = {
-            UUID(str(row["entity_id"]))
-            for row in snapshot.scene_entities
-            if bool(row["is_public"])
+            UUID(str(row["entity_id"])) for row in snapshot.scene_entities if bool(row["is_public"])
         }
         owned = {
             UUID(str(row["item_id"]))
@@ -617,10 +707,28 @@ class SkillCheckResolutionWorker:
     def _public_context(
         self, work: ResolutionWorkItem, snapshot: CanonicalSnapshot
     ) -> tuple[ContextFragment, ContextFragment]:
-        modifiers = [
-            f"{row['skill_ref']}:{_stored_int(row['modifier']):+d}"
+        modifiers = {
+            str(row["skill_ref"]): _stored_int(row["modifier"])
             for row in snapshot.skills
             if row["character_id"] == work.actor_id
+        }
+        actor = next(
+            (row for row in snapshot.characters if row["entity_id"] == work.actor_id), None
+        )
+        public_items = {
+            row["id"]: row
+            for row in snapshot.entities
+            if row["ref"] is not None and row["archived_at"] is None
+        }
+        inventory = [
+            {
+                "item_ref": public_items[row["item_id"]]["ref"],
+                "name": public_items[row["item_id"]]["label"],
+                "quantity": _stored_int(row["quantity"]),
+                "equipped": bool(row["equipped"]),
+            }
+            for row in snapshot.inventory
+            if row["owner_id"] == work.actor_id and row["item_id"] in public_items
         ]
         scenario_context = (
             None if snapshot.scenario_run is None else self._scenario_context(snapshot)
@@ -639,9 +747,9 @@ class SkillCheckResolutionWorker:
                         "objective": scenario_context.objective,
                         "discovered_facts": scenario_context.discovered_facts,
                         "available_actions": [
-                            {"action_ref": action_ref, "label": label}
-                            for action_ref, label in scenario_context.available_actions
+                            asdict(action) for action in scenario_context.action_details
                         ],
+                        "npc_notes": scenario_context.npc_notes,
                     }
                 )
             ),
@@ -652,10 +760,13 @@ class SkillCheckResolutionWorker:
                 source="active_pc",
                 trust_level="trusted",
                 access_scope="actor_private",
-                content=(
-                    "操作中PC。技能補正: " + ", ".join(modifiers)
-                    if modifiers
-                    else "操作中PC。公開可能な技能補正はない。"
+                content=_json(
+                    {
+                        "current_hp": None if actor is None else actor["current_hp"],
+                        "max_hp": None if actor is None else actor["max_hp"],
+                        "skills": modifiers,
+                        "inventory": inventory,
+                    }
                 ),
             ),
         )
@@ -665,9 +776,7 @@ class SkillCheckResolutionWorker:
             raise ResolutionInputError("Scenario進行componentが設定されていません")
         return self._scenario_progressor.public_context_for(snapshot.scenario_run)
 
-    async def _handle_failure(
-        self, work: ResolutionWorkItem, failure_code: str
-    ) -> bool:
+    async def _handle_failure(self, work: ResolutionWorkItem, failure_code: str) -> bool:
         disposition = await _record_failure(
             self._unit_of_work_factory,
             work.turn_id,
@@ -686,9 +795,7 @@ class SkillCheckResolutionWorker:
             failure_code,
         )
 
-    async def _finalize_not_applied(
-        self, work: ResolutionWorkItem, question: str
-    ) -> bool:
+    async def _finalize_not_applied(self, work: ResolutionWorkItem, question: str) -> bool:
         try:
             async with self._unit_of_work_factory() as unit_of_work:
                 finalized = await unit_of_work.turns.finalize_not_applied(
@@ -763,16 +870,12 @@ class SkillCheckResolutionWorker:
         }
         refs = EntityRefMap(ref_rows)
         id_to_ref = {entity_id: ref for ref, entity_id in ref_rows.items()}
-        weapons = {
-            UUID(str(row["entity_id"])): row for row in snapshot.equipment
-        }
+        weapons = {UUID(str(row["entity_id"])): row for row in snapshot.equipment}
         inventory_rows = {
             (UUID(str(row["owner_id"])), UUID(str(row["item_id"]))): row
             for row in snapshot.inventory
         }
-        quantities = {
-            key: _stored_int(row["quantity"]) for key, row in inventory_rows.items()
-        }
+        quantities = {key: _stored_int(row["quantity"]) for key, row in inventory_rows.items()}
 
         def resolve_ref(ref: str) -> UUID:
             try:
@@ -810,7 +913,8 @@ class SkillCheckResolutionWorker:
                 if modifier_row is None:
                     raise ResolutionInputError("actorに登録済み技能補正がありません")
                 skill_data[raw_intent.skill_ref] = (
-                    checks[0], _stored_int(modifier_row["modifier"])
+                    checks[0],
+                    _stored_int(modifier_row["modifier"]),
                 )
             elif isinstance(raw_intent, AttackIntent):
                 target_id = resolve_ref(raw_intent.target_ref)
@@ -899,9 +1003,7 @@ class SkillCheckResolutionWorker:
         draw_index = 0
         for ordinal, raw_intent in enumerate(intents, start=1):
             actor = characters[work.actor_id]
-            command: (
-                AttackCommand | SkillCheckCommand | UseItemCommand | ScenarioActionCommand
-            )
+            command: AttackCommand | SkillCheckCommand | UseItemCommand | ScenarioActionCommand
             result: AppliedResult | NotApplicableResult
             check: Mapping[str, object] | None = None
             binding = scenario_bindings[ordinal - 1]
@@ -927,9 +1029,7 @@ class SkillCheckResolutionWorker:
             elif isinstance(raw_intent, SkillCheckIntent):
                 check, modifier = skill_data[raw_intent.skill_ref]
                 try:
-                    difficulty_class = self._ruleset.difficulty_class(
-                        str(check["difficulty"])
-                    )
+                    difficulty_class = self._ruleset.difficulty_class(str(check["difficulty"]))
                 except ValueError as error:
                     raise ResolutionInputError(str(error)) from error
                 command = SkillCheckCommand(
@@ -974,9 +1074,7 @@ class SkillCheckResolutionWorker:
                     damage_bonus=damage_bonus,
                 )
                 if target.current_hp == 0:
-                    result = NotApplicableResult(
-                        kind="not_applicable", reason="target_unavailable"
-                    )
+                    result = NotApplicableResult(kind="not_applicable", reason="target_unavailable")
                 else:
                     try:
                         result = self._ruleset.resolve_attack(command, actor, target)
@@ -1006,9 +1104,7 @@ class SkillCheckResolutionWorker:
                         kind="not_applicable", reason="resource_unavailable"
                     )
                 elif actor.current_hp >= actor.max_hp:
-                    result = NotApplicableResult(
-                        kind="not_applicable", reason="rule_precondition"
-                    )
+                    result = NotApplicableResult(kind="not_applicable", reason="rule_precondition")
                 else:
                     try:
                         result = self._ruleset.resolve_use_item(
@@ -1043,9 +1139,7 @@ class SkillCheckResolutionWorker:
                         current = characters.get(change.target_id)
                         if current is None or current.current_hp != change.hp_before:
                             raise ResolutionInputError("EngineのHP遷移が作業状態と一致しません")
-                        characters[change.target_id] = character_with_hp(
-                            current, change.hp_after
-                        )
+                        characters[change.target_id] = character_with_hp(current, change.hp_after)
                         ref = id_to_ref.get(change.target_id)
                         if ref is not None:
                             public_state.append(
@@ -1053,9 +1147,7 @@ class SkillCheckResolutionWorker:
                                     source=f"entity:{ref}",
                                     trust_level="derived",
                                     access_scope="public",
-                                    content=(
-                                        f"@{ref} HP {change.hp_after}/{current.max_hp}"
-                                    ),
+                                    content=(f"@{ref} HP {change.hp_after}/{current.max_hp}"),
                                 )
                             )
                     elif isinstance(change, ItemConsumed):
@@ -1106,9 +1198,7 @@ class SkillCheckResolutionWorker:
                 )
                 if scenario_update is not None:
                     public_state.append(
-                        self._scenario_public_state_after(
-                            snapshot.scenario_run, scenario_update
-                        )
+                        self._scenario_public_state_after(snapshot.scenario_run, scenario_update)
                     )
         return tuple(records), resolved, public_state, scenario_update
 
@@ -1130,19 +1220,13 @@ class SkillCheckResolutionWorker:
             try:
                 binding: ScenarioActionBinding | None
                 if isinstance(intent, ScenarioActionIntent):
-                    binding = self._scenario_progressor.bind_scenario_action(
-                        run, intent.action_ref
-                    )
+                    binding = self._scenario_progressor.bind_scenario_action(run, intent.action_ref)
                     if binding is None:
                         raise ResolutionInputError("登録済みScenario行動ではありません")
                 elif isinstance(intent, SkillCheckIntent):
-                    binding = self._scenario_progressor.bind_skill_check(
-                        run, intent.skill_ref
-                    )
+                    binding = self._scenario_progressor.bind_skill_check(run, intent.skill_ref)
                 elif isinstance(intent, AttackIntent):
-                    binding = self._scenario_progressor.bind_attack(
-                        run, intent.target_ref
-                    )
+                    binding = self._scenario_progressor.bind_attack(run, intent.target_ref)
                 else:
                     binding = None
             except ScenarioActionUnavailableError as error:
@@ -1160,24 +1244,28 @@ class SkillCheckResolutionWorker:
         assert self._scenario_progressor is not None
         definition = self._scenario_progressor.definition_for(run)
         if update.to_scene_id is not None:
-            runtime_scene = next(
-                scene for scene in run.scenes if scene.id == update.to_scene_id
-            )
+            runtime_scene = next(scene for scene in run.scenes if scene.id == update.to_scene_id)
             scene = next(
-                scene
-                for scene in definition.scenes
-                if scene.sequence == runtime_scene.sequence
+                scene for scene in definition.scenes if scene.sequence == runtime_scene.sequence
             )
             source = "scenario_scene"
             content = f"{scene.title}: {scene.description}"
-        else:
+        elif update.ending_ref is not None:
             ending = next(
-                ending
-                for ending in definition.endings
-                if ending.ending_ref == update.ending_ref
+                ending for ending in definition.endings if ending.ending_ref == update.ending_ref
             )
             source = "scenario_ending"
             content = f"{ending.title}: {ending.summary}"
+        else:
+            source = "scenario_facts"
+            content = (
+                " / ".join(
+                    flag.public_fact
+                    for flag in definition.flags
+                    if flag.flag_ref in update.add_flags
+                )
+                or "現在の場面で行動を終えた。"
+            )
         return ContextFragment(
             source=source,
             trust_level="trusted",
@@ -1215,9 +1303,7 @@ class NarrationWorker:
             return False
 
         async with self._unit_of_work_factory() as unit_of_work:
-            work = await unit_of_work.narration.get_work(
-                lease.turn_id, lease.worker_epoch
-            )
+            work = await unit_of_work.narration.get_work(lease.turn_id, lease.worker_epoch)
             await unit_of_work.commit()
         if work is None:
             return False
@@ -1270,9 +1356,7 @@ class NarrationWorker:
             await unit_of_work.commit()
         return True
 
-    async def _handle_failure(
-        self, narration_work: NarrationWorkItem, failure_code: str
-    ) -> bool:
+    async def _handle_failure(self, narration_work: NarrationWorkItem, failure_code: str) -> bool:
         disposition = await _record_failure(
             self._unit_of_work_factory,
             narration_work.turn_id,

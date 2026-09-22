@@ -36,6 +36,7 @@ from ai_rpg.application.ports.repositories import (
     PublicEventRepository,
     RecentMessage,
     ResolutionWorkItem,
+    ScenarioActionNotAvailableError,
     ScenarioRepository,
     ScenarioRunSnapshot,
     ScenarioSceneSnapshot,
@@ -50,6 +51,7 @@ from ai_rpg.application.resolution import (
     TurnCommitContext,
     project_resolution,
 )
+from ai_rpg.application.scenarios import ScenarioActionUnavailableError, ScenarioProgressor
 from ai_rpg.contracts import (
     CampaignStateResponse,
     PlayerTurnInput,
@@ -85,6 +87,7 @@ from ai_rpg.infrastructure.postgres.models import (
     TurnChoiceModel,
     TurnModel,
 )
+from ai_rpg.scenarios import BUILTIN_SCENARIOS
 
 
 def _json(value: object) -> str:
@@ -107,9 +110,7 @@ def _public_action_summary(result: Mapping[str, object]) -> str | None:
         )[:8000]
     if kind == "not_applicable":
         not_applicable = NotApplicableResult.model_validate(result)
-        return _json(
-            {"kind": not_applicable.kind, "reason": not_applicable.reason}
-        )
+        return _json({"kind": not_applicable.kind, "reason": not_applicable.reason})
     return None
 
 
@@ -282,9 +283,10 @@ async def _assert_resolution_lease_current(
     worker_epoch: int,
 ) -> None:
     validity = (
-        await session.execute(
-            text(
-                """
+        (
+            await session.execute(
+                text(
+                    """
                 SELECT
                     lease_until>clock_timestamp() AS lease_current,
                     resolution_deadline>clock_timestamp() AS deadline_current
@@ -293,10 +295,13 @@ async def _assert_resolution_lease_current(
                   AND worker_epoch=:epoch
                   AND resolution_status='resolving'
                 """
-            ),
-            {"turn": turn_id, "epoch": worker_epoch},
+                ),
+                {"turn": turn_id, "epoch": worker_epoch},
+            )
         )
-    ).mappings().one_or_none()
+        .mappings()
+        .one_or_none()
+    )
     if validity is None or validity["lease_current"] is not True:
         raise RuntimeError("worker leaseが無効です")
     if validity["deadline_current"] is not True:
@@ -363,9 +368,10 @@ class PostgresTurnRepository:
             response_row["created_by"],
             turn,
         )
-        if response_row["input_payload"] != turn.model_dump(mode="json") or bytes(
-            response_row["request_hash"]
-        ) != digest:
+        if (
+            response_row["input_payload"] != turn.model_dump(mode="json")
+            or bytes(response_row["request_hash"]) != digest
+        ):
             raise IdempotencyConflictError("同じrequest_idに異なる入力は使用できません")
         return self._to_response(response_row)
 
@@ -388,6 +394,7 @@ class PostgresTurnRepository:
                     }
                     for action in row["replay_actions"]
                 ],
+                "enemy_reactions": row.get("replay_enemy_reactions", []),
                 "recovery": {
                     "fallback": row["narration_status"] == "fallback",
                     "reason": _public_recovery_reason(row["recovery_reason"]),
@@ -395,9 +402,7 @@ class PostgresTurnRepository:
             }
         )
 
-    async def _response_row(
-        self, campaign_id: UUID, turn_id: UUID
-    ) -> RowMapping | None:
+    async def _response_row(self, campaign_id: UUID, turn_id: UUID) -> RowMapping | None:
         result = await self._session.execute(
             text(
                 """
@@ -421,7 +426,16 @@ class PostgresTurnRepository:
                            )
                            FROM actions AS a
                            WHERE a.turn_id=t.id
-                       ), '[]'::jsonb) AS replay_actions
+                       ), '[]'::jsonb) AS replay_actions,
+                       COALESCE((
+                           SELECT jsonb_agg(jsonb_build_object(
+                               'reaction_id', e.payload->'command'->'action_id',
+                               'actor_id', e.payload->'command'->'actor_id',
+                               'target_id', e.payload->'command'->'target_id',
+                               'result', e.payload->'result') ORDER BY e.sequence)
+                           FROM events AS e
+                           WHERE e.turn_id=t.id AND e.type='EnemyReactionResolved'
+                       ), '[]'::jsonb) AS replay_enemy_reactions
                 FROM turns AS t
                 WHERE t.id=:turn AND t.campaign_id=:campaign
                 """
@@ -430,9 +444,7 @@ class PostgresTurnRepository:
         )
         return result.mappings().one_or_none()
 
-    async def get_response(
-        self, campaign_id: UUID, turn_id: UUID
-    ) -> TurnResponse | None:
+    async def get_response(self, campaign_id: UUID, turn_id: UUID) -> TurnResponse | None:
         row = await self._response_row(campaign_id, turn_id)
         return None if row is None else self._to_response(row)
 
@@ -563,12 +575,16 @@ class PostgresTurnRepository:
     ) -> TurnRow | None:
         # 全Canonical更新経路と同じくCampaignを最初にロックする。
         campaign = (
-            await self._session.execute(
-                select(CampaignModel.state_version, CampaignModel.status)
-                .where(CampaignModel.id == campaign_id)
-                .with_for_update()
+            (
+                await self._session.execute(
+                    select(CampaignModel.state_version, CampaignModel.status)
+                    .where(CampaignModel.id == campaign_id)
+                    .with_for_update()
+                )
             )
-        ).mappings().one()
+            .mappings()
+            .one()
+        )
         if not await self._can_access_campaign(campaign_id, principal_id):
             raise AuthorizationError("Campaignを参照する権限がありません")
         if await self._request_row(campaign_id, principal_id, turn.request_id) is not None:
@@ -614,6 +630,18 @@ class PostgresTurnRepository:
         if turn.expected_state_version != current_version:
             raise StateVersionConflictError("Campaignのstate versionが更新されています")
         content = turn.content.model_dump(mode="json")
+        input_text = content.get("text")
+        if turn.content.kind == "scenario_action":
+            run = await PostgresScenarioRepository(self._session).snapshot(campaign_id)
+            if run is None:
+                raise ScenarioActionNotAvailableError("Scenario runがありません")
+            try:
+                binding = ScenarioProgressor(BUILTIN_SCENARIOS).bind_registered_action(
+                    run, turn.content.action_ref
+                )
+            except ScenarioActionUnavailableError as error:
+                raise ScenarioActionNotAvailableError(str(error)) from error
+            input_text = binding.label
         if turn.content.kind == "choice":
             available_choice = await self._session.execute(
                 text(
@@ -665,16 +693,15 @@ class PostgresTurnRepository:
             "input_payload": turn.model_dump(mode="json"),
             "request_hash": request_hash(1, campaign_id, scene_id, principal_id, turn),
             "input_kind": content["kind"],
-            "input_text": content.get("text"),
+            "input_text": input_text,
             "selected_choice_id": content.get("choice_id"),
+            "selected_action_ref": content.get("action_ref"),
             "expected_state_version": turn.expected_state_version,
             "max_actions": max_actions,
             "llm_call_budget": llm_call_budget,
         }
         result = await self._session.execute(
-            insert(TurnModel)
-            .on_conflict_do_nothing()
-            .returning(*TurnModel.__table__.c),
+            insert(TurnModel).on_conflict_do_nothing().returning(*TurnModel.__table__.c),
             params,
         )
         row = result.mappings().one_or_none()
@@ -785,9 +812,7 @@ class PostgresTurnRepository:
                         TurnModel.campaign_id == current["campaign_id"],
                         TurnModel.scene_id == current["scene_id"],
                         TurnModel.actor_id == current["actor_id"],
-                        TurnModel.resolution_status.in_(
-                            ("committed", "not_applied", "failed")
-                        ),
+                        TurnModel.resolution_status.in_(("committed", "not_applied", "failed")),
                         TurnModel.narration_status.in_(("completed", "fallback")),
                         or_(
                             TurnModel.created_at < current["created_at"],
@@ -842,9 +867,10 @@ class PostgresTurnRepository:
         if not 0 <= recent_messages_limit <= 100:
             raise ValueError("recent_messages_limitは0から100の範囲で指定してください")
         row = (
-            await self._session.execute(
-                text(
-                    """
+            (
+                await self._session.execute(
+                    text(
+                        """
                     SELECT
                         t.id,
                         t.campaign_id,
@@ -871,6 +897,7 @@ class PostgresTurnRepository:
                         t.max_actions,
                         t.expected_state_version,
                         t.route,
+                        t.selected_action_ref,
                         t.created_at,
                         COALESCE(t.input_text,c.label) AS player_text
                     FROM turns AS t
@@ -880,10 +907,13 @@ class PostgresTurnRepository:
                       AND t.resolution_status='resolving'
                       AND t.lease_until>clock_timestamp()
                     """
-                ),
-                {"turn": turn_id, "epoch": worker_epoch},
+                    ),
+                    {"turn": turn_id, "epoch": worker_epoch},
+                )
             )
-        ).mappings().one_or_none()
+            .mappings()
+            .one_or_none()
+        )
         if row is None:
             return None
         recent_messages = await self._recent_messages(row, recent_messages_limit)
@@ -900,6 +930,7 @@ class PostgresTurnRepository:
             player_text=str(row["player_text"]),
             recent_messages=recent_messages,
             route=row["route"],
+            selected_action_ref=row["selected_action_ref"],
         )
 
     async def record_initial_route(
@@ -961,28 +992,21 @@ class PostgresTurnRepository:
         )
         return result.scalar_one_or_none() is not None
 
-    async def finalize_not_applied(
-        self, turn_id: UUID, worker_epoch: int, narration: str
-    ) -> bool:
+    async def finalize_not_applied(self, turn_id: UUID, worker_epoch: int, narration: str) -> bool:
         campaign_id = await self._session.scalar(
             select(TurnModel.campaign_id).where(TurnModel.id == turn_id)
         )
         if campaign_id is None:
             return False
         await self._session.execute(
-            select(CampaignModel.id)
-            .where(CampaignModel.id == campaign_id)
-            .with_for_update()
+            select(CampaignModel.id).where(CampaignModel.id == campaign_id).with_for_update()
         )
         turn = (
             await self._session.execute(
                 select(TurnModel).where(TurnModel.id == turn_id).with_for_update()
             )
         ).scalar_one()
-        if (
-            turn.resolution_status == "not_applied"
-            and turn.narration_status == "completed"
-        ):
+        if turn.resolution_status == "not_applied" and turn.narration_status == "completed":
             return True
         if turn.resolution_status != "resolving" or turn.worker_epoch != worker_epoch:
             return False
@@ -1058,10 +1082,7 @@ class PostgresTurnRepository:
         turn = (
             (
                 await self._session.execute(
-                    text(
-                        "SELECT * FROM turns "
-                        "WHERE id=:t AND campaign_id=:c FOR UPDATE"
-                    ),
+                    text("SELECT * FROM turns WHERE id=:t AND campaign_id=:c FOR UPDATE"),
                     {"t": bundle.turn_id, "c": bundle.campaign_id},
                 )
             )
@@ -1081,8 +1102,7 @@ class PostgresTurnRepository:
                 (
                     await self._session.execute(
                         text(
-                            "SELECT status FROM mvp_scenario_runs "
-                            "WHERE campaign_id=:c FOR UPDATE"
+                            "SELECT status FROM mvp_scenario_runs WHERE campaign_id=:c FOR UPDATE"
                         ),
                         {"c": bundle.campaign_id},
                     )
@@ -1106,10 +1126,7 @@ class PostgresTurnRepository:
                     },
                 )
             ).scalar_one_or_none()
-            if (
-                current_scene_id is None
-                or scenario_update.from_scene_id != turn["scene_id"]
-            ):
+            if current_scene_id is None or scenario_update.from_scene_id != turn["scene_id"]:
                 raise InvalidCommitBundleError("Scenarioのfrom Sceneが現在地と一致しません")
 
             if scenario_update.to_scene_id is not None:
@@ -1130,10 +1147,7 @@ class PostgresTurnRepository:
                         "Scenarioのto Sceneが同一Campaignのplanned Sceneではありません"
                     )
 
-            if (
-                scenario_update.ending_ref is not None
-                and scenario_update.to_scene_id is not None
-            ):
+            if scenario_update.ending_ref is not None and scenario_update.to_scene_id is not None:
                 raise InvalidCommitBundleError("Scenarioのto SceneとEndingは排他的です")
 
             other_active_count = int(
@@ -1151,8 +1165,7 @@ class PostgresTurnRepository:
                 ).scalar_one()
             )
             closes_current = (
-                scenario_update.to_scene_id is not None
-                or scenario_update.ending_ref is not None
+                scenario_update.to_scene_id is not None or scenario_update.ending_ref is not None
             )
             resulting_active_count = (
                 other_active_count
@@ -1160,19 +1173,42 @@ class PostgresTurnRepository:
                 + int(scenario_update.to_scene_id is not None)
             )
             if resulting_active_count > 1:
-                raise InvalidCommitBundleError(
-                    "Scenario更新後のactive Sceneが一件を超えます"
-                )
+                raise InvalidCommitBundleError("Scenario更新後のactive Sceneが一件を超えます")
         await _assert_turn_actor_authorized(self._session, turn)
         if int(campaign["state_version"]) != bundle.base_state_version:
             raise StateVersionConflictError("Canonical versionが更新されています")
         first = int(campaign["event_sequence"]) + 1
+        enemy_id = None
+        if bundle.enemy_reactions:
+            run_snapshot = await PostgresScenarioRepository(self._session).snapshot(
+                bundle.campaign_id
+            )
+            combat = (
+                None
+                if run_snapshot is None
+                else ScenarioProgressor(BUILTIN_SCENARIOS).scene_for(run_snapshot).combat
+            )
+            if combat is not None:
+                enemy_id = await self._session.scalar(
+                    select(EntityModel.id)
+                    .join(MvpSceneEntityModel, MvpSceneEntityModel.entity_id == EntityModel.id)
+                    .where(
+                        EntityModel.campaign_id == bundle.campaign_id,
+                        EntityModel.ref == combat.enemy_ref,
+                        EntityModel.kind == "npc",
+                        EntityModel.archived_at.is_(None),
+                        MvpSceneEntityModel.scene_id == bundle.scene_id,
+                        MvpSceneEntityModel.is_public.is_(True),
+                        MvpSceneEntityModel.is_attack_reachable.is_(True),
+                    )
+                )
         projection = project_resolution(
             bundle,
             TurnCommitContext(
                 scene_id=turn["scene_id"],
                 actor_id=turn["actor_id"],
                 max_actions=int(turn["max_actions"]),
+                enemy_id=enemy_id,
             ),
             first_event_sequence=first,
             event_id_factory=self._event_id_factory,
@@ -1182,9 +1218,7 @@ class PostgresTurnRepository:
             bundle.campaign_id,
             projection.canonical_mutations,
         )
-        await _assert_resolution_lease_current(
-            self._session, bundle.turn_id, bundle.worker_epoch
-        )
+        await _assert_resolution_lease_current(self._session, bundle.turn_id, bundle.worker_epoch)
         for mutation in projection.canonical_mutations:
             if isinstance(mutation, CharacterHpMutation):
                 updated = await self._session.execute(
@@ -1224,10 +1258,7 @@ class PostgresTurnRepository:
         if scenario_update is not None:
             for flag_ref in scenario_update.add_flags:
                 await self._session.execute(
-                    text(
-                        "INSERT INTO mvp_scenario_flags(campaign_id,flag_ref) "
-                        "VALUES(:c,:flag)"
-                    ),
+                    text("INSERT INTO mvp_scenario_flags(campaign_id,flag_ref) VALUES(:c,:flag)"),
                     {"c": bundle.campaign_id, "flag": flag_ref},
                 )
             if closes_current:
@@ -1304,11 +1335,7 @@ class PostgresTurnRepository:
         )
         for action in projection.actions:
             command = action.command
-            target_id = (
-                None
-                if isinstance(command, ScenarioActionCommand)
-                else command.target_id
-            )
+            target_id = None if isinstance(command, ScenarioActionCommand) else command.target_id
             item_id = (
                 command.weapon_id
                 if isinstance(command, AttackCommand)
@@ -1392,27 +1419,29 @@ class PostgresTurnRepository:
 
     async def commit_narrative(self, commit: NarrativeCommit) -> int:
         campaign = (
-            await self._session.execute(
-                text(
-                    "SELECT state_version,event_sequence FROM campaigns "
-                    "WHERE id=:campaign FOR UPDATE"
-                ),
-                {"campaign": commit.campaign_id},
+            (
+                await self._session.execute(
+                    text(
+                        "SELECT state_version,event_sequence FROM campaigns "
+                        "WHERE id=:campaign FOR UPDATE"
+                    ),
+                    {"campaign": commit.campaign_id},
+                )
             )
-        ).mappings().one()
+            .mappings()
+            .one()
+        )
         turn = (
-            await self._session.execute(
-                text(
-                    "SELECT * FROM turns "
-                    "WHERE id=:turn AND campaign_id=:campaign FOR UPDATE"
-                ),
-                {"turn": commit.turn_id, "campaign": commit.campaign_id},
+            (
+                await self._session.execute(
+                    text("SELECT * FROM turns WHERE id=:turn AND campaign_id=:campaign FOR UPDATE"),
+                    {"turn": commit.turn_id, "campaign": commit.campaign_id},
+                )
             )
-        ).mappings().one()
-        if (
-            turn["resolution_status"] == "committed"
-            and turn["narration_status"] == "completed"
-        ):
+            .mappings()
+            .one()
+        )
+        if turn["resolution_status"] == "committed" and turn["narration_status"] == "completed":
             return int(turn["committed_state_version"])
         if (
             turn["resolution_status"] != "resolving"
@@ -1423,16 +1452,12 @@ class PostgresTurnRepository:
         await _assert_turn_actor_authorized(self._session, turn)
         if int(campaign["state_version"]) != commit.base_state_version:
             raise StateVersionConflictError("Canonical versionが更新されています")
-        await _assert_resolution_lease_current(
-            self._session, commit.turn_id, commit.worker_epoch
-        )
+        await _assert_resolution_lease_current(self._session, commit.turn_id, commit.worker_epoch)
 
         version = int(campaign["state_version"])
         sequence = int(campaign["event_sequence"]) + 1
         await self._session.execute(
-            text(
-                "UPDATE campaigns SET event_sequence=:sequence WHERE id=:campaign"
-            ),
+            text("UPDATE campaigns SET event_sequence=:sequence WHERE id=:campaign"),
             {"sequence": sequence, "campaign": commit.campaign_id},
         )
         await self._session.execute(
@@ -1509,16 +1534,20 @@ class PostgresScenarioRepository:
 
     async def snapshot(self, campaign_id: UUID) -> ScenarioRunSnapshot | None:
         run = (
-            await self._session.execute(
-                select(
-                    MvpScenarioRunModel.campaign_id,
-                    MvpScenarioRunModel.scenario_ref,
-                    MvpScenarioRunModel.scenario_version,
-                    MvpScenarioRunModel.status,
-                    MvpScenarioRunModel.ending_ref,
-                ).where(MvpScenarioRunModel.campaign_id == campaign_id)
+            (
+                await self._session.execute(
+                    select(
+                        MvpScenarioRunModel.campaign_id,
+                        MvpScenarioRunModel.scenario_ref,
+                        MvpScenarioRunModel.scenario_version,
+                        MvpScenarioRunModel.status,
+                        MvpScenarioRunModel.ending_ref,
+                    ).where(MvpScenarioRunModel.campaign_id == campaign_id)
+                )
             )
-        ).mappings().one_or_none()
+            .mappings()
+            .one_or_none()
+        )
         if run is None:
             return None
 
@@ -1669,9 +1698,7 @@ class PostgresLLMCallRepository:
         if campaign_id is None:
             return None
         await self._session.execute(
-            select(CampaignModel.id)
-            .where(CampaignModel.id == campaign_id)
-            .with_for_update()
+            select(CampaignModel.id).where(CampaignModel.id == campaign_id).with_for_update()
         )
         if phase == "resolution":
             ownership = (
@@ -1692,9 +1719,10 @@ class PostgresLLMCallRepository:
             raise ValueError(f"未対応のLLM phaseです: {phase}")
 
         row = (
-            await self._session.execute(
-                text(
-                    f"""
+            (
+                await self._session.execute(
+                    text(
+                        f"""
                     SELECT
                         ({attempts}<:max_attempts
                          AND {deadline}>clock_timestamp()
@@ -1705,14 +1733,17 @@ class PostgresLLMCallRepository:
                     WHERE id=:turn AND {ownership}
                     FOR UPDATE
                     """
-                ),
-                {
-                    "turn": turn_id,
-                    "epoch": worker_epoch,
-                    "max_attempts": max_attempts,
-                },
+                    ),
+                    {
+                        "turn": turn_id,
+                        "epoch": worker_epoch,
+                        "max_attempts": max_attempts,
+                    },
+                )
             )
-        ).mappings().one_or_none()
+            .mappings()
+            .one_or_none()
+        )
         if row is None:
             return None
         retry = bool(row["retry"])
@@ -1862,24 +1893,26 @@ class PostgresNarrationRepository:
             terminal_cleanup=bool(row["terminal_cleanup"]),
         )
 
-    async def get_work(
-        self, turn_id: UUID, worker_epoch: int
-    ) -> NarrationWorkItem | None:
+    async def get_work(self, turn_id: UUID, worker_epoch: int) -> NarrationWorkItem | None:
         row = (
-            await self._session.execute(
-                select(
-                    TurnModel.id,
-                    TurnModel.campaign_id,
-                    TurnModel.narration_worker_epoch,
-                    TurnModel.narration_input,
-                ).where(
-                    TurnModel.id == turn_id,
-                    TurnModel.narration_worker_epoch == worker_epoch,
-                    TurnModel.narration_status == "generating",
-                    TurnModel.narration_lease_until > text("clock_timestamp()"),
+            (
+                await self._session.execute(
+                    select(
+                        TurnModel.id,
+                        TurnModel.campaign_id,
+                        TurnModel.narration_worker_epoch,
+                        TurnModel.narration_input,
+                    ).where(
+                        TurnModel.id == turn_id,
+                        TurnModel.narration_worker_epoch == worker_epoch,
+                        TurnModel.narration_status == "generating",
+                        TurnModel.narration_lease_until > text("clock_timestamp()"),
+                    )
                 )
             )
-        ).mappings().one_or_none()
+            .mappings()
+            .one_or_none()
+        )
         if row is None:
             return None
         return NarrationWorkItem(
@@ -1905,14 +1938,17 @@ class PostgresNarrationRepository:
     ) -> bool:
         # Campaign→Turnのロック順を確定処理と統一する。
         campaign = (
-            await self._session.execute(
-                text(
-                    "SELECT state_version,event_sequence FROM campaigns "
-                    "WHERE id=:c FOR UPDATE"
-                ),
-                {"c": campaign_id},
+            (
+                await self._session.execute(
+                    text(
+                        "SELECT state_version,event_sequence FROM campaigns WHERE id=:c FOR UPDATE"
+                    ),
+                    {"c": campaign_id},
+                )
             )
-        ).mappings().one()
+            .mappings()
+            .one()
+        )
         result = await self._session.execute(
             text(
                 """
@@ -1984,9 +2020,7 @@ class PostgresNarrationRepository:
             fallback=fallback_reason is not None,
         )
         await self._session.execute(
-            text(
-                "UPDATE campaigns SET event_sequence=:sequence WHERE id=:campaign"
-            ),
+            text("UPDATE campaigns SET event_sequence=:sequence WHERE id=:campaign"),
             {"sequence": sequence, "campaign": campaign_id},
         )
         await self._session.execute(

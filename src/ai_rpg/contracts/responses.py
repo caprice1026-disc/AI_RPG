@@ -15,7 +15,7 @@ from ai_rpg.contracts.common import (
 )
 from ai_rpg.contracts.context import ContextFragment, EntityRef, OutputLimits
 from ai_rpg.contracts.llm_decisions import ChoiceDraft
-from ai_rpg.domain.results import ResolvedAction
+from ai_rpg.domain.results import ResolvedAction, ResolvedEnemyReaction
 
 RecoveryReason: TypeAlias = Literal[
     "MODEL_TIMEOUT",
@@ -33,6 +33,7 @@ class MechanicalNarrationInput(Contract):
     player_text: InputText
     committed_state_version: NonNegativeInt
     resolved_actions: list[ResolvedAction]
+    enemy_reactions: list[ResolvedEnemyReaction] = Field(default_factory=list)
     public_state_after: list[ContextFragment]
     allowed_entity_refs: list[EntityRef]
     output_limits: OutputLimits
@@ -72,6 +73,7 @@ class TurnResponse(Contract):
     narration: NarrationText | None
     choices: list[Choice]
     action_results: list[ResolvedAction]
+    enemy_reactions: list[ResolvedEnemyReaction] = Field(default_factory=list)
     recovery: TurnRecovery
 
     @model_validator(mode="after")
@@ -80,7 +82,7 @@ class TurnResponse(Contract):
             raise ValueError("committed状態とstate versionは一致する必要があります")
         if self.resolution_status == "committed" and self.route is None:
             raise ValueError("確定済みTurnにはrouteが必要です")
-        if self.action_results and (
+        if (self.action_results or self.enemy_reactions) and (
             self.route != "mechanical" or self.resolution_status != "committed"
         ):
             raise ValueError("Action結果には確定済みMechanical Turnが必要です")
@@ -111,6 +113,14 @@ class AdventureEnding(Contract):
     summary: ShortText
 
 
+class AdventureCombatState(Contract):
+    enemy_ref: Ref
+    enemy_name: ShortText
+    current_hp: NonNegativeInt
+    max_hp: NonNegativeInt
+    active: StrictBool
+
+
 class AdventureState(Contract):
     scenario_ref: Ref
     title: ShortText
@@ -120,6 +130,7 @@ class AdventureState(Contract):
     discovered_facts: list[ShortText]
     available_actions: list[AdventureAction]
     ending: AdventureEnding | None
+    combat: AdventureCombatState | None = None
 
 
 class InventoryItem(Contract):
