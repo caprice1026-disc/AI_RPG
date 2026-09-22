@@ -256,3 +256,20 @@ async def test_login_attempt_expiry_prevents_token_exchange(setup_auth):
         response = await client.get("/auth/callback", params={"state": state, "code": "code"})
         assert response.headers["location"] == "/?login_error=LOGIN_REJECTED"
         assert not setup.requests
+
+
+@pytest.mark.asyncio
+async def test_public_client_can_use_keycloak_metadata_without_none_method():
+    settings = Settings(_env_file=None, auth_issuer=ISSUER, auth_audience="api",
+                        auth_client_id="public", auth_app_origin=ORIGIN)
+    async with httpx.AsyncClient() as client:
+        auth = BrowserAuthenticator(
+            settings, OidcConfiguration(ISSUER, ISSUER + "/keys", ISSUER + "/authorize",
+                                        ISSUER + "/token", ("client_secret_basic",)),
+            MemorySessions(), None, None, client=client,
+        )
+        app = create_app(principal_provider=auth, browser_auth=auth)
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url=ORIGIN) as ui:
+            response = await ui.get("/auth/login")
+            assert response.status_code == 303
+            assert parse_qs(urlsplit(response.headers["location"]).query)["client_id"] == ["public"]

@@ -64,7 +64,9 @@ class BrowserAuthenticator:
             self._client_auth = "client_secret_basic"
         else:
             self._client_auth = "client_secret_post"
-        if self._client_auth not in methods:
+        # Public clients do not authenticate at the token endpoint. Some providers
+        # (including Keycloak) list only confidential-client methods in Discovery.
+        if self._client_auth != "none" and self._client_auth not in methods:
             raise OidcDiscoveryError("OIDC client認証方式を利用できません")
 
     async def close(self) -> None:
