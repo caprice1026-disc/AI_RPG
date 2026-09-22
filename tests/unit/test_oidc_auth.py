@@ -1,5 +1,6 @@
 """OIDC DiscoveryとBearer JWT検証のUnit Test。"""
 
+import hashlib
 import logging
 from dataclasses import dataclass, fields
 from datetime import UTC, datetime, timedelta
@@ -29,6 +30,56 @@ from ai_rpg.api.auth import (
 ISSUER = "https://idp.example.com/"
 AUDIENCE = "ai-rpg-api"
 PRINCIPAL_ID = UUID("00000000-0000-0000-0000-000000000021")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("overrides", [
+    {"nonce": "wrong"}, {"nonce": None}, {"iat": None}, {"iat": True},
+    {"iat": "1000000000"}, {"azp": "another-client"},
+    {"aud": [AUDIENCE, "other"], "azp": None},
+])
+async def test_id_token_requires_bound_nonce_and_authorized_party(signing_key, overrides):
+    client, _ = _jwks_client({"keys": [_public_jwk(signing_key, "key-1")]})
+    claims = _claims(nonce="login-nonce")
+    claims.update(overrides)
+    token = _token(signing_key, claims)
+    with pytest.raises(InvalidCredentialError):
+        await _verifier(client).verify(
+            token, nonce_digest=hashlib.sha256(b"login-nonce").hexdigest(),
+        )
+
+
+@pytest.mark.asyncio
+async def test_id_token_accepts_correct_nonce_and_client(signing_key):
+    client, _ = _jwks_client({"keys": [_public_jwk(signing_key, "key-1")]})
+    token = _token(signing_key, _claims(
+        nonce="login-nonce", aud=[AUDIENCE, "other"], azp=AUDIENCE,
+    ))
+    identity = await _verifier(client).verify(
+        token, nonce_digest=hashlib.sha256(b"login-nonce").hexdigest(),
+    )
+    assert identity.subject == "player-1"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("override", [
+    {"authorization_endpoint": "http://idp.example.com/auth"},
+    {"token_endpoint": "https://user:secret@idp.example.com/token"},
+    {"code_challenge_methods_supported": ["plain"]},
+])
+async def test_browser_discovery_rejects_unsafe_endpoints_and_pkce(override):
+    payload = {
+        "issuer": ISSUER, "jwks_uri": "https://idp.example.com/keys",
+        "authorization_endpoint": "https://idp.example.com/auth",
+        "token_endpoint": "https://idp.example.com/token",
+        "code_challenge_methods_supported": ["S256"],
+    }
+    payload.update(override)
+    async with httpx.AsyncClient(transport=httpx.MockTransport(
+        lambda _: httpx.Response(200, json=payload),
+    )) as client:
+        with pytest.raises(OidcDiscoveryError):
+            await discover_oidc(ISSUER, client, browser=True)
 
 
 @dataclass
@@ -399,6 +450,7 @@ async def test_authenticator_maps_invalid_jwks_document_to_unavailable(
     settings = Mock()
     settings.require_oidc.return_value = (ISSUER, AUDIENCE, ("RS256",))
     settings.database_url = "postgresql+psycopg://airpg@database/airpg"
+    settings.auth_allow_insecure_loopback = False
     discovery = AsyncMock(
         return_value=auth_module.OidcConfiguration(
             issuer=ISSUER,
@@ -663,6 +715,7 @@ async def test_build_oidc_authenticator_wires_validated_configuration(
     settings = Mock()
     settings.require_oidc.return_value = (ISSUER, AUDIENCE, ("RS256",))
     settings.database_url = "postgresql+psycopg://airpg@database/airpg"
+    settings.auth_allow_insecure_loopback = False
 
     client = Mock()
     client_context = AsyncMock()
@@ -697,7 +750,7 @@ async def test_build_oidc_authenticator_wires_validated_configuration(
 
     settings.require_oidc.assert_called_once_with()
     async_client_factory.assert_called_once_with(timeout=5.0)
-    discovery.assert_awaited_once_with(ISSUER, client)
+    discovery.assert_awaited_once_with(ISSUER, client, allow_loopback=False)
     jwks_factory.assert_called_once_with(
         "https://idp.example.com/keys",
         lifespan=300,

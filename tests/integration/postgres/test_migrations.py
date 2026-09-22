@@ -1134,6 +1134,8 @@ def test_scenario_progress_upgrade_has_no_backfill_and_downgrades_in_dependency_
             "mvp_scenario_runs",
             "mvp_scenario_flags",
             "adventure_start_requests",
+            "login_attempts",
+            "browser_sessions",
         }
         with engine.connect() as connection:
             assert connection.scalar(text("SELECT count(*) FROM mvp_scenario_runs")) == 0
@@ -1200,7 +1202,7 @@ def test_scenario_commit_action_kind_migration_is_forward_only_with_live_rows(
         )
         with engine.connect() as connection:
             assert connection.scalar(text("SELECT version_num FROM alembic_version")) == (
-                "0012_registered_action_input"
+                "0013_browser_sessions"
             )
             assert connection.scalar(
                 text("SELECT kind FROM actions WHERE id=:action"),
@@ -1328,6 +1330,8 @@ def test_scene_entity_upgrade_has_no_backfill_and_rollback_preserves_data(
             "mvp_scenario_runs",
             "mvp_scenario_flags",
             "adventure_start_requests",
+            "login_attempts",
+            "browser_sessions",
         }
         with engine.begin() as connection:
             assert connection.scalar(text("SELECT count(*) FROM mvp_scene_entities")) == 0

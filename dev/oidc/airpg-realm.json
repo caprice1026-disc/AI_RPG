@@ -1,0 +1,38 @@
+{
+  "realm": "airpg-local",
+  "enabled": true,
+  "sslRequired": "none",
+  "registrationAllowed": false,
+  "resetPasswordAllowed": false,
+  "loginWithEmailAllowed": false,
+  "clients": [{
+    "clientId": "airpg-browser",
+    "enabled": true,
+    "publicClient": true,
+    "protocol": "openid-connect",
+    "standardFlowEnabled": true,
+    "directAccessGrantsEnabled": false,
+    "redirectUris": ["http://127.0.0.1:8035/auth/callback"],
+    "webOrigins": ["http://127.0.0.1:8035"],
+    "attributes": {"pkce.code.challenge.method": "S256"},
+    "defaultClientScopes": [],
+    "optionalClientScopes": []
+  }],
+  "users": [{
+    "id": "00000000-0000-0000-0000-000000000501",
+    "username": "adventurer",
+    "enabled": true,
+    "emailVerified": true,
+    "firstName": "Local",
+    "lastName": "Adventurer",
+    "credentials": [{"type": "password", "value": "local-playtest-only", "temporary": false}]
+  }, {
+    "id": "00000000-0000-0000-0000-000000000502",
+    "username": "unregistered",
+    "enabled": true,
+    "emailVerified": true,
+    "firstName": "Local",
+    "lastName": "Unregistered",
+    "credentials": [{"type": "password", "value": "local-playtest-only", "temporary": false}]
+  }]
+}

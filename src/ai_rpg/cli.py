@@ -11,6 +11,7 @@ from uuid import UUID
 from sqlalchemy.exc import SQLAlchemyError
 
 from ai_rpg.api import OidcDiscoveryError, build_oidc_authenticator, create_app
+from ai_rpg.api.browser_auth import build_browser_authenticator
 from ai_rpg.application import AuthenticatedPrincipal
 from ai_rpg.config import Settings, get_settings
 from ai_rpg.infrastructure.database import create_session_factory
@@ -151,19 +152,31 @@ def main(argv: Sequence[str] | None = None) -> None:
     if args.command == "api":
         import uvicorn
 
+        if (
+            args.dev_principal is not None or settings.auth_allow_insecure_loopback
+        ) and args.host not in {"127.0.0.1", "localhost", "::1"}:
+            parser.error("development authentication requires a loopback host")
         if args.dev_principal is not None:
-            app = create_app(principal_provider=_development_principal(args.dev_principal))
+            app = create_app(
+                principal_provider=_development_principal(args.dev_principal),
+                development_mode=True,
+            )
         else:
             try:
-                principal_provider = asyncio.run(build_oidc_authenticator(settings))
+                if settings.browser_auth_enabled:
+                    browser_auth = asyncio.run(build_browser_authenticator(settings))
+                    app = create_app(principal_provider=browser_auth, browser_auth=browser_auth)
+                else:
+                    principal_provider = asyncio.run(build_oidc_authenticator(settings))
+                    app = create_app(principal_provider=principal_provider)
             except (ValueError, OidcDiscoveryError) as error:
                 parser.error(str(error))
-            app = create_app(principal_provider=principal_provider)
         uvicorn.run(
             app,
             host=args.host,
             port=args.port,
             loop="ai_rpg.runtime:selector_event_loop" if sys.platform == "win32" else "auto",
+            access_log=False,  # OIDC callback query contains a one-use authorization code.
         )
         return
 

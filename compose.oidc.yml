@@ -1,0 +1,11 @@
+# Local-only example credentials and HTTP. Never use this realm in production.
+services:
+  oidc:
+    image: quay.io/keycloak/keycloak:26.7.4
+    command: ["start-dev", "--import-realm"]
+    environment:
+      KC_HOSTNAME: http://127.0.0.1:8180
+    ports:
+      - "127.0.0.1:8180:8080"
+    volumes:
+      - ./dev/oidc/airpg-realm.json:/opt/keycloak/data/import/airpg-local-realm.json:ro

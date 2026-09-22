@@ -333,7 +333,7 @@ async def test_sse_replays_after_last_event_id_and_deduplicates() -> None:
 
     assert response.status_code == 200
     assert response.headers["content-type"].startswith("text/event-stream")
-    assert response.headers["cache-control"] == "no-cache"
+    assert response.headers["cache-control"] == "no-store"
     assert response.headers["x-accel-buffering"] == "no"
     assert response.text.count("id: 6\n") == 1
     assert response.text.count("id: 7\n") == 1

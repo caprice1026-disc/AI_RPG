@@ -53,6 +53,7 @@ def test_metadata_contains_contract_tables_and_worker_control_columns() -> None:
         "principal_id",
         "created_at",
         "disabled_at",
+        "identity_id",
     } == set(PrincipalIdentityModel.__table__.columns.keys())
 
 

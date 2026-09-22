@@ -247,6 +247,27 @@ def test_development_api_does_not_build_oidc_authenticator(
     uvicorn_run.assert_called_once()
 
 
+def test_browser_api_uses_session_adapter_and_does_not_log_codes(monkeypatch):
+    create_app, uvicorn_run = _patch_api_runtime(monkeypatch)
+    settings = Settings(auth_issuer=ISSUER, auth_audience="api",
+                        auth_client_id="web", auth_app_origin="https://game.example")
+    monkeypatch.setattr(cli, "get_settings", lambda: settings)
+    provider = object()
+    builder = AsyncMock(return_value=provider)
+    monkeypatch.setattr(cli, "build_browser_authenticator", builder, raising=False)
+    cli.main(["api"])
+    create_app.assert_called_once_with(principal_provider=provider, browser_auth=provider)
+    assert uvicorn_run.call_args.kwargs["access_log"] is False
+
+
+def test_insecure_local_auth_cannot_bind_public_interface(monkeypatch):
+    _, run = _patch_api_runtime(monkeypatch)
+    monkeypatch.setattr(cli, "get_settings", lambda: Settings(auth_allow_insecure_loopback=True))
+    with pytest.raises(SystemExit, match="2"):
+        cli.main(["api", "--host", "0.0.0.0", "--dev-principal"])
+    run.assert_not_called()
+
+
 @pytest.mark.parametrize(
     "error",
     [ValueError("invalid oidc settings"), OidcDiscoveryError("discovery failed")],

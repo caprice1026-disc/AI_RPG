@@ -23,6 +23,26 @@ _ASYMMETRIC_JWT_ALGORITHMS = frozenset(
 )
 
 
+def validate_auth_url(value: str, *, allow_loopback: bool = False, origin: bool = False) -> str:
+    """本番HTTPSと明示的なloopback開発URLのみを受け付ける。"""
+
+    parsed = urlsplit(value)
+    local_http = (
+        allow_loopback and parsed.scheme == "http"
+        and parsed.hostname in {"localhost", "127.0.0.1", "::1"}
+    )
+    if (
+        (parsed.scheme != "https" and not local_http) or not parsed.hostname
+        or parsed.username is not None or parsed.password is not None
+        or parsed.query or parsed.fragment or "\\" in value
+        or any(character.isspace() for character in value)
+        or (origin and parsed.path not in {"", "/"})
+    ):
+        raise ValueError("認証URLは資格情報・query・fragmentのないHTTPS URLが必要です")
+    _ = parsed.port  # Validate the optional port as well.
+    return value.rstrip("/") if origin else value
+
+
 class Settings(BaseSettings):
     """検証済みの実行時設定を提供する。"""
 
@@ -57,6 +77,19 @@ class Settings(BaseSettings):
     auth_issuer: str | None = None
     auth_audience: str | None = None
     auth_allowed_algorithms: str = "RS256"
+    auth_client_id: str | None = Field(default=None, min_length=1, max_length=500)
+    auth_client_secret: SecretStr | None = None
+    auth_app_origin: str | None = None
+    auth_allow_insecure_loopback: bool = False
+
+    @property
+    def browser_auth_enabled(self) -> bool:
+        return self.auth_client_id is not None
+
+    @field_validator("auth_app_origin")
+    @classmethod
+    def normalize_app_origin(cls, value: str | None) -> str | None:
+        return value.rstrip("/") if value is not None else None
 
     @model_validator(mode="before")
     @classmethod
@@ -97,9 +130,15 @@ class Settings(BaseSettings):
         ):
             raise ValueError("JWT algorithm allowlistには対応する非対称方式だけを指定します")
         if self.auth_issuer is not None:
-            parsed = urlsplit(self.auth_issuer)
-            if parsed.scheme != "https" or not parsed.netloc or parsed.query or parsed.fragment:
-                raise ValueError("AIRPG_AUTH_ISSUERにはquery/fragmentのないHTTPS URLが必要です")
+            validate_auth_url(self.auth_issuer, allow_loopback=self.auth_allow_insecure_loopback)
+        if (self.auth_client_id is None) != (self.auth_app_origin is None):
+            raise ValueError("AIRPG_AUTH_CLIENT_IDとAIRPG_AUTH_APP_ORIGINは同時に指定します")
+        if self.auth_app_origin is not None:
+            validate_auth_url(
+                self.auth_app_origin, allow_loopback=self.auth_allow_insecure_loopback, origin=True,
+            )
+        if self.auth_client_secret is not None and not self.browser_auth_enabled:
+            raise ValueError("AIRPG_AUTH_CLIENT_SECRETにはbrowser認証設定が必要です")
         return self
 
     def require_oidc(self) -> tuple[str, str, tuple[str, ...]]:

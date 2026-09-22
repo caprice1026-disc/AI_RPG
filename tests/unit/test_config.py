@@ -172,3 +172,31 @@ def test_oidc_is_optional_for_non_api_processes() -> None:
 def test_oidc_rejects_unsafe_algorithm_allowlist(algorithm: str) -> None:
     with pytest.raises(ValidationError):
         Settings(auth_allowed_algorithms=algorithm)
+
+
+@pytest.mark.parametrize("values", [
+    {"auth_client_id": "browser"},
+    {"auth_app_origin": "https://game.example"},
+    {"auth_client_id": "browser", "auth_app_origin": "https://game.example/path"},
+    {"auth_issuer": "https://user:password@idp.example"},
+    {"auth_allow_insecure_loopback": True, "auth_issuer": "http://idp.example"},
+    {"auth_client_id": "browser", "auth_app_origin": "http://game.example",
+     "auth_allow_insecure_loopback": True},
+])
+def test_browser_auth_rejects_partial_or_unsafe_configuration(values: dict) -> None:
+    with pytest.raises(ValidationError):
+        Settings(**values)
+
+
+def test_browser_auth_only_allows_explicit_loopback_http() -> None:
+    settings = Settings(
+        auth_issuer="http://127.0.0.1:8180/realms/airpg",
+        auth_client_id="browser", auth_app_origin="http://127.0.0.1:8035/",
+        auth_allow_insecure_loopback=True,
+    )
+    assert settings.auth_app_origin == "http://127.0.0.1:8035"
+    assert settings.browser_auth_enabled
+
+
+def test_browser_auth_is_opt_in() -> None:
+    assert not Settings().browser_auth_enabled

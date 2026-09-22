@@ -2,15 +2,17 @@
 
 import asyncio
 from collections.abc import AsyncIterator, Awaitable, Callable
+from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Annotated
 from uuid import UUID
 
-from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, status
+from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, Response, status
 from fastapi.responses import FileResponse, StreamingResponse
 from starlette.types import Message, Send
 
+from ai_rpg.api.browser_auth import BrowserAuthenticator
 from ai_rpg.application import (
     AdventureCompletedError,
     AuthenticatedPrincipal,
@@ -119,6 +121,8 @@ def create_app(
     event_stream_service: EventStreamService | None = None,
     adventure_service: AdventureService | None = None,
     principal_provider: PrincipalProvider = _unconfigured_principal,
+    browser_auth: BrowserAuthenticator | None = None,
+    development_mode: bool = False,
     event_poll_seconds: float = 0.5,
     event_heartbeat_seconds: float = 15.0,
     event_send_timeout_seconds: float = 5.0,
@@ -166,7 +170,43 @@ def create_app(
                 authorization, unit_of_work_factory
             )
 
-    app = FastAPI(title="AI RPG API", version="0.1.0")
+    @asynccontextmanager
+    async def lifespan(app: FastAPI) -> AsyncIterator[None]:
+        try:
+            yield
+        finally:
+            if browser_auth is not None:
+                await browser_auth.close()
+
+    app = FastAPI(title="AI RPG API", version="0.1.0", lifespan=lifespan)
+    if browser_auth is not None:
+        browser_auth.mount(app)
+
+    @app.middleware("http")
+    async def security_headers(
+        request: Request, call_next: Callable[..., Awaitable[Response]],
+    ) -> Response:
+        response = await call_next(request)
+        response.headers["Referrer-Policy"] = "no-referrer"
+        response.headers["X-Content-Type-Options"] = "nosniff"
+        response.headers["X-Frame-Options"] = "DENY"
+        if not request.url.path.startswith("/static/"):
+            response.headers["Cache-Control"] = "no-store"
+        return response
+
+    @app.get("/auth/session", tags=["認証"])
+    async def session_info(
+        request: Request, principal: Annotated[AuthenticatedPrincipal, Depends(principal_provider)],
+    ) -> dict[str, object]:
+        session = getattr(request.state, "browser_session", None)
+        return {
+            "principal_id": str(principal.principal_id),
+            "mode": (
+                "development" if development_mode else getattr(request.state, "auth_mode", "bearer")
+            ),
+            "csrf_token": session.csrf_token if session is not None else None,
+            "expires_at": principal.credential_expires_at,
+        }
 
     @app.get("/", include_in_schema=False, response_class=FileResponse)
     async def play_screen() -> FileResponse:
@@ -317,6 +357,8 @@ def create_app(
                 return expires_at is not None and utc_now() >= expires_at
 
             while True:
+                if browser_auth is not None and not await browser_auth.stream_is_valid(request):
+                    return
                 if credential_expired() or await request.is_disconnected():
                     return
                 events = pending

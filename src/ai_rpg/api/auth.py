@@ -1,12 +1,13 @@
 """OIDC DiscoveryとBearer JWT検証のHTTP境界。"""
 
 import asyncio
+import hashlib
+import hmac
 import logging
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Annotated
-from urllib.parse import urlsplit
 from uuid import UUID
 
 import httpx
@@ -15,7 +16,7 @@ from fastapi import Header, HTTPException, status
 from sqlalchemy.exc import SQLAlchemyError
 
 from ai_rpg.application import AuthenticatedPrincipal
-from ai_rpg.config import Settings
+from ai_rpg.config import Settings, validate_auth_url
 from ai_rpg.infrastructure.database import create_session_factory
 from ai_rpg.infrastructure.postgres import PostgresIdentityStore
 
@@ -26,6 +27,9 @@ logger = logging.getLogger(__name__)
 class OidcConfiguration:
     issuer: str
     jwks_uri: str
+    authorization_endpoint: str | None = None
+    token_endpoint: str | None = None
+    token_endpoint_auth_methods: tuple[str, ...] = ("client_secret_basic",)
 
 
 class OidcDiscoveryError(RuntimeError):
@@ -67,6 +71,9 @@ class ValidatedOidcIdentity:
 async def discover_oidc(
     issuer: str,
     client: httpx.AsyncClient,
+    *,
+    browser: bool = False,
+    allow_loopback: bool = False,
 ) -> OidcConfiguration:
     """設定Issuerに完全一致するHTTPS JWKS endpointを取得する。"""
 
@@ -83,11 +90,29 @@ async def discover_oidc(
     if not isinstance(jwks_uri, str):
         raise OidcDiscoveryError("OIDC Discoveryのjwks_uriが不正です")
     try:
-        parsed = urlsplit(jwks_uri)
+        validate_auth_url(jwks_uri, allow_loopback=allow_loopback)
     except ValueError as error:
         raise OidcDiscoveryError("OIDC Discoveryのjwks_uriが不正です") from error
-    if parsed.scheme != "https" or not parsed.netloc:
-        raise OidcDiscoveryError("OIDC Discoveryのjwks_uriが不正です")
+    if browser:
+        authorization_endpoint = payload.get("authorization_endpoint")
+        token_endpoint = payload.get("token_endpoint")
+        try:
+            if not isinstance(authorization_endpoint, str) or not isinstance(token_endpoint, str):
+                raise ValueError
+            validate_auth_url(authorization_endpoint, allow_loopback=allow_loopback)
+            validate_auth_url(token_endpoint, allow_loopback=allow_loopback)
+        except ValueError as error:
+            raise OidcDiscoveryError("OIDC browser endpointが不正です") from error
+        pkce = payload.get("code_challenge_methods_supported", ["S256"])
+        methods = payload.get("token_endpoint_auth_methods_supported", ["client_secret_basic"])
+        if (
+            not isinstance(pkce, list) or "S256" not in pkce
+            or not isinstance(methods, list) or not all(isinstance(item, str) for item in methods)
+        ):
+            raise OidcDiscoveryError("OIDC browser認証方式を利用できません")
+        return OidcConfiguration(
+            issuer, jwks_uri, authorization_endpoint, token_endpoint, tuple(methods),
+        )
     return OidcConfiguration(issuer=issuer, jwks_uri=jwks_uri)
 
 
@@ -106,7 +131,9 @@ class OidcJwtVerifier:
         self._algorithms = algorithms
         self._jwks = jwks
 
-    async def verify(self, token: str) -> ValidatedOidcIdentity:
+    async def verify(
+        self, token: str, *, nonce_digest: str | None = None,
+    ) -> ValidatedOidcIdentity:
         authenticated_at = datetime.now(UTC)
         try:
             signing_key = await asyncio.to_thread(
@@ -120,7 +147,10 @@ class OidcJwtVerifier:
                 audience=self._audience,
                 issuer=self._issuer,
                 leeway=30,
-                options={"require": ["iss", "aud", "sub", "exp"]},
+                options={
+                    "require": ["iss", "aud", "sub", "exp"]
+                    + (["iat", "nonce"] if nonce_digest is not None else []),
+                },
             )
         except jwt.PyJWKClientConnectionError as error:
             raise AuthenticationUnavailableError("JWKSを取得できません") from error
@@ -144,6 +174,18 @@ class OidcJwtVerifier:
             raise InvalidCredentialError("Bearer tokenが不正です") from error
         if expires_at <= authenticated_at:
             raise InvalidCredentialError("Bearer tokenが不正です")
+        if nonce_digest is not None:
+            nonce, issued_at = claims.get("nonce"), claims.get("iat")
+            audience, authorized_party = claims.get("aud"), claims.get("azp")
+            if (
+                not isinstance(nonce, str)
+                or not hmac.compare_digest(hashlib.sha256(nonce.encode()).hexdigest(), nonce_digest)
+                or isinstance(issued_at, bool) or not isinstance(issued_at, int | float)
+                or (authorized_party is not None and authorized_party != self._audience)
+                or (isinstance(audience, list) and len(audience) > 1
+                    and authorized_party != self._audience)
+            ):
+                raise InvalidCredentialError("ID tokenが不正です")
         return ValidatedOidcIdentity(
             issuer=self._issuer,
             subject=subject,
@@ -235,7 +277,9 @@ def _authentication_unavailable() -> HTTPException:
 async def build_oidc_authenticator(settings: Settings) -> OidcBearerAuthenticator:
     issuer, audience, algorithms = settings.require_oidc()
     async with httpx.AsyncClient(timeout=5.0) as client:
-        configuration = await discover_oidc(issuer, client)
+        configuration = await discover_oidc(
+            issuer, client, allow_loopback=settings.auth_allow_insecure_loopback,
+        )
     jwks = _ProviderJWKClient(
         configuration.jwks_uri,
         lifespan=300,
