@@ -100,6 +100,9 @@ class PrincipalIdentityModel(Base):
 
     issuer: Mapped[str] = mapped_column(Text, primary_key=True)
     subject: Mapped[str] = mapped_column(Text, primary_key=True)
+    identity_id: Mapped[UUID] = mapped_column(
+        PG_UUID(as_uuid=True), nullable=False, unique=True, server_default=text("gen_random_uuid()")
+    )
     principal_id: Mapped[UUID] = mapped_column(
         PG_UUID(as_uuid=True), ForeignKey("principals.id"), nullable=False
     )
@@ -116,6 +119,35 @@ class PrincipalIdentityModel(Base):
             name="principal_identity_disabled_after_created",
         ),
         Index("principal_identities_principal", "principal_id"),
+    )
+
+
+class LoginAttemptModel(Base):
+    __tablename__ = "login_attempts"
+
+    state_digest: Mapped[str] = mapped_column(Text, primary_key=True)
+    binding_digest: Mapped[str] = mapped_column(Text, nullable=False)
+    nonce_digest: Mapped[str] = mapped_column(Text, nullable=False)
+    code_verifier: Mapped[str] = mapped_column(Text, nullable=False)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+    __table_args__ = (Index("login_attempts_expires_at", "expires_at"),)
+
+
+class BrowserSessionModel(Base):
+    __tablename__ = "browser_sessions"
+
+    token_digest: Mapped[str] = mapped_column(Text, primary_key=True)
+    identity_id: Mapped[UUID] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("principal_identities.identity_id"), nullable=False
+    )
+    csrf_token: Mapped[str] = mapped_column(Text, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+    __table_args__ = (
+        CheckConstraint("expires_at>created_at", name="browser_session_expires_after_created"),
+        Index("browser_sessions_expires_at", "expires_at"),
     )
 
 
