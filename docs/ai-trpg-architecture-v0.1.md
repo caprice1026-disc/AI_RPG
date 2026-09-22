@@ -189,7 +189,7 @@ Proposalには参照したworld stateのバージョンを持たせる。適用�
 | QUALITY | 重要なSceneなど |
 | BACKGROUND | 要約やシナリオ生成など |
 
-初期プロバイダーとadapter境界は [ADR-0006](adr/0006-llm-provider.md) で決定する。具体的なmodel IDと重要Sceneの判定条件は設定・後続仕様で扱う。Tierを変更してもゲームの状態変更権限や呼び出し予算は変えない。
+AI実行は [ADR-0013](adr/0013-pydantic-ai-orchestration.md) の用途別Pydantic AI Agentを使い、初期モデルはGemini 3.5 Flashとする。モデルとproviderは設定で切り替える。重要Sceneの判定条件は後続仕様で扱い、tierを変更してもゲームの状態変更権限や呼び出し予算は変えない。
 
 ## 10 Streaming と Event Store
 

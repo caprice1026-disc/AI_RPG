@@ -20,6 +20,8 @@
 
 ## 2 Pythonの境界型
 
+実装上のLLM実行境界は[ADR-0013](adr/0013-pydantic-ai-orchestration.md)に従う。用途別Protocolへ既存DTOを渡し、Pydantic AI Agentが同じ出力型をNativeOutputで検証する。保存済みTurnのAction上限をSchemaへ反映し、認可・参照・grounding・予算の検証はApplicationに残す。
+
 以下のコードブロックは独立したPythonモジュールとして読み込める。JSON入力にはmodel_validate_jsonを使う。数値はstrictな整数型を使い、文字列数値やboolを受け付けない。UUIDはJSON文字列から復元する。
 
 LLM出力はextra="forbid"で未定義フィールドを拒否し、kindによるdiscriminated unionで判別する。ただし構造検証は権限検証やゲーム上の正当性検証の代替ではない。

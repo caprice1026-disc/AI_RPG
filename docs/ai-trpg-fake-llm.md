@@ -4,6 +4,8 @@
 状態: 主要実装と結合検証を完了。独立processの開発用runnerは後続
 対象: caprice1026-disc/AI_RPG
 
+> 2026-09-22追記: 以下は当時の実装計画・検証記録である。現在のAI実行境界は[ADR-0013](adr/0013-pydantic-ai-orchestration.md)で置換した。Fakeは用途別portを直接実装し、DB予約はworkerが行う。旧StructuredOutputAdapter／ProviderTransportは使用しない。現在の起動手順と実装範囲はREADMEを参照する。
+
 ## 1 目的と完成条件
 
 単一プレイヤー・単一PC・進行中Scene一つの構成で、Fake LLMを使って次の一往復を完成させる。

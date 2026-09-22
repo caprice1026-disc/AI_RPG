@@ -62,7 +62,7 @@ class ClarificationRequired(Contract):
     question: ShortText
 
 
-def make_decision_types(max_actions: int = 3) -> tuple[TypeAdapter[Any], TypeAdapter[Any]]:
+def make_decision_output_types(max_actions: int = 3) -> tuple[Any, Any]:
     """保存済みAction上限を検証とJSON Schemaの双方へ埋め込む。"""
 
     if type(max_actions) is not int or max_actions < 1:
@@ -85,6 +85,13 @@ def make_decision_types(max_actions: int = 3) -> tuple[TypeAdapter[Any], TypeAda
         plan | ClarificationRequired,
         Field(discriminator="kind"),
     ]
+    return narrative_type, mechanical_type
+
+
+def make_decision_types(max_actions: int = 3) -> tuple[TypeAdapter[Any], TypeAdapter[Any]]:
+    """既存の保存・Fake境界にもAgentと同じ出力型を使う。"""
+
+    narrative_type, mechanical_type = make_decision_output_types(max_actions)
     return TypeAdapter(narrative_type), TypeAdapter(mechanical_type)
 
 

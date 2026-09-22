@@ -1,6 +1,6 @@
 # ADR-0006: port/adapterによるLLM抽象化とOpenAI初期対応
 
-- 状態: 採用
+- 状態: 置換（[ADR-0013](0013-pydantic-ai-orchestration.md)）
 - 決定日: 2026-09-14
 
 ## 文脈と決定

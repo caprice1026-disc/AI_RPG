@@ -6,6 +6,77 @@ from pydantic import ValidationError
 from ai_rpg.config import Settings
 
 
+@pytest.fixture(autouse=True)
+def isolated_settings(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setitem(Settings.model_config, "env_file", None)
+    for name in (
+        "AIRPG_LLM_MODEL", "AIRPG_FAST_MODEL", "AIRPG_QUALITY_MODEL",
+        "AIRPG_BACKGROUND_MODEL", "AIRPG_GEMINI_API_KEY", "GEMINI_API_KEY",
+        "GOOGLE_API_KEY", "AIRPG_OPENAI_API_KEY", "OPENAI_API_KEY",
+    ):
+        monkeypatch.delenv(name, raising=False)
+
+
+def test_tiers_inherit_common_gemini_model() -> None:
+    settings = Settings()
+
+    assert settings.llm_model == "google:gemini-3.5-flash"
+    assert settings.fast_model == "google:gemini-3.5-flash"
+    assert settings.quality_model == "google:gemini-3.5-flash"
+    assert settings.background_model == "google:gemini-3.5-flash"
+
+
+def test_common_model_and_explicit_tier_overrides(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("AIRPG_LLM_MODEL", "google:gemini-custom")
+    monkeypatch.setenv("AIRPG_QUALITY_MODEL", "openai:gpt-5.4")
+    settings = Settings(fast_model="gpt-5-mini")
+
+    assert settings.fast_model == "openai-responses:gpt-5-mini"
+    assert settings.quality_model == "openai-responses:gpt-5.4"
+    assert settings.background_model == "google:gemini-custom"
+
+
+@pytest.mark.parametrize(
+    "model", ["gpt-5-mini", "openai:gpt-5-mini", "openai-responses:gpt-5-mini"]
+)
+def test_openai_aliases_resolve_before_workers_use_them(model: str) -> None:
+    settings = Settings(llm_model=model)
+
+    assert settings.llm_model == "openai-responses:gpt-5-mini"
+    assert settings.fast_model == "openai-responses:gpt-5-mini"
+    assert settings.quality_model == "openai-responses:gpt-5-mini"
+    assert settings.background_model == "openai-responses:gpt-5-mini"
+
+
+@pytest.mark.parametrize("model", ["anthropic:claude", "gateway:google:model", "google:", "", " "])
+def test_invalid_provider_or_empty_model_fails_without_exposing_keys(model: str) -> None:
+    with pytest.raises(ValidationError) as error:
+        Settings(llm_model=model, gemini_api_key="private-test-key")
+
+    assert "private-test-key" not in str(error.value)
+    assert "private-test-key" not in repr(error.value)
+
+
+@pytest.mark.parametrize(
+    ("field", "alias", "preferred"),
+    [
+        ("gemini_api_key", "GEMINI_API_KEY", "AIRPG_GEMINI_API_KEY"),
+        ("openai_api_key", "OPENAI_API_KEY", "AIRPG_OPENAI_API_KEY"),
+    ],
+)
+def test_key_aliases_remain_secrets_and_airpg_takes_precedence(
+    monkeypatch: pytest.MonkeyPatch, field: str, alias: str, preferred: str,
+) -> None:
+    monkeypatch.setenv(alias, "alias-secret")
+    settings = Settings()
+    assert getattr(settings, field).get_secret_value() == "alias-secret"
+    assert "alias-secret" not in repr(settings)
+    monkeypatch.setenv(preferred, "preferred-secret")
+    settings = Settings()
+    assert getattr(settings, field).get_secret_value() == "preferred-secret"
+    assert "preferred-secret" not in repr(settings)
+
+
 def test_environment_overrides_runtime_policy(monkeypatch: pytest.MonkeyPatch) -> None:
     """環境変数が型検証された設定へ反映される。"""
 

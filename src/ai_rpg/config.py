@@ -4,7 +4,7 @@ from functools import lru_cache
 from typing import Self
 from urllib.parse import urlsplit
 
-from pydantic import Field, SecretStr, model_validator
+from pydantic import AliasChoices, Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 _ASYMMETRIC_JWT_ALGORITHMS = frozenset(
@@ -27,7 +27,8 @@ class Settings(BaseSettings):
     """検証済みの実行時設定を提供する。"""
 
     model_config = SettingsConfigDict(
-        env_prefix="AIRPG_", env_file=".env", extra="ignore", frozen=True
+        env_prefix="AIRPG_", env_file=".env", extra="ignore", frozen=True,
+        populate_by_name=True, hide_input_in_errors=True,
     )
 
     max_actions_per_turn: int = Field(default=3, ge=1, le=10)
@@ -40,16 +41,47 @@ class Settings(BaseSettings):
     llm_timeout_seconds: int = Field(default=30, ge=5, le=120)
     narrative_call_budget: int = Field(default=1, ge=1, le=1)
     mechanical_call_budget: int = Field(default=3, ge=3, le=3)
-    fast_model: str = Field(default="gpt-5-mini", min_length=1)
-    quality_model: str = Field(default="gpt-5.4", min_length=1)
-    background_model: str = Field(default="gpt-5-mini", min_length=1)
-    openai_api_key: SecretStr | None = None
+    llm_model: str = Field(default="google:gemini-3.5-flash", min_length=1)
+    fast_model: str = Field(default="google:gemini-3.5-flash", min_length=1)
+    quality_model: str = Field(default="google:gemini-3.5-flash", min_length=1)
+    background_model: str = Field(default="google:gemini-3.5-flash", min_length=1)
+    gemini_api_key: SecretStr | None = Field(
+        default=None, validation_alias=AliasChoices("AIRPG_GEMINI_API_KEY", "GEMINI_API_KEY")
+    )
+    openai_api_key: SecretStr | None = Field(
+        default=None, validation_alias=AliasChoices("AIRPG_OPENAI_API_KEY", "OPENAI_API_KEY")
+    )
     database_url: str = Field(
         default="postgresql+psycopg://airpg:airpg@localhost/airpg", min_length=1
     )
     auth_issuer: str | None = None
     auth_audience: str | None = None
     auth_allowed_algorithms: str = "RS256"
+
+    @model_validator(mode="before")
+    @classmethod
+    def inherit_model_ids(cls, values: dict[str, object]) -> dict[str, object]:
+        values = dict(values)
+        common = values.get("llm_model", cls.model_fields["llm_model"].default)
+        for tier in ("fast_model", "quality_model", "background_model"):
+            if values.get(tier) is None:
+                values[tier] = common
+        return values
+
+    @field_validator("llm_model", "fast_model", "quality_model", "background_model")
+    @classmethod
+    def normalize_model_id(cls, value: str) -> str:
+        """Bare IDs and openai: are compatibility aliases for openai-responses:."""
+
+        value = value.strip()
+        provider, separator, model = value.partition(":")
+        if not separator:
+            provider, model = "openai-responses", value
+        if provider == "openai":
+            provider = "openai-responses"
+        if provider not in {"google", "openai-responses"} or not model.strip():
+            raise ValueError("LLM model requires google: or openai-responses: and a model name")
+        return f"{provider}:{model.strip()}"
 
     @model_validator(mode="after")
     def validate_worker_timing(self) -> Self:

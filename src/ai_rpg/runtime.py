@@ -20,12 +20,12 @@ from ai_rpg.application import (
     WorkerPhasePolicy,
 )
 from ai_rpg.application.ports import UnitOfWork
+from ai_rpg.application.ports.llm import ResolutionLLM, ResultNarrator
 from ai_rpg.config import Settings
 from ai_rpg.engine import DiceEngine, MvpV1Ruleset, SecureRandomSource, SeededRandomSource
 from ai_rpg.infrastructure.database import create_session_factory
 from ai_rpg.infrastructure.postgres import PostgresUnitOfWork
-from ai_rpg.llm import DevelopmentFakeTransport, OpenAIResponsesTransport
-from ai_rpg.llm.structured import ProviderTransport
+from ai_rpg.llm.models import build_language_models as build_language_models
 from ai_rpg.scenarios import BUILTIN_SCENARIOS, SkillScenarioAction
 
 
@@ -63,17 +63,6 @@ DEVELOPMENT_FIXTURE = DevelopmentFixture(
 
 class RunnableWorker(Protocol):
     async def run_once(self, turn_id: UUID | None = None) -> bool: ...
-
-
-def build_provider_transport(settings: Settings, *, fake: bool) -> ProviderTransport:
-    if fake:
-        return DevelopmentFakeTransport()
-    if settings.openai_api_key is None:
-        raise ValueError("AIRPG_OPENAI_API_KEY is required for real workers")
-    return OpenAIResponsesTransport(
-        settings.openai_api_key.get_secret_value(),
-        settings.llm_timeout_seconds,
-    )
 
 
 def selector_event_loop() -> asyncio.AbstractEventLoop:
@@ -307,7 +296,7 @@ def _unit_of_work_factory(
 
 def build_resolution_worker(
     settings: Settings,
-    transport: ProviderTransport,
+    llm: ResolutionLLM,
     *,
     deterministic: bool = False,
 ) -> SkillCheckResolutionWorker:
@@ -315,7 +304,7 @@ def build_resolution_worker(
     random_source = SeededRandomSource(7) if deterministic else SecureRandomSource()
     return SkillCheckResolutionWorker(
         _unit_of_work_factory(sessions),
-        transport,
+        llm,
         MvpV1Ruleset(DiceEngine(random_source)),
         WorkerPhasePolicy(
             settings.worker_lease_seconds,
@@ -332,12 +321,12 @@ def build_resolution_worker(
 
 def build_narration_worker(
     settings: Settings,
-    transport: ProviderTransport,
+    narrator: ResultNarrator,
 ) -> NarrationWorker:
     sessions = create_session_factory(settings.database_url)
     return NarrationWorker(
         _unit_of_work_factory(sessions),
-        transport,
+        narrator,
         WorkerPhasePolicy(
             settings.worker_lease_seconds,
             settings.narration_max_attempts,

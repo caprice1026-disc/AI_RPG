@@ -85,7 +85,7 @@ from ai_rpg.infrastructure.postgres.repositories import (
     PostgresPublicEventRepository,
     PostgresTurnRepository,
 )
-from ai_rpg.llm import DevelopmentFakeTransport, ProviderRefusalError, ScriptedFakeTransport
+from ai_rpg.llm import DevelopmentFakeLLM, ProviderRefusalError, ScriptedFakeLLM
 from ai_rpg.scenarios import BUILTIN_SCENARIOS, ScenarioCatalog, ScenarioDefinition
 
 URL = os.getenv("AIRPG_TEST_DATABASE_URL")
@@ -4098,7 +4098,7 @@ def test_fake_llm_skill_check_round_trip_reopens_turn_acceptance(
                 turn_query_service=query_service,
                 principal_provider=authenticate,
             )
-            intent_transport = ScriptedFakeTransport(
+            intent_transport = ScriptedFakeLLM(
                 [
                     {
                         "kind": "action_plan",
@@ -4113,7 +4113,7 @@ def test_fake_llm_skill_check_round_trip_reopens_turn_acceptance(
                     }
                 ]
             )
-            narration_transport = ScriptedFakeTransport(
+            narration_transport = ScriptedFakeLLM(
                 [
                     {
                         "narration": narration_text,
@@ -4342,7 +4342,7 @@ def test_resolution_context_uses_only_recent_completed_public_history(
             def unit_of_work_factory() -> PostgresUnitOfWork:
                 return PostgresUnitOfWork(factory)
 
-            transport = ScriptedFakeTransport(
+            transport = ScriptedFakeLLM(
                 [
                     {
                         "kind": "narrative",
@@ -4438,7 +4438,7 @@ def test_ungrounded_result_narration_retries_then_falls_back(database: Engine) -
             )
             resolution = SkillCheckResolutionWorker(
                 unit_of_work_factory,
-                ScriptedFakeTransport(
+                ScriptedFakeLLM(
                     [
                         {
                             "kind": "action_plan",
@@ -4457,7 +4457,7 @@ def test_ungrounded_result_narration_retries_then_falls_back(database: Engine) -
                 WorkerPhasePolicy(60, 3, 120, "fake-intent"),
             )
             assert await resolution.run_once(accepted.turn_id)
-            transport = ScriptedFakeTransport(
+            transport = ScriptedFakeLLM(
                 [
                     {"narration": "判定結果は999だった。", "choices": []},
                     {"narration": "判定結果は999だった。", "choices": []},
@@ -4530,7 +4530,7 @@ def test_incapacitated_actor_is_not_retried(database: Engine) -> None:
             accepted = await _accept_turn(
                 factory, _player_turn("周囲を注意深く観察する")
             )
-            transport = ScriptedFakeTransport(
+            transport = ScriptedFakeLLM(
                 [
                     {
                         "kind": "action_plan",
@@ -4587,7 +4587,7 @@ def test_unregistered_skill_check_is_not_retried(database: Engine) -> None:
             accepted = await _accept_turn(
                 factory, _player_turn("周囲を注意深く観察する")
             )
-            transport = ScriptedFakeTransport(
+            transport = ScriptedFakeLLM(
                 [
                     {
                         "kind": "action_plan",
@@ -4649,7 +4649,7 @@ def test_atomic_not_applied_needs_no_narration_recovery(database: Engine) -> Non
             def unit_of_work_factory() -> PostgresUnitOfWork:
                 return PostgresUnitOfWork(factory)
 
-            transport = ScriptedFakeTransport([])
+            transport = ScriptedFakeLLM([])
             worker = NarrationWorker(
                 unit_of_work_factory,
                 transport,
@@ -4734,7 +4734,7 @@ def test_narration_timeout_survives_worker_replacement_and_falls_back(
             )
             resolution = SkillCheckResolutionWorker(
                 unit_of_work_factory,
-                ScriptedFakeTransport(
+                ScriptedFakeLLM(
                     [
                         {
                             "kind": "action_plan",
@@ -4758,7 +4758,7 @@ def test_narration_timeout_survives_worker_replacement_and_falls_back(
 
             first_worker = NarrationWorker(
                 unit_of_work_factory,
-                ScriptedFakeTransport([TimeoutError("first worker stopped")]),
+                ScriptedFakeLLM([TimeoutError("first worker stopped")]),
                 WorkerPhasePolicy(60, 3, 120, "fake-narration"),
             )
             assert await first_worker.run_once(accepted.turn_id)
@@ -4770,7 +4770,7 @@ def test_narration_timeout_survives_worker_replacement_and_falls_back(
 
             replacement_worker = NarrationWorker(
                 unit_of_work_factory,
-                ScriptedFakeTransport([TimeoutError("replacement also stopped")]),
+                ScriptedFakeLLM([TimeoutError("replacement also stopped")]),
                 WorkerPhasePolicy(60, 3, 120, "fake-narration"),
             )
             assert await replacement_worker.run_once(accepted.turn_id)
@@ -4833,7 +4833,7 @@ def test_fake_clarification_finishes_not_applied_without_game_writes(
             accepted = await _accept_turn(factory, _player_turn("調べる"))
             worker = SkillCheckResolutionWorker(
                 unit_of_work_factory,
-                ScriptedFakeTransport(
+                ScriptedFakeLLM(
                     [
                         {
                             "kind": "clarification_required",
@@ -4892,7 +4892,7 @@ def test_invalid_intent_retries_are_bounded_and_end_in_fallback(database: Engine
             )
             worker = SkillCheckResolutionWorker(
                 unit_of_work_factory,
-                ScriptedFakeTransport(
+                ScriptedFakeLLM(
                     [
                         {"kind": "action_plan", "actions": "invalid"},
                         {"kind": "action_plan", "actions": "invalid"},
@@ -4957,7 +4957,7 @@ def test_invalid_narrative_output_consumes_the_single_call_budget(
                 return PostgresUnitOfWork(factory)
 
             accepted = await _accept_turn(factory, _player_turn("今日は静かだね"))
-            transport = ScriptedFakeTransport(
+            transport = ScriptedFakeLLM(
                 [{"kind": "narrative", "narration": 123, "choices": []}]
             )
             worker = SkillCheckResolutionWorker(
@@ -5004,7 +5004,7 @@ def test_provider_refusal_uses_public_recovery_reason(database: Engine) -> None:
             accepted = await _accept_turn(factory, _player_turn("今日は静かだね"))
             worker = SkillCheckResolutionWorker(
                 unit_of_work_factory,
-                ScriptedFakeTransport([ProviderRefusalError("refused")]),
+                ScriptedFakeLLM([ProviderRefusalError("refused")]),
                 MvpV1Ruleset(DiceEngine(UnusedRandom())),
                 WorkerPhasePolicy(60, 3, 120, "fake-narrative"),
             )
@@ -5039,7 +5039,7 @@ def test_narrative_route_commits_zero_actions_in_one_llm_call(database: Engine) 
                 return PostgresUnitOfWork(factory)
 
             accepted = await _accept_turn(factory, _player_turn("今日は静かだね"))
-            transport = ScriptedFakeTransport(
+            transport = ScriptedFakeLLM(
                 [
                     {
                         "kind": "narrative",
@@ -5130,7 +5130,7 @@ def test_narrative_escalation_reuses_first_call_as_mechanical_intent(
                 return PostgresUnitOfWork(factory)
 
             accepted = await _accept_turn(factory, _player_turn("謎の装置を作動させる"))
-            resolution_transport = ScriptedFakeTransport(
+            resolution_transport = ScriptedFakeLLM(
                 [
                     {
                         "kind": "resolution_required",
@@ -5155,7 +5155,7 @@ def test_narrative_escalation_reuses_first_call_as_mechanical_intent(
             )
             assert await resolution.run_once(accepted.turn_id)
 
-            narration_transport = ScriptedFakeTransport(
+            narration_transport = ScriptedFakeLLM(
                 [{"narration": "起動印の意味を読み取った。", "choices": []}]
             )
             narration = NarrationWorker(
@@ -5217,7 +5217,7 @@ def test_exhausted_resolution_lease_is_terminalized_without_another_llm_call(
             def unit_of_work_factory() -> PostgresUnitOfWork:
                 return PostgresUnitOfWork(factory)
 
-            transport = ScriptedFakeTransport([])
+            transport = ScriptedFakeLLM([])
             worker = SkillCheckResolutionWorker(
                 unit_of_work_factory,
                 transport,
@@ -5281,7 +5281,7 @@ def test_exhausted_narration_lease_falls_back_without_another_llm_call(
             )
             resolution = SkillCheckResolutionWorker(
                 unit_of_work_factory,
-                ScriptedFakeTransport(
+                ScriptedFakeLLM(
                     [
                         {
                             "kind": "action_plan",
@@ -5313,7 +5313,7 @@ def test_exhausted_narration_lease_falls_back_without_another_llm_call(
                     {"turn": accepted.turn_id},
                 )
                 await session.commit()
-            transport = ScriptedFakeTransport([])
+            transport = ScriptedFakeLLM([])
             narration = NarrationWorker(
                 unit_of_work_factory,
                 transport,
@@ -5385,7 +5385,7 @@ def test_lost_commit_response_is_requeried_without_reapplying_action(
             )
             worker = SkillCheckResolutionWorker(
                 unit_of_work_factory,
-                ScriptedFakeTransport(
+                ScriptedFakeLLM(
                     [
                         {
                             "kind": "action_plan",
@@ -5448,7 +5448,7 @@ def test_state_change_between_snapshot_and_commit_becomes_not_applied(
         def randint(self, lower: int, upper: int) -> int:
             return 10
 
-    class StateChangingTransport:
+    class StateChangingTransport(DevelopmentFakeLLM):
         async def request(
             self,
             model_id: str,
@@ -5555,7 +5555,7 @@ def test_state_change_before_worker_snapshot_does_not_reroll(
                     {"campaign": CAMPAIGN_A},
                 )
                 await session.commit()
-            transport = ScriptedFakeTransport(
+            transport = ScriptedFakeLLM(
                 [
                     {
                         "kind": "action_plan",
@@ -5637,7 +5637,7 @@ def test_transient_provider_failure_retries_with_persistent_budget(
             accepted = await _accept_turn(
                 factory, _player_turn("周囲を注意深く観察する")
             )
-            transport = ScriptedFakeTransport(
+            transport = ScriptedFakeLLM(
                 [
                     ConnectionError("temporary provider failure"),
                     {
@@ -5720,7 +5720,7 @@ def test_worker_rechecks_actor_authorization_before_llm(
             def unit_of_work_factory() -> PostgresUnitOfWork:
                 return PostgresUnitOfWork(factory)
 
-            transport = ScriptedFakeTransport([])
+            transport = ScriptedFakeLLM([])
             worker = SkillCheckResolutionWorker(
                 unit_of_work_factory,
                 transport,
@@ -5771,7 +5771,7 @@ def test_commit_rechecks_actor_authorization_after_llm(database: Engine) -> None
         def randint(self, lower: int, upper: int) -> int:
             return 10
 
-    class RevokingTransport:
+    class RevokingTransport(DevelopmentFakeLLM):
         async def request(
             self,
             model_id: str,
@@ -5857,7 +5857,7 @@ def test_pre_resolution_context_excludes_success_only_scene_description(
                 return PostgresUnitOfWork(factory)
 
             accepted = await _accept_turn(factory, _player_turn("今日は静かだね"))
-            transport = ScriptedFakeTransport(
+            transport = ScriptedFakeLLM(
                 [{"kind": "narrative", "narration": "静かな時間が流れる。", "choices": []}]
             )
             worker = SkillCheckResolutionWorker(
@@ -5910,7 +5910,7 @@ def test_clarification_is_saved_atomically_before_narration_worker_can_claim(
                         raced = True
                         narrator = NarrationWorker(
                             normal_factory,
-                            ScriptedFakeTransport([]),
+                            ScriptedFakeLLM([]),
                             WorkerPhasePolicy(60, 3, 120, "fake-narration"),
                         )
                         assert await narrator.run_once()
@@ -5921,7 +5921,7 @@ def test_clarification_is_saved_atomically_before_narration_worker_can_claim(
             accepted = await _accept_turn(factory, _player_turn("調べる"))
             worker = SkillCheckResolutionWorker(
                 racing_factory,
-                ScriptedFakeTransport(
+                ScriptedFakeLLM(
                     [
                         {
                             "kind": "clarification_required",
@@ -6017,7 +6017,7 @@ def test_resolution_result_after_phase_deadline_becomes_fallback(
             assert lower <= 10 <= upper
             return 10
 
-    class ExpiringTransport:
+    class ExpiringTransport(DevelopmentFakeLLM):
         async def request(
             self,
             model_id: str,
@@ -6096,7 +6096,7 @@ def test_narration_result_after_phase_deadline_becomes_fallback(database: Engine
             assert lower <= 10 <= upper
             return 10
 
-    class ExpiringNarrationTransport:
+    class ExpiringNarrationTransport(DevelopmentFakeLLM):
         async def request(
             self,
             model_id: str,
@@ -6129,7 +6129,7 @@ def test_narration_result_after_phase_deadline_becomes_fallback(database: Engine
             )
             resolution = SkillCheckResolutionWorker(
                 unit_of_work_factory,
-                ScriptedFakeTransport(
+                ScriptedFakeLLM(
                     [
                         {
                             "kind": "action_plan",
@@ -6261,7 +6261,7 @@ def _assert_plan_rejected_before_rng(
             )
             worker = SkillCheckResolutionWorker(
                 lambda: PostgresUnitOfWork(factory),
-                ScriptedFakeTransport([{
+                ScriptedFakeLLM([{
                     "kind": "resolution_required" if narrative else "action_plan",
                     "actions": intents,
                 }]),
@@ -6322,7 +6322,7 @@ def _run_scenario_worker(
         url = database.url.render_as_string(hide_password=False)
         async with _postgres_sessions(url) as factory:
             accepted = await _accept_turn(factory, _player_turn(player_text))
-            transport = ScriptedFakeTransport([decision])
+            transport = ScriptedFakeLLM([decision])
             worker = SkillCheckResolutionWorker(
                 lambda: PostgresUnitOfWork(factory),
                 transport,
@@ -6970,7 +6970,7 @@ def test_context_excludes_other_scene_and_nonpublic_entities(
             accepted = await _accept_turn(
                 factory, _player_turn("こんにちは" if narrative else "攻撃する")
             )
-            transport = ScriptedFakeTransport([
+            transport = ScriptedFakeLLM([
                 {"kind": "clarification_required", "question": "対象を指定してください。"}
             ])
             worker = SkillCheckResolutionWorker(
@@ -7141,7 +7141,7 @@ def test_worker_commits_attack_and_healing_item_from_registered_refs(
             def unit_of_work_factory() -> PostgresUnitOfWork:
                 return PostgresUnitOfWork(factory)
 
-            transport = ScriptedFakeTransport(
+            transport = ScriptedFakeLLM(
                 [{"kind": "action_plan", "actions": [intent]}]
             )
             worker = SkillCheckResolutionWorker(
@@ -7271,7 +7271,7 @@ def test_worker_keeps_first_heal_when_second_use_becomes_not_applicable(
 
             worker = SkillCheckResolutionWorker(
                 unit_of_work_factory,
-                ScriptedFakeTransport([{"kind": "action_plan", "actions": intents}]),
+                ScriptedFakeLLM([{"kind": "action_plan", "actions": intents}]),
                 MvpV1Ruleset(DiceEngine(random)),
                 WorkerPhasePolicy(60, 3, 120, "fake-intent"),
                 rng_source="seeded_test",
@@ -7358,7 +7358,7 @@ def test_worker_attack_miss_keeps_hp_and_state_version(database: Engine) -> None
 
             worker = SkillCheckResolutionWorker(
                 unit_of_work_factory,
-                ScriptedFakeTransport(
+                ScriptedFakeLLM(
                     [
                         {
                             "kind": "action_plan",
@@ -7441,7 +7441,7 @@ def test_later_attack_on_target_reduced_to_zero_is_not_applicable(
 
             worker = SkillCheckResolutionWorker(
                 unit_of_work_factory,
-                ScriptedFakeTransport(
+                ScriptedFakeLLM(
                     [{"kind": "action_plan", "actions": [attack, attack]}]
                 ),
                 MvpV1Ruleset(DiceEngine(FixedSequence())),
@@ -7563,7 +7563,7 @@ def test_worker_rejects_illegal_attack_and_item_intents_without_game_writes(
 
             worker = SkillCheckResolutionWorker(
                 unit_of_work_factory,
-                ScriptedFakeTransport(
+                ScriptedFakeLLM(
                     [{"kind": "action_plan", "actions": [intent]}]
                 ),
                 MvpV1Ruleset(DiceEngine(MagicMock())),
@@ -7971,7 +7971,7 @@ def _play_ruined_chapel(
                 ),
                 principal_provider=authenticate,
             )
-            fake_transport = DevelopmentFakeTransport()
+            fake_transport = DevelopmentFakeLLM()
             resolution_worker = SkillCheckResolutionWorker(
                 unit_of_work_factory,
                 fake_transport,

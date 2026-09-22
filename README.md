@@ -46,8 +46,8 @@ AI_RPGは、LLMにゲーム状態を直接変更させないAI TRPGバックエ�
 - FastAPIによるTurn受付と、認可付きTurn取得
 - Narrative／Mechanicalを分ける決定的なTurn Router
 - `mvp_v1` rulesetによる再現可能な技能判定
-- Fake transportによる通常描写とMechanicalへの昇格
-- OpenAI Responses APIのStructured Outputs adapter（object envelope、単発request、暗黙retryなし）
+- Fake LLMによる通常描写とMechanicalへの昇格
+- Pydantic AIによる会話・意図抽出・結果描写の3用途のAgent（Gemini／OpenAI切替、暗黙retryなし）
 - 完了済みTurnだけから組み立てる、公開範囲を限定した複数Turn Context
 - UUID入力が不要な冒険の開始、保存済み冒険の再開、DB由来のHP・所持品・履歴表示
 - 開始要求とTurnの送信結果が不明な場合も、同じrequestを再送して追跡するプレイ画面
@@ -262,21 +262,34 @@ $state.adventure | ConvertTo-Json -Depth 5
 
 解決workerへ渡す直近の公開履歴は`AIRPG_RECENT_MESSAGES_LIMIT`で0〜100件に設定でき、既定値は20です。0にすると履歴を渡しません。対象は同じCampaign・Scene・Actorの終端Turnだけで、プレイヤー入力、公開Action結果、保存済み描写を古い順に渡します。プレイヤー入力はuntrusted、Action結果とGM履歴はderived dataであり、履歴中の命令はworkerへの指示になりません。
 
-### OpenAI adapterを使う
+### Pydantic AIと実モデルを使う
 
-Fakeの代わりに実providerを選ぶ場合だけAPI keyが必要です。`--fake`を外し、同じ環境変数を設定したworkerを起動します。
+AI処理はPydantic AIのAgentが担当します。既定モデルは`google:gemini-3.5-flash`です。リポジトリ直下の`.env`に`GEMINI_API_KEY`を設定し、`--fake`を外して二つのworkerを別ターミナルで起動します。[.env.example](.env.example)には秘密値を含まない設定例があります。実モデルの呼び出しには利用料金が発生します。
 
 ```powershell
-$env:AIRPG_OPENAI_API_KEY = "..."
-$env:AIRPG_FAST_MODEL = "gpt-5-mini"
-$env:AIRPG_QUALITY_MODEL = "gpt-5.4"
+$env:AIRPG_LLM_MODEL = "google:gemini-3.5-flash"
 .\.venv\Scripts\ai-rpg.exe resolution-worker
 .\.venv\Scripts\ai-rpg.exe narration-worker
 ```
 
-API keyは実provider選択時だけ検証され、Fake実行には不要です。Pydanticのdiscriminated unionはprovider境界でobject envelopeへ変換し、ネストした`oneOf`／`discriminator`も対応する`anyOf`へ正規化してから送信します。応答はenvelopeから取り出した後、元の型付き契約で再検証します。
+| 設定 | 用途 |
+| --- | --- |
+| `AIRPG_LLM_MODEL` | 共通モデル。既定値は`google:gemini-3.5-flash` |
+| `AIRPG_FAST_MODEL` | 意図抽出・通常会話。未指定なら共通モデル |
+| `AIRPG_QUALITY_MODEL` | 確定結果の描写。未指定なら共通モデル |
+| `AIRPG_BACKGROUND_MODEL` | 将来のbackground用途。未指定なら共通モデル |
+| `AIRPG_GEMINI_API_KEY` / `GEMINI_API_KEY` | Google API認証。左の設定を優先 |
+| `AIRPG_OPENAI_API_KEY` / `OPENAI_API_KEY` | OpenAI API認証。左の設定を優先 |
+
+OpenAIへ切り替える場合は共通モデルを`openai-responses:gpt-5-mini`などに変更し、OpenAIのキーを設定します。tierのoverrideがある場合は、その設定が共通モデルより優先されます。旧形式の`gpt-5-mini`や`openai:gpt-5-mini`もOpenAI Responsesモデルとして扱います。選択したproviderのキーだけが必要で、Fakeではキーも通信も不要です。
+
+3用途のAgentは既存のPydantic契約を`NativeOutput`へ渡します。出力は型付きの`result`オブジェクトで包み、provider向けSchema変換はPydantic AIが行います。手書きのOpenAI HTTP transportは廃止しました。Google/OpenAI以外の追加には、対応extraとモデルfactoryへの追加、Schema・例外・再送回数の適合試験が必要です。
+
+workerは各Agent呼出前にDB予算を一度予約します。Agentの`retries=0`、`UsageLimits(request_limit=1)`に加え、Google SDKは`attempts=1`、OpenAI SDKは`max_retries=0`とし、自動repair・通信retry・provider fallbackを行いません。明示的な再試行は既存workerが残予算とdeadlineを確認して実施します。OpenAIの`store=False`を維持し、会話履歴はDBから組み立てます。Agentへゲーム更新toolは渡さず、未検証の途中出力もSSEへ流しません。
 
 各物理requestの直前にDBのTurn予算を予約し、timeout、拒否、不正JSON、Schema不一致、描写の事実逸脱も消費済みとして扱います。Mechanical描写は、プレイヤー入力を確定値の根拠にせず、保存済みEngine結果と認可済み公開状態にない数値、Canonical UUID、未登録の明示`@ref`を保存前に拒否します。
+
+2026-09-22の実Gemini検証では、会話→入場→探索→交渉→結末を4Turn・7要求で完走し、DB予約数との一致、同一入力の再送、履歴からの再開を確認しました。OpenAI側は実SDKとHTTP mockでの検証までです。20〜30分のプレイ時間や会話品質の評価、敵の反撃は後続に残しています。
 
 ## SSEでTurn更新を受け取る
 
@@ -297,13 +310,13 @@ data: {"id":12,"type":"turn.updated","schema_version":1,"payload":{"turn":{...}}
 - [x] 永続LLM予算、lease、deadline、障害復旧
 - [x] 開発用の独立API／worker runner
 - [x] 公開範囲を限定した複数Turn Context
-- [x] OpenAI Responses API adapter
+- [x] Pydantic AIの用途別AgentとGemini／OpenAIのモデル切替
 - [x] 本番認証adapter
 - [x] 最小のプレイヤー向け画面
 - [x] 攻撃・回復・アイテム使用のAPI経路
 - [x] SSEによるリアルタイム更新
 - [x] 固定短編の開始、探索、Scene遷移、三つの結末
-- [ ] シナリオ選択を含む開始・再開画面
+- [x] シナリオ選択を含む開始・再開画面
 - [ ] 実LLMによる短編プレイの調整
 - [ ] 敵の反撃を含む戦闘ループ
 - [ ] ブラウザログイン
@@ -337,7 +350,7 @@ src/ai_rpg/
 ├── domain/           # Command、Result、Event
 ├── engine/           # 決定的なゲームルール
 ├── infrastructure/   # PostgreSQLと外部adapter
-├── llm/              # Structured outputとFake transport
+├── llm/              # Pydantic AI Agent、モデル構成、Fake LLM
 └── scenarios/        # version付き固定Scenario定義
 
 migrations/           # Alembic migration

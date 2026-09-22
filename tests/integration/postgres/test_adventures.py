@@ -1,6 +1,7 @@
 """Atomic adventure creation and public resume against a dedicated PostgreSQL DB."""
 
 import asyncio
+import json
 import os
 from collections.abc import AsyncIterator, Iterator
 from contextlib import asynccontextmanager
@@ -10,6 +11,8 @@ from uuid import UUID, uuid4
 
 import pytest
 from httpx import ASGITransport, AsyncClient
+from pydantic_ai.messages import ModelResponse, TextPart
+from pydantic_ai.models.function import FunctionModel
 from sqlalchemy import Engine, create_engine, event, text
 from test_migrations import (
     _guard_empty_database,
@@ -32,7 +35,8 @@ from ai_rpg.application import (
 )
 from ai_rpg.engine import DiceEngine, MvpV1Ruleset
 from ai_rpg.infrastructure.postgres import PostgresAuthorizationPolicy, PostgresUnitOfWork
-from ai_rpg.llm import DevelopmentFakeTransport, ScriptedFakeTransport
+from ai_rpg.llm import DevelopmentFakeLLM, ScriptedFakeLLM
+from ai_rpg.llm.pydantic_ai import PydanticAILLM
 from ai_rpg.scenarios import BUILTIN_SCENARIOS
 
 URL = os.getenv("AIRPG_TEST_DATABASE_URL")
@@ -176,7 +180,10 @@ def test_differing_concurrent_starts_commit_one_and_rollback_retry(database: Eng
         runner.run(run())
 
 
-def test_new_adventure_fake_progress_state_and_paginated_history(database: Engine) -> None:
+@pytest.mark.parametrize("use_agent", [False, True], ids=["fake", "pydantic-ai"])
+def test_new_adventure_fake_progress_state_and_paginated_history(
+    database: Engine, use_agent: bool,
+) -> None:
     async def run() -> None:
         async with _postgres_sessions(URL) as factory, client_for(factory) as client:
             created = await client.post("/adventures", json=payload(preset_ref="guardian"))
@@ -202,7 +209,23 @@ def test_new_adventure_fake_progress_state_and_paginated_history(database: Engin
                 for secret in ("goblin", "flags", "difficulty", "defense", "attack_bonus")
             )
             uow = lambda: PostgresUnitOfWork(factory)  # noqa: E731
-            transport = DevelopmentFakeTransport()
+            fake = DevelopmentFakeLLM()
+            model_calls = []
+
+            async def model_response(messages, info):
+                # The real Agent supplies the actual public input, never game tools.
+                input_json = messages[-1].parts[-1].content
+                data = json.loads(input_json)
+                purpose = "result_narration" if "resolved_actions" in data else "intent"
+                model_calls.append(purpose)
+                assert not info.function_tools
+                if len(model_calls) == 2:
+                    # Invalid first narration must not replay the committed action.
+                    return ModelResponse(parts=[TextPart("invalid")], finish_reason="stop")
+                raw = await fake.request("fake", purpose, "", input_json, {})
+                return ModelResponse(parts=[TextPart(json.dumps({"result": raw}))], finish_reason="stop")
+
+            transport = PydanticAILLM({"fake": FunctionModel(model_response)}) if use_agent else fake
             resolution = SkillCheckResolutionWorker(
                 uow,
                 transport,
@@ -231,8 +254,13 @@ def test_new_adventure_fake_progress_state_and_paginated_history(database: Engin
                 assert pending["items"][0]["player_input"] == label
                 assert await resolution.run_once(turn_id)
                 assert await narration.run_once(turn_id)
+                if use_agent and version == 0:
+                    assert await narration.run_once(turn_id)
+                assert not await resolution.run_once(turn_id)
+                assert not await narration.run_once(turn_id)
                 turn = (await client.get(base + f"/turns/{turn_id}")).json()
                 assert turn["resolution_status"] == "committed"
+                assert turn["narration_status"] == "completed"
                 assert turn["route"] == "mechanical"
                 turns.append(turn)
             assert (
@@ -258,6 +286,13 @@ def test_new_adventure_fake_progress_state_and_paginated_history(database: Engin
             final = (await client.get(base + "/state")).json()
             assert final["adventure"]["status"] == "completed"
             assert final["state_version"] == 4
+            if use_agent:
+                assert model_calls.count("intent") == 4
+                assert model_calls.count("result_narration") == 5
+                with database.connect() as connection:
+                    assert connection.execute(text(
+                        "SELECT sum(llm_call_count) FROM turns WHERE campaign_id=:id"
+                    ), {"id": ids["campaign_id"]}).scalar_one() == 9
             assert final["latest_turn"] == turns[-1]
             assert (await client.get("/adventures")).json()["adventures"][0][
                 "status"
@@ -338,7 +373,7 @@ def test_resume_reads_live_pc_and_choice_labels_with_stable_history_cursor(
             first_id = UUID(first.json()["turn_id"])
             worker = SkillCheckResolutionWorker(
                 lambda: PostgresUnitOfWork(factory),
-                ScriptedFakeTransport(
+                ScriptedFakeLLM(
                     [
                         {
                             "kind": "narrative",

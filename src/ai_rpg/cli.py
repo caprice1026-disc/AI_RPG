@@ -21,8 +21,8 @@ from ai_rpg.infrastructure.postgres import (
 )
 from ai_rpg.runtime import (
     DEVELOPMENT_FIXTURE,
+    build_language_models,
     build_narration_worker,
-    build_provider_transport,
     build_resolution_worker,
     migrate_database,
     run_worker,
@@ -104,6 +104,16 @@ async def _run_auth_command(
     }
 
 
+async def _run_worker_command(args: argparse.Namespace, settings: Settings) -> bool:
+    async with build_language_models(settings, fake=args.fake) as llm:
+        worker = (
+            build_resolution_worker(settings, llm, deterministic=args.fake)
+            if args.command == "resolution-worker"
+            else build_narration_worker(settings, llm)
+        )
+        return await run_worker(worker, once=args.once, poll_seconds=1.0)
+
+
 def main(argv: Sequence[str] | None = None) -> None:
     parser = _parser()
     args = parser.parse_args(argv)
@@ -158,21 +168,9 @@ def main(argv: Sequence[str] | None = None) -> None:
         return
 
     try:
-        transport = build_provider_transport(settings, fake=args.fake)
+        processed = asyncio.run(_run_worker_command(args, settings))
     except ValueError as error:
         parser.error(str(error))
-    worker = (
-        build_resolution_worker(settings, transport, deterministic=args.fake)
-        if args.command == "resolution-worker"
-        else build_narration_worker(settings, transport)
-    )
-    processed = asyncio.run(
-        run_worker(
-            worker,
-            once=args.once,
-            poll_seconds=1.0,
-        )
-    )
     if args.once:
         print(json.dumps({"processed": processed}))
 

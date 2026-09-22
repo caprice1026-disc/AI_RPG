@@ -1,10 +1,73 @@
-"""構造化出力adapterの下で使うscript式Fake transport。"""
+"""用途別portを実装する、外部通信なしの決定的Fake。"""
 
 import json
+from abc import ABC, abstractmethod
 from collections.abc import Sequence
 from dataclasses import dataclass
+from typing import Literal, TypeAlias, cast
 
-from ai_rpg.llm.structured import LLMPurpose
+from pydantic import TypeAdapter
+
+from ai_rpg.application.ports.llm import IntentResult, NarrativeResult
+from ai_rpg.contracts.context import MechanicalInput, NarrativeInput
+from ai_rpg.contracts.llm_decisions import make_decision_types
+from ai_rpg.contracts.responses import MechanicalNarrationDraft, MechanicalNarrationInput
+from ai_rpg.llm.prompts import (
+    INTENT_INSTRUCTIONS,
+    NARRATION_INSTRUCTIONS,
+    NARRATIVE_INSTRUCTIONS,
+)
+
+LLMPurpose: TypeAlias = Literal["intent", "narrative", "result_narration"]
+
+
+class _FakeLLM(ABC):
+    async def generate_narrative(
+        self, context: NarrativeInput, *, model_id: str
+    ) -> NarrativeResult:
+        adapter, _ = make_decision_types(context.output_limits.max_actions)
+        raw = await self.request(
+            model_id,
+            "narrative",
+            NARRATIVE_INSTRUCTIONS,
+            context.model_dump_json(),
+            adapter.json_schema(),
+        )
+        return cast(NarrativeResult, adapter.validate_python(raw))
+
+    async def extract_intent(self, context: MechanicalInput, *, model_id: str) -> IntentResult:
+        _, adapter = make_decision_types(context.output_limits.max_actions)
+        raw = await self.request(
+            model_id,
+            "intent",
+            INTENT_INSTRUCTIONS,
+            context.model_dump_json(),
+            adapter.json_schema(),
+        )
+        return cast(IntentResult, adapter.validate_python(raw))
+
+    async def narrate_result(
+        self, context: MechanicalNarrationInput, *, model_id: str
+    ) -> MechanicalNarrationDraft:
+        adapter = TypeAdapter(MechanicalNarrationDraft)
+        raw = await self.request(
+            model_id,
+            "result_narration",
+            NARRATION_INSTRUCTIONS,
+            context.model_dump_json(),
+            adapter.json_schema(),
+        )
+        return adapter.validate_python(raw)
+
+    @abstractmethod
+    async def request(
+        self,
+        model_id: str,
+        purpose: LLMPurpose,
+        instruction: str,
+        input_data: str,
+        output_schema: dict[str, object],
+    ) -> object: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -16,7 +79,7 @@ class FakeCall:
     output_schema: dict[str, object]
 
 
-class ScriptedFakeTransport:
+class ScriptedFakeLLM(_FakeLLM):
     """応答または例外を指定順に一度ずつ返す。"""
 
     def __init__(self, script: Sequence[object]) -> None:
@@ -34,9 +97,7 @@ class ScriptedFakeTransport:
     ) -> object:
         if self.request_count >= len(self._script):
             raise RuntimeError("Fake LLMのscriptを使い切りました")
-        self.calls.append(
-            FakeCall(model_id, purpose, instruction, input_data, output_schema)
-        )
+        self.calls.append(FakeCall(model_id, purpose, instruction, input_data, output_schema))
         outcome = self._script[self.request_count]
         self.request_count += 1
         if isinstance(outcome, BaseException):
@@ -44,7 +105,7 @@ class ScriptedFakeTransport:
         return outcome
 
 
-class DevelopmentFakeTransport:
+class DevelopmentFakeLLM(_FakeLLM):
     """別processの開発実行で同じ一往復を再現する決定的Fake。"""
 
     async def request(

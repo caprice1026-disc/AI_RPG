@@ -1,90 +1,37 @@
-"""永続予約を通る構造化出力adapterとFake transport。"""
+"""用途別Fakeの出力検証と固定短編の決定的応答。"""
 
 import json
-from unittest.mock import AsyncMock
 
 import pytest
-from pydantic import TypeAdapter, ValidationError
+from pydantic import ValidationError
 
+from ai_rpg.contracts.context import NarrativeInput
 from ai_rpg.llm import (
-    CallBudgetExceeded,
-    DevelopmentFakeTransport,
-    ScriptedFakeTransport,
-    StructuredOutputAdapter,
-    StructuredRequest,
+    DevelopmentFakeLLM,
+    ScriptedFakeLLM,
 )
 
 
 @pytest.mark.asyncio
-async def test_adapter_reserves_before_transport_and_validates_output() -> None:
-    order: list[str] = []
-
-    async def reserve() -> bool:
-        order.append("reserve")
-        return True
-
-    transport = ScriptedFakeTransport([{"value": 7}])
-    adapter = StructuredOutputAdapter(transport, reserve)
-
-    result = await adapter.generate(
-        StructuredRequest(
-            model_id="fake",
-            purpose="intent",
-            system_instruction="test",
-            input_data="{}",
-            output_adapter=TypeAdapter(dict[str, int]),
-        )
+async def test_fake_port_rejects_invalid_typed_output_without_retry() -> None:
+    fragment = dict(source="test", trust_level="trusted", access_scope="public", content="入口")
+    context = NarrativeInput(
+        player_text="話す",
+        scene_view=fragment,
+        pc_view=fragment,
+        recent_messages=[],
+        allowed_entity_refs=[],
+        output_limits={},
     )
-
-    assert result == {"value": 7}
-    assert order == ["reserve"]
-    assert transport.request_count == 1
-    assert transport.calls[0].purpose == "intent"
-    assert transport.calls[0].output_schema["type"] == "object"
-
-
-@pytest.mark.asyncio
-async def test_adapter_does_not_call_transport_when_db_reservation_fails() -> None:
-    reserve = AsyncMock(return_value=False)
-    transport = ScriptedFakeTransport([{"value": 7}])
-
-    with pytest.raises(CallBudgetExceeded):
-        await StructuredOutputAdapter(transport, reserve).generate(
-            StructuredRequest(
-                model_id="fake",
-                purpose="intent",
-                system_instruction="test",
-                input_data="{}",
-                output_adapter=TypeAdapter(dict[str, int]),
-            )
-        )
-
-    assert transport.request_count == 0
-
-
-@pytest.mark.asyncio
-async def test_invalid_fake_output_still_consumes_one_reserved_call() -> None:
-    reserve = AsyncMock(return_value=True)
-    transport = ScriptedFakeTransport([{"value": "invalid"}])
-
+    transport = ScriptedFakeLLM([{"kind": "narrative", "narration": "", "choices": []}])
     with pytest.raises(ValidationError):
-        await StructuredOutputAdapter(transport, reserve).generate(
-            StructuredRequest(
-                model_id="fake",
-                purpose="intent",
-                system_instruction="test",
-                input_data="{}",
-                output_adapter=TypeAdapter(dict[str, int]),
-            )
-        )
-
-    reserve.assert_awaited_once()
+        await transport.generate_narrative(context, model_id="fake")
     assert transport.request_count == 1
 
 
 @pytest.mark.asyncio
 async def test_fake_transport_can_script_timeout() -> None:
-    transport = ScriptedFakeTransport([TimeoutError("scripted timeout")])
+    transport = ScriptedFakeLLM([TimeoutError("scripted timeout")])
 
     with pytest.raises(TimeoutError, match="scripted timeout"):
         await transport.request("fake", "intent", "test", "{}", {"type": "object"})
@@ -94,12 +41,10 @@ async def test_fake_transport_can_script_timeout() -> None:
 
 @pytest.mark.asyncio
 async def test_fake_transport_can_script_transient_failure() -> None:
-    transport = ScriptedFakeTransport([ConnectionError("provider unavailable")])
+    transport = ScriptedFakeLLM([ConnectionError("provider unavailable")])
 
     with pytest.raises(ConnectionError, match="provider unavailable"):
-        await transport.request(
-            "fake", "intent", "test", "{}", {"type": "object"}
-        )
+        await transport.request("fake", "intent", "test", "{}", {"type": "object"})
 
     assert transport.request_count == 1
 
@@ -164,17 +109,13 @@ async def test_development_fake_uses_only_available_scenario_actions(
     action_ref: str,
     expected: dict[str, object],
 ) -> None:
-    transport = DevelopmentFakeTransport()
+    transport = DevelopmentFakeLLM()
     input_data = json.dumps(
         {
             "player_text": player_text,
             "scene_view": {
                 "content": json.dumps(
-                    {
-                        "available_actions": [
-                            {"action_ref": action_ref, "label": "利用可能"}
-                        ]
-                    },
+                    {"available_actions": [{"action_ref": action_ref, "label": "利用可能"}]},
                     ensure_ascii=False,
                 )
             },
@@ -189,7 +130,7 @@ async def test_development_fake_uses_only_available_scenario_actions(
 
 @pytest.mark.asyncio
 async def test_development_fake_does_not_invent_unavailable_scenario_action() -> None:
-    transport = DevelopmentFakeTransport()
+    transport = DevelopmentFakeLLM()
     input_data = json.dumps(
         {
             "player_text": "撤退する",

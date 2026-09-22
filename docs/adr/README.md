@@ -9,13 +9,14 @@
 | [0003](0003-postgresql-access-and-migrations.md) | PostgreSQLアクセスとマイグレーション |
 | [0004](0004-worker-runtime.md) | Turn／描写workerの実行基盤 |
 | [0005](0005-streaming.md) | クライアント向けストリーミング |
-| [0006](0006-llm-provider.md) | LLMプロバイダー抽象化 |
+| [0006](0006-llm-provider.md) | LLMプロバイダー抽象化（0013で置換） |
 | [0007](0007-mvp-ruleset.md) | MVPゲームルール |
 | [0008](0008-runtime-defaults.md) | 実行時初期設定 |
 | [0009](0009-turn-routing.md) | Turnルーティング |
 | [0010](0010-authenticated-principal.md) | 認証済みprincipal境界 |
 | [0011](0011-scene-entity-scope.md) | Scene entityの公開範囲と攻撃到達可能性 |
 | [0012](0012-scenario-definitions-and-progress.md) | Scenario定義と実行状態の分離 |
+| [0013](0013-pydantic-ai-orchestration.md) | 用途別Pydantic AI Agentとモデル切替 |
 
 ## 共通方針
 
