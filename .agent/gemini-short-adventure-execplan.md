@@ -41,7 +41,7 @@ Interfaces: NarrativeGenerator、IntentExtractor、ResultNarratorをApplication�
 
 ## Task 2: 登録済み行動の直接実行と公開Context
 
-状態: 実装・検証・レビュー完了。mainへの統合・pushを残す。
+状態: 実装・検証・レビューとmainへの統合・pushが完了（実装commit 6cc154c）。
 
 担当: controller。対象: contracts/player_turn.py、ports/repositories.py、application/turns.py・workers.py・scenarios.py、postgres/models.py・repositories.py・adventures.py、migration0012、関連tests。UIはTask4が担当。
 
@@ -51,11 +51,11 @@ Interfaces: 新規入力はcontent={kind:'scenario_action', action_ref:'enter_ch
 - [x] typed入力とmigrationを追加する。元のtext/choiceを維持する。選択肢ラベルを再解釈せず、現在の定義・flags・actor権限から登録済みDirect/Skill/Attack Intentを作る。解決前にも再検証し、選択行動のintent用LLM呼出は0回、描写だけ既存予算を消費する。
 - [x] scene公開説明、目的、公開facts、登録行動のkind/ref/対象/技能、PC自身のHP・装備・所持品、直近完了会話をContextへ含める。少数の公開NPC会話設定をSceneに置く。秘密の遷移条件/未訪問情報は出さない。
 - [x] 自由入力で会話か判定かを選び、action_refとスキル/攻撃の対応を明示するpromptにする。解釈不能な入力は確認/未適用へ戻し、状態を捏造しない。
-- [ ] 関連unit/contract/DB testsをGREENにしcommit。Task3との共有箇所はcontrollerが逐次統合する。
+- [x] 関連unit/contract/DB testsをGREENにしcommit。Task3との共有箇所はcontrollerが逐次統合する。
 
 ## Task 3: version付き短編v2と最小戦闘
 
-状態: 実装・検証・レビュー完了。mainへの統合・pushを残す。
+状態: 実装・検証・レビューとmainへの統合・pushが完了（実装commit 6cc154c）。
 
 担当: controller。対象: scenarios/models.py・catalog.py・ruined_chapel_v2.json、application/combat.py（必要な純粋処理のみ）、workers.py・resolution.py、domain/results.py・events.py、contracts/responses.py、postgres/repositories.py、narration_grounding.py、関連tests。
 
@@ -69,7 +69,7 @@ Interfaces: CommitBundleに既定空のenemy_reactionsを持たせ、型付きEn
 
 ## Task 4: 画面・文書・実モデル受入・統合
 
-状態: 実装・検証・レビュー完了。mainへの統合・pushを残す。
+状態: 実装・検証・レビューとmainへの統合・pushが完了（実装commit 6cc154c）。
 
 担当: UIは契約確定後に独立エージェントへ委任可。controllerが全体検証と文書・実APIを担当。
 
@@ -77,7 +77,7 @@ Interfaces: CommitBundleに既定空のenemy_reactionsを持たせ、型付きEn
 - [x] .envのGeminiキーをsecretのまま用い、別DBで自由入力→探索/会話→判定→遷移→結末を実モデルで検証する。固定候補の非再解釈も確認し、呼出数と失敗種別を記録する。30回上限を超えて続行しない。
 - [x] 実PostgreSQL全pytest、Node tests、Ruff、mypy、buildを実行し、実browserで開始・候補・自由入力・HP変化・反撃・reload・Endingを確認する。
 - [x] README・contracts・必要なADRをjapanese-tech-writingに沿って更新する。起動設定、モデル選択、LLM料金発生、v1/v2互換、戦闘規則、未検証の20〜30分目標と段階5を明記する。
-- [ ] task reviewと最終全体reviewの必要修正を終え、mainへ統合・pushしてremote SHAを照合する。秘密漏洩と無関係な差分がないことを確認する。検証専用processを停止し記録を保存する。
+- [x] task reviewと最終全体reviewの必要修正を終え、mainへ統合・pushしてremote SHAを照合する。秘密漏洩と無関係な差分がないことを確認する。検証専用processを停止し記録を保存する。
 
 ## 進捗・検証記録
 
@@ -104,3 +104,4 @@ Interfaces: CommitBundleに既定空のenemy_reactionsを持たせ、型付きEn
 - 実測で回復上限前の量を実回復量と語る問題を発見。Engineの公開事実を実際のHP差分へ修正し、Narrator指示を補足。RED/GREENを確認後、実GeminiでHP6→10を4回復と描写し、登録済み直接撤退まで3要求で確認。累計29/30要求で終了。キーは表示・保存せず、通常履歴DBとは分離した。
 - 実ブラウザと専用ai_rpg_stage4_browserで、開始、候補直接送信、下書き保持、探索、敵HP10→4、反撃で本人HP10→9、戦闘中reload、自由入力回復9→10と在庫2→1、撃破、回収・帰還、完了後reloadと入力停止を確認。console警告/エラーなし。実ブラウザの敗北・狭幅表示は未確認（敗北は実DBとNodeで確認）。
 - シナリオ・反撃projection・UIの個別レビュー、最終統合レビューはいずれも仕様/品質PASS、要対応指摘なし。20〜30分の所要時間・自然言語全体の意味整合性・楽しさは未評価。ブラウザログインと少人数テストは段階5に残す。
+- mainを6cc154c801e366997f7fed6ea539247973082218へfast-forwardし、uv sync --frozenと統合後の重点29 testsを確認。origin/mainへのpush後、git ls-remoteで同じSHAを確認した。契約文書のPython例は実行可能、差分の秘密値パターン検査は0件。検証用API/Fake workerを停止し、ユーザーの既存DB・Dockerコンテナは維持した。
