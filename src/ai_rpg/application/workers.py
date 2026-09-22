@@ -1249,28 +1249,24 @@ class SkillCheckResolutionWorker:
                 scene for scene in definition.scenes if scene.sequence == runtime_scene.sequence
             )
             source = "scenario_scene"
-            content = f"{scene.title}: {scene.description}"
+            parts = [f"{scene.title}: {scene.description}"]
         elif update.ending_ref is not None:
             ending = next(
                 ending for ending in definition.endings if ending.ending_ref == update.ending_ref
             )
             source = "scenario_ending"
-            content = f"{ending.title}: {ending.summary}"
+            parts = [f"{ending.title}: {ending.summary}"]
         else:
             source = "scenario_facts"
-            content = (
-                " / ".join(
-                    flag.public_fact
-                    for flag in definition.flags
-                    if flag.flag_ref in update.add_flags
-                )
-                or "現在の場面で行動を終えた。"
-            )
+            parts = []
+        parts.extend(
+            flag.public_fact for flag in definition.flags if flag.flag_ref in update.add_flags
+        )
         return ContextFragment(
             source=source,
             trust_level="trusted",
             access_scope="public",
-            content=content,
+            content=" / ".join(parts) or "現在の場面で行動を終えた。",
         )
 
 

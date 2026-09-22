@@ -9,6 +9,11 @@ from pydantic_ai.models.function import AgentInfo, FunctionModel
 from ai_rpg.application.ports.llm import ProviderOutputError, ProviderRefusalError
 from ai_rpg.contracts.context import MechanicalInput, NarrativeInput
 from ai_rpg.contracts.responses import MechanicalNarrationInput
+from ai_rpg.llm.prompts import (
+    INTENT_INSTRUCTIONS,
+    NARRATION_INSTRUCTIONS,
+    NARRATIVE_INSTRUCTIONS,
+)
 from ai_rpg.llm.pydantic_ai import PydanticAILLM
 
 
@@ -66,6 +71,11 @@ async def test_agents_return_typed_output_without_tools_or_extra_requests(purpos
         )
     assert result.model_dump() == expected
     assert len(calls) == 1
+    assert calls[0][1].instructions == {
+        "intent": INTENT_INSTRUCTIONS,
+        "narrative": NARRATIVE_INSTRUCTIONS,
+        "result_narration": NARRATION_INSTRUCTIONS,
+    }[purpose]
 
 
 @pytest.mark.asyncio

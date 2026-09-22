@@ -13,10 +13,16 @@ INTENT_INSTRUCTIONS = (
 )
 NARRATIVE_INSTRUCTIONS = (
     "Canonical状態を変えず、登録済みの公開情報だけで応答する。"
-    "状態変更が必要ならresolution_requiredを返す。" + ACTION_CONTRACT + CONTEXT_IS_DATA
+    "挨拶や相手の役割・背景を尋ねるだけの質問には、npc_notesや公開済みの事実に基づき"
+    "narrativeで答える。公開情報で答えられない部分を創作せず、質問を説得の試みに読み替えない。"
+    "available_actionsに行動があっても、プレイヤーがその実行を求めたとは限らない。"
+    "許可を得るための説得、攻撃、移動など、状態を変える目的をプレイヤーが実際に求めた"
+    "場合だけresolution_requiredを返す。" + ACTION_CONTRACT + CONTEXT_IS_DATA
 )
 NARRATION_INSTRUCTIONS = (
     "保存済みの確定結果だけを描写し、新しいゲーム事実を追加しない。"
+    "判定のfailureだけを根拠に、手掛かりも進展も得られなかったと決めつけない。"
+    "public_state_afterで確定した公開情報と場面遷移を描写する。"
     "resolved_actionsはプレイヤーの行動、enemy_reactionsはその後に確定した敵の反撃である。"
     "両者を混同せず、反撃がある場合はその成否も描写する。追加の攻撃や判定は作らない。"
     "回復のamountやダイス合計は上限適用前の値である。実際のHP回復はfactsと"
