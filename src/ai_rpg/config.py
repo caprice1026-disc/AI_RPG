@@ -95,7 +95,9 @@ class Settings(BaseSettings):
         # The model validator separately enforces the explicit loopback opt-in.
         validate_auth_url(value, allow_loopback=True, origin=True)
         parsed = urlsplit(value)
-        host = (parsed.hostname or "").encode("idna").decode("ascii")
+        host = parsed.hostname or ""
+        if not host.isascii():
+            raise ValueError("APP_ORIGINのホストはASCIIまたはpunycodeで指定します")
         authority = f"[{host}]" if ":" in host else host
         if parsed.port is not None and parsed.port != {"http": 80, "https": 443}[parsed.scheme]:
             authority += f":{parsed.port}"

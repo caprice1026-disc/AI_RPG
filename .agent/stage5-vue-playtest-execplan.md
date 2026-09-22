@@ -70,7 +70,7 @@ QA専用DBを使い、desktop/mobileでlogin→新規開始→探索→自由入
 
 - [x] 現行main/文書/認証契約を確認し専用worktreeとvenvを用意した。
 - [x] Task 1: persistence (de5d5ec、13実DB tests、独立review承認)
-- [ ] Task 2: browser OIDC
+- [x] Task 2: browser OIDC (Keycloak実ログイン、独立レビュー、Origin/SSE失効の回帰修正)
 - [ ] Task 3: playtest handoff
 - [ ] Task 4: Vue
 - [ ] Task 5: browser/LLM/refinement/main

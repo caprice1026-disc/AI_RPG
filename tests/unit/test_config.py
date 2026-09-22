@@ -207,8 +207,15 @@ def test_browser_auth_is_opt_in() -> None:
     ("https://game.example:8443", "https://game.example:8443"),
     ("http://LOCALHOST:80", "http://localhost"),
     ("http://[::1]:8035", "http://[::1]:8035"),
+    ("https://xn--fa-hia.example", "https://xn--fa-hia.example"),
 ])
 def test_browser_origin_matches_browser_serialization(origin, canonical):
     settings = Settings(auth_client_id="web", auth_app_origin=origin,
                         auth_allow_insecure_loopback=True)
     assert settings.auth_app_origin == canonical
+
+
+@pytest.mark.parametrize("origin", ["https://faß.example", "https://例え.example"])
+def test_browser_origin_requires_explicit_ascii_hostname(origin):
+    with pytest.raises(ValidationError, match="ASCII"):
+        Settings(auth_client_id="web", auth_app_origin=origin)

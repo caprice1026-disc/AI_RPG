@@ -157,12 +157,14 @@ def test_registered_input_downgrade_refuses_without_losing_turn(database):
 
     with asyncio.Runner(loop_factory=asyncio.SelectorEventLoop) as runner:
         runner.run(run())
+    with database.connect() as connection:
+        original_revision = connection.scalar(text("SELECT version_num FROM alembic_version"))
     with pytest.raises(subprocess.CalledProcessError):
         _run_alembic(URL, "downgrade", "0011_adventure_starts")
     with database.connect() as connection:
         assert (
             connection.scalar(text("SELECT version_num FROM alembic_version"))
-            == "0012_registered_action_input"
+            == original_revision
         )
         assert connection.scalar(text("SELECT selected_action_ref FROM turns")) == "enter_chapel"
 
