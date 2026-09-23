@@ -9,7 +9,7 @@ npm.cmd run typecheck
 npm.cmd run build
 ```
 
-The build writes only `../src/ai_rpg/api/static/vue/`. Commit that generated directory together with the source for Python-only installations. The backend serves its `index.html` at `/`; all built assets use `/static/vue/`. The existing legacy static files are outside this client's ownership.
+The build writes only `../src/ai_rpg/api/static/vue/`. Commit that generated directory together with the source for Python-only installations. The backend serves its `index.html` at `/`; all built assets use `/static/vue/`.
 
 `npm.cmd run dev` starts Vite for frontend development. Gameplay and login use same-origin absolute URLs, so end-to-end testing uses the Python-served production build with the backend's configured authentication origin. This project does not configure another authentication origin or read application secrets.
 

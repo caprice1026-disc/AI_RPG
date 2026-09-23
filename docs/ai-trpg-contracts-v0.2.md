@@ -949,4 +949,21 @@ Pydanticのkindによるunionと未知フィールドの扱いは、公式の[Un
 
 履歴の`limit`は1〜100、既定値は50。最初のrequestで最新のページを返し、ページ内の`items`は古い順に並べる。各itemは`created_at`、`player_input`、`turn`を持つ。`next_before_turn_id`がnullでなければ、その値を次のrequestの`before_turn_id`に渡して古いページを読む。未完了Turnも含めて返すため、ブラウザは保存済み履歴の表示と進行中Turnの追跡を両立させる。
 
-ブラウザは開始要求の送信前にrequest_idとpayloadを保存する。通信結果が不明なら同じ要求を再送し、受付を確認するまで別の開始要求を作らない。Turnの既存の再送・409再確認規約も維持する。段階2の行動候補はラベルを既存のtext入力へ渡す補助機能であり、サーバー側の進行条件・権限検証を省略しない。登録済みactionへの直接bindingは後続段階とする。
+ブラウザは開始要求の送信前にrequest_idとpayloadを保存する。通信結果が不明なら同じ要求を再送し、受付を確認するまで別の開始要求を作らない。Turnの既存の再送・409再確認規約も維持する。段階4以降の行動候補は`{kind: "scenario_action", action_ref: "登録済み参照"}`を送り、ラベルをLLMへ再解釈させない。実行時の進行条件・権限検証は省略しない。
+
+## 11 ブラウザ認証とセッション
+
+ブラウザ認証を設定したAPIは、[ADR-0015](adr/0015-browser-oidc-sessions.md)に従ってOIDCログインを提供する。既存Bearer APIの契約は維持する。
+
+| API | 契約 |
+| --- | --- |
+| `GET /auth/login` | binding Cookieと5分のlogin attemptを作り、PKCE S256・state・nonce付きでIdPへredirectする |
+| `GET /auth/callback` | 一度だけcodeを交換・検証し、有効な登録identityのセッションを発行してrootへ戻す |
+| `GET /auth/session` | principal_id、mode、csrf_token、expires_atを返す。subjectやprovider tokenは返さない |
+| `POST /auth/logout` | Cookie認証とOrigin・CSRFを検証し、セッションを失効して204を返す |
+
+`mode`は`session`／`development`／`bearer`。Cookie認証では更新要求に`X-CSRF-Token`が必要で、Originは設定されたapp originと一致させる。Bearer headerが指定された場合はBearerを優先し、不正tokenからCookieへfallbackしない。
+
+ブラウザはCSRF tokenをメモリだけに保持する。未確認の開始・Turn要求は内部principal IDごとに分離して保存し、別ユーザーへ引き継がない。401やlogoutでは表示中の個人データとイベント購読を解除するが、同じユーザーが再ログインした後に未確認要求を追跡できるようにする。
+
+セッションは8時間の絶対期限を持つ。DBにはCookie秘密値のSHA256を保存し、subjectはidentity対応表だけに残す。identity無効化は各requestとSSEのpollで再確認する。callbackエラーは固定の`login_error`だけをrootへ渡し、code・token・providerのエラー本文を表示しない。

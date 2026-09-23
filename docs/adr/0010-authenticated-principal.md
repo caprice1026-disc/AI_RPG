@@ -50,6 +50,8 @@ Campaign認可は引き続きDB-backedとし、JWTのrole、email、nameなど�
 
 HTTP層の `Authenticator` portがcredentialを検証し、このvalue objectを生成する。将来のブラウザログイン／server session adapterも同じ`AuthenticatedPrincipal`契約を生成し、`(issuer, subject)` の一意対応、内部 `principal_id`、RequestContext契約を維持する。認可は独立した `AuthorizationPolicy` portに保つ。
 
+2026-09-22追記: [ADR-0015](0015-browser-oidc-sessions.md)でブラウザ向けOIDCログインとserver sessionを追加した。上記のBearer APIとprincipal境界は維持し、Cookie認証の更新要求にOrigin・CSRF検証を加える。
+
 ## 影響
 
 ログには `principal_id` とcorrelation IDを記録できるがtoken、Authorization header、cookie、認証秘密、subject、全claimは記録しない。subjectはidentity対応キーとして`principal_identities`だけに永続化し、管理者が明示的に実行したidentity管理CLIのJSON以外へ出力しない。event、ゲームデータ、HTTPエラーにもsubjectを含めない。日時はtimezone-aware UTCとする。issuer/subjectの紐付け変更には監査可能なidentity migrationが必要になる。

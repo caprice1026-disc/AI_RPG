@@ -68,9 +68,13 @@ QA専用DBを使い、desktop/mobileでlogin→新規開始→探索→自由入
 
 ## 進捗
 
+実プレイからの追加修正: Scene遷移を伴う技能判定で、`_scenario_public_state_after`が移動先だけを返し、同時に得た公開flagの事実を描写Contextへ渡していなかった。0299afcで移動先と公開事実を両方渡し、9回帰テストと実Geminiの失敗時描写で確認した。背景質問の誤った交渉昇格も用途別プロンプトで改善し、同じ質問がNarrativeとなることを実Geminiで確認した。
+
+UIは0375245で移行し、56b7f9fで別端末の未完了Turn追跡、復旧警告、重複選択肢を改善。バックエンド753件、frontend79件、Ruff/mypy/buildを確認した。実ブラウザは3冒険26ターン、Gemini30要求で、成功経路の完走・撤退・再開・回復・認証を確認した。詳細はdocs/verification-stage5-20260922.mdに記録。
+
 - [x] 現行main/文書/認証契約を確認し専用worktreeとvenvを用意した。
 - [x] Task 1: persistence (de5d5ec、13実DB tests、独立review承認)
 - [x] Task 2: browser OIDC (Keycloak実ログイン、独立レビュー、Origin/SSE失効の回帰修正)
-- [ ] Task 3: playtest handoff
-- [ ] Task 4: Vue
+- [x] Task 3: playtest handoff（登録/運用ガイド、感想のローカル保存、人の試遊との区別）
+- [x] Task 4: Vue（79 tests、型検査/build、desktop/mobile確認）
 - [ ] Task 5: browser/LLM/refinement/main

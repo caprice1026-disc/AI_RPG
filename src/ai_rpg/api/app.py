@@ -10,6 +10,7 @@ from uuid import UUID
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, Response, status
 from fastapi.responses import FileResponse, StreamingResponse
+from fastapi.staticfiles import StaticFiles
 from starlette.types import Message, Send
 
 from ai_rpg.api.browser_auth import BrowserAuthenticator
@@ -55,8 +56,8 @@ ApplicationError = (
     | InvalidAdventureError
     | InvalidHistoryCursorError
 )
-_PLAY_SCREEN = Path(__file__).with_name("static") / "index.html"
-_PLAY_STATE = Path(__file__).with_name("static") / "play-state.js"
+_PLAY_ASSETS = Path(__file__).with_name("static") / "vue"
+_PLAY_SCREEN = _PLAY_ASSETS / "index.html"
 
 
 class _TimedStreamingResponse(StreamingResponse):
@@ -179,6 +180,7 @@ def create_app(
                 await browser_auth.close()
 
     app = FastAPI(title="AI RPG API", version="0.1.0", lifespan=lifespan)
+    app.mount("/static/vue", StaticFiles(directory=_PLAY_ASSETS), name="vue")
     if browser_auth is not None:
         browser_auth.mount(app)
 
@@ -211,10 +213,6 @@ def create_app(
     @app.get("/", include_in_schema=False, response_class=FileResponse)
     async def play_screen() -> FileResponse:
         return FileResponse(_PLAY_SCREEN, media_type="text/html")
-
-    @app.get("/static/play-state.js", include_in_schema=False, response_class=FileResponse)
-    async def play_state_script() -> FileResponse:
-        return FileResponse(_PLAY_STATE, media_type="text/javascript")
 
     @app.get("/health", tags=["運用"])
     async def health() -> dict[str, str]:

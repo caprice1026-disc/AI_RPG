@@ -17,7 +17,7 @@ LLMの創造性と、決定的なゲームルール・永続状態・障害復�
 
 ## AI_RPGとは
 
-AI_RPGは、LLMにゲーム状態を直接変更させないAI TRPGバックエンドです。LLMはプレイヤー入力から意図を抽出し、確定済み結果を描写します。判定、乱数、HPや在庫の変更、イベント履歴は、型付きのGame EngineとPostgreSQL transactionが担当します。
+AI_RPGは、あなたの言葉で冒険を進めるAI TRPGです。LLMはプレイヤー入力から意図を抽出し、確定済み結果を描写します。判定、乱数、HPや在庫の変更、イベント履歴は、型付きのGame EngineとPostgreSQL transactionが担当します。
 
 現在のMVPでは、ブラウザでシナリオとプリセットPCを選び、固定短編「廃礼拝堂の聖印」を遊べます。Geminiとの自由入力、確実に実行できる行動候補、敵の反撃を含む戦闘に対応しています。回収成功・代償付き成功・撤退・敗北の結末があり、保存済みの冒険一覧から続きを再開できます。
 
@@ -26,7 +26,7 @@ AI_RPGは、LLMにゲーム状態を直接変更させないAI TRPGバックエ�
 ```
 
 > [!IMPORTANT]
-> 現在は基盤機能を検証するMVPです。本番APIはOIDC Bearer JWT認証に対応していますが、ブラウザログインは未実装です。bundled play screenは引き続き開発用principalで利用します。
+> 現在は短編を試遊できるMVPです。ブラウザログインはOIDCの事前登録ユーザーに対応し、既存のBearer APIも維持しています。本番公開にはIdPとHTTPSの設定が必要です。20〜30分の所要時間や楽しさは、実プレイヤーによる評価を続ける対象です。
 
 ## 特徴
 
@@ -50,6 +50,8 @@ AI_RPGは、LLMにゲーム状態を直接変更させないAI TRPGバックエ�
 - Pydantic AIによる会話・意図抽出・結果描写の3用途のAgent（Gemini／OpenAI切替、暗黙retryなし）
 - 完了済みTurnだけから組み立てる、公開範囲を限定した複数Turn Context
 - UUID入力が不要な冒険の開始、保存済み冒険の再開、DB由来のHP・所持品・履歴表示
+- Vue 3のプレイ画面、ブラウザログイン、スマートフォン向けの折りたたみ表示
+- 任意の感想を手元へ保存できる、少人数プレイテストの導線
 - 開始要求とTurnの送信結果が不明な場合も、同じrequestを再送して追跡するプレイ画面
 - 登録済み参照だけを使う攻撃、HP下限／上限、回復ポーションと在庫消費
 - version付きScenario定義と、探索の成否からScene／公開情報／Endingへ進む固定短編
@@ -86,7 +88,7 @@ flowchart LR
 
 ## クイックスタート
 
-必要なものはPython 3.11以上、[uv](https://docs.astral.sh/uv/)、PostgreSQLです。
+必要なものはPython 3.11以上、[uv](https://docs.astral.sh/uv/)、PostgreSQLです。Vueのビルド済み画面を同梱しているため、遊ぶだけならNode.jsは不要です。
 
 ```powershell
 .\.venv\Scripts\uv.exe sync --frozen
@@ -156,7 +158,22 @@ HTTP statusの意味は次のとおりです。
 
 Discoveryはprocess起動時に取得し、失敗した場合はAPIを起動しません。JWKSは300秒cacheし、未知の`kid`では直近取得から30秒のcooldown経過後に再取得してIssuer側の鍵rotationへ追随します。必要なJWKS取得に接続できない場合は503、既知鍵での署名不一致や更新後も鍵を選択できないtokenは、他の不正credentialと同じ401になります。
 
-`ai-rpg api --dev-principal`はOIDCを迂回するローカル開発専用の明示的な起動方法です。UUIDを省略すると固定の開発principalを使い、`--dev-principal <UUID>`で別の開発principalも指定できます。通常のAPI起動やworkerへ暗黙適用されません。このモードでは接続者を同じプレイヤーとして扱うため、APIを外部公開しないでください。将来のブラウザログイン／server sessionは同じprincipal契約を生成する別adapterとして追加します。それまではbundled play screenからBearer loginはできず、ローカル開発では`--dev-principal`が必要です。
+### ブラウザでログインする
+
+OIDCのAuthorization Code Flowに対応したclientを用意し、上記の設定へ次を追加します。redirect URIは`https://game.example/auth/callback`に固定します。
+
+```dotenv
+AIRPG_AUTH_CLIENT_ID=ai-rpg-browser
+AIRPG_AUTH_APP_ORIGIN=https://game.example
+# Confidential clientの場合だけ設定
+# AIRPG_AUTH_CLIENT_SECRET=...
+```
+
+画面からIdPへログインすると、登録済みのidentityだけに8時間のサーバーセッションを発行します。PKCE・state・nonceを検証し、CookieはHttpOnly／Secure／SameSite=Laxとします。更新要求にはOriginとCSRF tokenを両方確認します。providerのtokenはブラウザstorageへ保存しません。ログアウトとidentity無効化でセッションは利用できなくなり、SSEも失効を検知して閉じます。
+
+参加者への渡し方、本番のログ設定、ローカルKeycloakでの確認手順は[プレイテストガイド](docs/playtest-guide.md)を参照してください。ブラウザ用client IDとBearer API向けAudienceは別の設定です。
+
+`ai-rpg api --dev-principal`はOIDCを迂回するローカル開発専用の明示的な起動方法です。UUIDを省略すると固定の開発principalを使い、`--dev-principal <UUID>`で別の開発principalも指定できます。通常のAPI起動やworkerへ暗黙適用されません。このモードはloopback限定で、接続者を同じプレイヤーとして扱います。外部公開しないでください。
 
 ## Fake LLMで動作を試す
 
@@ -236,16 +253,24 @@ APIとworkerは各TerminalのCtrl+Cで停止できます。DBを停止する場�
 
 冒険では全Sceneで`hero`を公開し、`goblin`は奥の部屋だけで公開かつ攻撃到達可能にします。`iron_sword`と`healing_potion`はhero所有のprivate inventoryです。
 
-段階4までの最小ループに対応しています。Fakeでは行動候補を使って完走でき、戦闘中の回復は「回復ポーションを飲む」と入力できます。Fakeは自由な会話や言い換えを理解する実モデルではありません。自由入力の冒険には下記の実モデルを利用してください。ブラウザログインと少人数のプレイテストは段階5として残しています。
+段階4までの最小ループに対応しています。Fakeでは行動候補を使って完走でき、戦闘中の回復は「回復ポーションを飲む」と入力できます。Fakeは自由な会話や言い換えを理解する実モデルではありません。自由入力の冒険には下記の実モデルを利用してください。段階5のブラウザログインと感想保存も利用できます。人による試遊とエージェントによる動作確認は、[記録テンプレート](docs/playtest-record-template.md)で区別して記録します。
 
 画面は`GET /campaigns/{campaign_id}/state`から正本のstate versionと最新Turnを取得し、Campaign切替、別タブ更新、reload後に状態を同期します。409時は古い行動を新versionで自動実行せず、再確認を促します。turn ID発行前の確定的な4xx入力エラーではpendingを消し、修正後は新しいrequest IDで送信します。通信断・不明なPOST結果・5xx・turn ID発行後の失敗では、同じrequest IDとbodyを保持して同じ内容だけを再送します。受付済みの`turn_id`が分かっている場合はPOSTせずGET／SSE追跡を再開します。SSEが失敗またはtimeoutした場合はSSEを閉じてGET Pollingだけへ引き継ぎ、古いCampaignや世代の更新は表示しません。開発用principalを指定せずAPIを起動した場合は401を表示し、認証を暗黙に迂回しません。
 
-依存なしのブラウザ状態ロジックはNode標準runnerでも確認できます。
+### Vue画面を開発する
+
+画面を変更するときだけNode.js 22.14以上を使います。ソースとlockfileは`frontend/`、配布用のビルド結果は`src/ai_rpg/api/static/vue/`です。ソースの変更時は両方をcommitしてください。
 
 ```powershell
-node tests\browser\play_state.test.cjs
-node tests\browser\play_screen.test.cjs
+Set-Location frontend
+npm.cmd ci
+npm.cmd test
+npm.cmd run typecheck
+npm.cmd run build
+Set-Location ..
 ```
+
+ビルド後はFastAPIのURLを再読み込みして確認します。認証・Cookie・SSEを含む試遊は同じoriginのAPI配信画面で行います。JavaScriptに認証秘密やLLMのAPIキーを埋め込まないでください。
 
 ```powershell
 $requestId = [guid]::NewGuid()
@@ -327,7 +352,11 @@ data: {"id":12,"type":"turn.updated","schema_version":1,"payload":{"turn":{...}}
 - [x] 実LLMの自由入力による短編の一通りの動作確認
 - [x] 敵の反撃を含む最小戦闘ループ
 - [ ] 20〜30分の所要時間・会話品質・遊びやすさのプレイテスト
-- [ ] ブラウザログイン
+- [x] 事前登録ユーザーのブラウザログインとセッション失効
+- [x] 試遊ガイドと任意フィードバックのローカル保存
+- [x] Vue 3への移行とdesktop/mobileの実ブラウザ確認
+
+段階5・Vue移行では、実ブラウザから3冒険・26ターンを実行し、Geminiの30物理要求とDB予約の一致、戦闘・回復・完走・撤退・再ログインを確認しました。[検証記録と未確認の範囲](docs/verification-stage5-20260922.md)を公開しています。人による少人数試遊はこれからです。
 
 ## コントリビューション
 
@@ -362,6 +391,7 @@ src/ai_rpg/
 └── scenarios/        # version付き固定Scenario定義
 
 migrations/           # Alembic migration
+frontend/             # Vue 3、TypeScript、Vite、画面の回帰テスト
 tests/                # Unit、contract、PostgreSQL integration
 docs/                 # Architecture、ADR、実装方針
 ```
@@ -373,3 +403,5 @@ docs/                 # Architecture、ADR、実装方針
 - [ADR index](docs/adr/README.md)
 - [MVP ruleset](docs/adr/0007-mvp-ruleset.md)
 - [Fake LLM round trip](docs/ai-trpg-fake-llm.md)
+- [プレイテストガイド](docs/playtest-guide.md)
+- [Vue画面と画像素材の設計](docs/vue-design.md)

@@ -75,43 +75,6 @@ async def test_health_endpoint() -> None:
 
 @pytest.mark.integration
 @pytest.mark.asyncio
-async def test_play_screen_is_served_with_accessible_core_controls() -> None:
-    transport = ASGITransport(app=create_app())
-    async with AsyncClient(transport=transport, base_url="http://test") as client:
-        response = await client.get("/")
-
-    assert response.status_code == 200
-    assert response.headers["content-type"].startswith("text/html")
-    assert '<input id="campaign-id" type="hidden">' in response.text
-    assert '<input id="actor-id" type="hidden">' in response.text
-    assert '<label for="scenario-select">シナリオ</label>' in response.text
-    assert '<label for="preset-select">冒険者のタイプ</label>' in response.text
-    assert '<label for="player-name">冒険者の名前</label>' in response.text
-    assert 'id="start-adventure"' in response.text
-    assert 'id="adventure-list"' in response.text
-    assert '<label for="action-text">行動を入力</label>' in response.text
-    assert 'id="send-action"' in response.text
-    assert 'role="status"' in response.text
-    assert "aria-live=\"polite\"" in response.text
-    assert '<script src="/static/play-state.js"></script>' in response.text
-    assert "new EventSource" in response.text
-    assert "pollTurn" in response.text
-
-
-@pytest.mark.integration
-@pytest.mark.asyncio
-async def test_play_state_script_is_served() -> None:
-    transport = ASGITransport(app=create_app())
-    async with AsyncClient(transport=transport, base_url="http://test") as client:
-        response = await client.get("/static/play-state.js")
-
-    assert response.status_code == 200
-    assert response.headers["content-type"].startswith("text/javascript")
-    assert "AiRpgPending" in response.text
-
-
-@pytest.mark.integration
-@pytest.mark.asyncio
 async def test_turn_endpoint_requires_configured_authenticator() -> None:
     transport = ASGITransport(app=create_app())
     async with AsyncClient(transport=transport, base_url="http://test") as client:
