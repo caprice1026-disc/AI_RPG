@@ -249,6 +249,9 @@ export function createGame(options: Options = {}) {
       if (!active()) return
       const current = state.records.find(r => r.turn.turn_id === turn.turn_id)!.turn
       if (state.campaign && (!state.campaign.latest_turn || state.campaign.latest_turn.turn_id === turn.turn_id)) state.campaign.latest_turn = current
+      const latest = state.campaign?.latest_turn
+      // A replay or completion event may reveal another device's next turn.
+      if (latest && latest.turn_id !== turn.turn_id && !terminal(latest)) track(latest)
       if (terminal(turn)) void refreshHome()
     }
   }
@@ -343,7 +346,7 @@ export function createGame(options: Options = {}) {
         if (!persist(updated, pending)) return
         pending = updated
         await acceptTurn(accepted, pending)
-        if (active() && !terminal(accepted)) track(accepted)
+        if (active() && !terminal(accepted) && state.campaign?.latest_turn?.turn_id === accepted.turn_id) track(accepted)
       }
     } catch (error) {
       if (!owns() || !active()) return

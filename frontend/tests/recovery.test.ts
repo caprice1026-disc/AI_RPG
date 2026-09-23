@@ -220,3 +220,37 @@ it('successful state recovery clears a tracking warning only after completion is
   expect(g.canAct.value).toBe(true); expect(g.state.trackingError).toBe('')
   expect(api.posts()).toHaveLength(0)
 })
+
+it.each(['unknown-response', 'accepted-id', 'live-completion'])('reconciling old completion tracks a newer server turn after %s', async entry => {
+  let current = campaign(), posts = 0
+  const completed = turn('completed-a', 1)
+  const api = server((path, init) => {
+    if (path.endsWith('/state')) return response(current)
+    if (init.method === 'POST') {
+      if (++posts === 1) return entry === 'unknown-response' ? response({}, 503) : response(waiting('completed-a'))
+      return response(completed)
+    }
+    if (path.endsWith('/turns/completed-a')) return response(completed)
+  })
+  const g = await playing(api); await g.submit(text, text.text)
+  const body = String(api.posts()[0]!.init.body)
+  expect(g.state.pending).not.toBeNull()
+  const oldStream = Events.instances[0]
+  current = campaign({ state_version: 1, latest_turn: waiting('server-b') })
+  if (entry === 'live-completion') { oldStream!.emit(completed); await flush() }
+  else await g.retry(g.state.pending)
+
+  expect(g.state.pending).toBeNull()
+  expect(g.state.campaign?.latest_turn?.turn_id).toBe('server-b')
+  expect(g.state.tracking).toBe(true); expect(g.canAct.value).toBe(false)
+  expect(Events.instances).toHaveLength(entry === 'unknown-response' ? 1 : 2)
+  if (oldStream) expect(oldStream.closed).toBe(true)
+  expect(api.posts()).toHaveLength(entry === 'unknown-response' ? 2 : 1)
+  expect(api.posts().every(call => String(call.init.body) === body)).toBe(true)
+
+  current = campaign({ state_version: 2, latest_turn: turn('server-b', 2) })
+  Events.instances.at(-1)!.emit(current.latest_turn!); await flush()
+  expect(g.state.tracking).toBe(false); expect(g.canAct.value).toBe(true)
+  expect(g.state.records.map(record => record.turn.turn_id)).toEqual(['completed-a', 'server-b'])
+  expect(api.posts()).toHaveLength(entry === 'unknown-response' ? 2 : 1)
+})
