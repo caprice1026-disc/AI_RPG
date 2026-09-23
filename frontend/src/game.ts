@@ -174,17 +174,21 @@ export function createGame(options: Options = {}) {
       const result = await request<CampaignState>(`/campaigns/${encodeURIComponent(selected.campaign_id)}/state`)
       if (!active() || generation !== refreshGeneration || result.state_version < (state.campaign?.state_version ?? -1)) return null
       if (result.latest_turn) merge({ turn: result.latest_turn })
-      // Keep a live result when a replica still returns its predecessor. The public
-      // state itself remains server-owned; actions wait until its version catches up.
-      if (observedTurn && (observedTurn.committed_state_version ?? -1) >= (result.latest_turn?.committed_state_version ?? -1)) {
-        result.latest_turn = state.records.find(r => r.turn.turn_id === observedTurn!.turn_id)?.turn ?? observedTurn
-      }
+      // History and live records establish turn order by identity. A different
+      // pending turn has no committed version; that does not make it older.
+      const observedIndex = state.records.findIndex(r => r.turn.turn_id === observedTurn?.turn_id)
+      const latestIndex = state.records.findIndex(r => r.turn.turn_id === result.latest_turn?.turn_id)
+      if (observedTurn && (latestIndex < observedIndex || result.state_version < (observedTurn.committed_state_version ?? 0))) {
+        result.latest_turn = state.records[observedIndex]?.turn ?? observedTurn
+      } else if (latestIndex >= 0) result.latest_turn = state.records[latestIndex]!.turn
+      observedTurn = result.latest_turn
       state.campaign = result
       if (result.player) state.names.hero = result.player.name
       for (const item of result.player?.inventory ?? []) if (item.item_ref) state.names[item.item_ref] = item.name
       if (result.adventure?.combat) state.names[result.adventure.combat.enemy_ref.replace(/^@/, '')] = result.adventure.combat.enemy_name
       state.stateReady = result.state_version >= (observedTurn?.committed_state_version ?? 0)
       if (!state.stateReady) state.error = '保存済みの結果に状態表示を合わせています。状態を再取得してください。'
+      if (state.stateReady && result.latest_turn && terminal(result.latest_turn)) state.trackingError = ''
       return result
     } catch {
       if (active() && generation === refreshGeneration) {

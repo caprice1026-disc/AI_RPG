@@ -1,7 +1,9 @@
 <script setup lang="ts">
+import { computed } from 'vue'
 import type { Result, StoryRecord } from './contracts'
-defineProps<{ record: StoryRecord; names: Record<string, string>; enabled: boolean }>()
+const props = defineProps<{ record: StoryRecord; names: Record<string, string>; enabled: boolean; hiddenChoiceLabels?: string[] }>()
 defineEmits<{ choice: [id: string, label: string] }>()
+const choices = computed(() => props.record.turn.choices.filter(choice => !props.hiddenChoiceLabels?.includes(choice.label)))
 const reasons = { target_unavailable: '対象を見つけられませんでした。', resource_unavailable: '必要な持ち物がありません。', rule_precondition: '今はその行動を実行できません。' }
 function lines(result: Result): string[] {
   return result.kind === 'not_applicable' ? [reasons[result.reason]] : [
@@ -30,8 +32,8 @@ function humanize(text: string, names: Record<string, string>) {
     </section>
     <p v-if="record.turn.narration" class="narration">{{ humanize(record.turn.narration, names) }}</p>
     <p v-if="record.turn.recovery.fallback" class="hint fallback">描写の生成に問題があり、保存済みの結果を表示しています。判定と状態は保存済みです。行動をやり直す必要はありません。</p>
-    <div v-if="record.turn.choices.length" class="choices" aria-label="物語の選択肢">
-      <button v-for="choice in record.turn.choices" :key="choice.id" :disabled="!enabled"
+    <div v-if="choices.length" class="choices" aria-label="物語の選択肢">
+      <button v-for="choice in choices" :key="choice.id" :disabled="!enabled"
         @click="$emit('choice', choice.id, choice.label)">{{ humanize(choice.label, names) }}</button>
     </div>
   </li>

@@ -128,6 +128,47 @@ it('generated item choices display public names but emit original label and choi
   expect(events).toEqual([['item-choice', original]])
   expect(c.latest_turn!.choices[0]!.label).toBe(original)
 })
+it('latest duplicate choices prefer registered actions while historical choices remain intact', async () => {
+  const choices = [{ id: 'generated-look', label: '周囲を見る' }]
+  const latest = { ...turn('latest', 0), choices }
+  const older = { ...turn('older', 0), choices: [{ id: 'historical-look', label: '周囲を見る' }] }
+  let current = campaign({ latest_turn: latest })
+  const api = server((path, init) => {
+    if (path.endsWith('/state')) return response(current)
+    if (path.includes('/history?')) return response({ items: [
+      { created_at: '2026-09-22T00:00:00Z', player_input: '以前の質問', turn: older },
+      { created_at: '2026-09-22T00:01:00Z', player_input: '背景の質問', turn: latest },
+    ], next_before_turn_id: null })
+    if (init.method === 'POST') {
+      current = campaign({ state_version: 1, latest_turn: turn('next', 1) })
+      return response(current.latest_turn)
+    }
+  })
+  const w = await render(api); await w.get('[data-adventure="campaign-a"]').trigger('click'); await flushPromises()
+  expect(w.get('[data-turn-id="latest"]').find('.choices').exists()).toBe(false)
+  const historical = w.get('[data-turn-id="older"] .choices button')
+  expect(historical.text()).toBe('周囲を見る'); expect((historical.element as HTMLButtonElement).disabled).toBe(true)
+  const record = w.findAllComponents({ name: 'TurnRecord' }).find(r => r.props('record').turn.turn_id === 'latest')!
+  expect(record.props('record').turn.choices).toEqual([{ id: 'generated-look', label: '周囲を見る' }])
+  await w.get('.registered-actions button').trigger('click'); await flushPromises()
+  expect(JSON.parse(String(api.posts()[0]!.init.body)).content).toEqual({ kind: 'scenario_action', action_ref: 'look' })
+  expect(record.emitted('choice')).toBeUndefined()
+})
+it('nonduplicate latest choices retain exact IDs and labels without trimming', async () => {
+  const label = ' 周囲を見る'
+  const latest = { ...turn('latest', 0), choices: [
+    { id: 'duplicate', label: '周囲を見る' }, { id: 'distinct-choice', label },
+  ] }
+  const api = server((path, init) => path.endsWith('/state') ? response(campaign({ latest_turn: latest }))
+    : init.method === 'POST' ? response(turn('next', 0)) : undefined)
+  const w = await render(api); await w.get('[data-adventure="campaign-a"]').trigger('click'); await flushPromises()
+  const choices = w.get('[data-turn-id="latest"]').findAll('.choices button')
+  expect(choices).toHaveLength(1)
+  await choices[0]!.trigger('click'); await flushPromises()
+  expect(JSON.parse(String(api.posts()[0]!.init.body)).content).toEqual({ kind: 'choice', choice_id: 'distinct-choice' })
+  const events = w.findAllComponents({ name: 'TurnRecord' }).flatMap(r => r.emitted('choice') ?? [])
+  expect(events).toEqual([['distinct-choice', ' 周囲を見る']])
+})
 it('feedback downloads only optional entered text as UTF-8, with no network submission', async () => {
   const api = server(); const w = await render(api)
   const blobs: Blob[] = []

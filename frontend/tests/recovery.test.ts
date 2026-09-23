@@ -31,6 +31,7 @@ it('tracking failure retains accepted id and retry never posts again', async () 
   expect(g.state.trackingError).not.toBe(''); expect(JSON.stringify(g.state.pending?.body)).toBe(body)
   await g.retry(g.state.pending)
   expect(api.posts()).toHaveLength(1); expect(gets).toBe(2); expect(g.state.pending).toBeNull()
+  expect(g.state.trackingError).toBe('')
 })
 it('completed turn with failed state refresh recovers by GET only', async () => {
   let failState = false
@@ -172,4 +173,50 @@ it('SSE completion keeps controls locked until authoritative state refresh compl
   expect(g.canAct.value).toBe(false)
   delayed.resolve(response(campaign({ state_version: 1, latest_turn: turn() }))); await flush()
   expect(g.canAct.value).toBe(true)
+})
+it.each(['recover', 'submit'])('a newer server pending turn supersedes a completed turn during %s', async entry => {
+  let current = campaign()
+  const completed = turn('completed-a', 1)
+  const api = server((path, init) => {
+    if (path.endsWith('/state')) return response(current)
+    if (init.method === 'POST') {
+      current = campaign({ state_version: 1, latest_turn: completed })
+      return response(completed)
+    }
+  })
+  const g = await playing(api); await g.submit(text, text.text)
+  expect(g.state.pending).toBeNull(); expect(g.canAct.value).toBe(true)
+
+  current = campaign({ state_version: 1, latest_turn: waiting('server-b') })
+  if (entry === 'recover') await g.recover(); else await g.submit(text, text.text)
+  expect(g.state.campaign?.latest_turn?.turn_id).toBe('server-b')
+  expect(g.state.tracking).toBe(true); expect(g.canAct.value).toBe(false)
+  expect(api.posts()).toHaveLength(1); expect(Events.instances).toHaveLength(1)
+  expect(g.state.records.find(r => r.turn.turn_id === 'completed-a')?.turn.narration).toBe('扉が開いた。')
+
+  current = campaign({ state_version: 1, latest_turn: completed })
+  await g.refreshState()
+  expect(g.state.campaign?.latest_turn?.turn_id).toBe('server-b')
+  expect(g.canAct.value).toBe(false)
+
+  current = campaign({ state_version: 2, latest_turn: turn('server-b', 2) })
+  Events.instances[0]!.emit(current.latest_turn!); await flush()
+  expect(g.state.campaign?.latest_turn?.turn_id).toBe('server-b')
+  expect(g.state.tracking).toBe(false); expect(g.canAct.value).toBe(true)
+  expect(g.state.records.map(r => r.turn.turn_id)).toEqual(['completed-a', 'server-b'])
+  expect(api.posts()).toHaveLength(1)
+})
+it('successful state recovery clears a tracking warning only after completion is confirmed', async () => {
+  let current = campaign({ latest_turn: waiting('server') }), failState = false
+  const api = server(path => path.endsWith('/state') ? failState ? response({}, 503) : response(current)
+    : path.includes('/turns/') ? response({}, 503) : undefined)
+  const g = await playing(api); Events.instances[0]!.onerror?.(); await flush()
+  expect(g.state.trackingError).not.toBe('')
+  failState = true; await g.recover()
+  expect(g.state.trackingError).not.toBe(''); expect(g.canAct.value).toBe(false)
+
+  failState = false; current = campaign({ state_version: 1, latest_turn: turn('server', 1) })
+  await g.recover()
+  expect(g.canAct.value).toBe(true); expect(g.state.trackingError).toBe('')
+  expect(api.posts()).toHaveLength(0)
 })

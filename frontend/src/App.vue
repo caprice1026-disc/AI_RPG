@@ -151,6 +151,7 @@ function heal() { s.draft = '回復ポーションを使って、自分の傷を
           <ol ref="timeline" class="timeline" aria-label="物語の履歴">
             <TurnRecord v-for="record in s.records" :key="record.turn.turn_id" :record="record" :names="names"
               :enabled="canAct && record.turn.turn_id === s.campaign?.latest_turn?.turn_id"
+              :hidden-choice-labels="record.turn.turn_id === s.campaign?.latest_turn?.turn_id ? actions.map(action => action.label) : []"
               @choice="(id, label) => game.submit({ kind: 'choice', choice_id: id }, label)" />
           </ol>
           <p v-if="!s.records.length && s.historyLoaded && !s.loading" class="hint">まだ行動の記録はありません。最初の一歩を選んでみましょう。</p>
