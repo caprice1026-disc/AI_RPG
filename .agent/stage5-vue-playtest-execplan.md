@@ -77,4 +77,6 @@ UIは0375245で移行し、56b7f9fと最終レビューの修正で別端末の�
 - [x] Task 2: browser OIDC (Keycloak実ログイン、独立レビュー、Origin/SSE失効の回帰修正)
 - [x] Task 3: playtest handoff（登録/運用ガイド、感想のローカル保存、人の試遊との区別）
 - [x] Task 4: Vue（82 tests、型検査/build、desktop/mobile確認）
-- [ ] Task 5: browser/LLM/refinement/main
+- [x] Task 5: browser/LLM/refinement/main（独立レビュー承認、6226e27をmainへpushしてremote SHA一致を確認）
+
+2026-09-23完了: 最終追跡修正後の82件・型検査・build・Python asset配信2件を確認し、wheel内4assetのバイト一致と最終画面の実ブラウザ表示も確認した。試遊用API/worker/Keycloakは停止し、PostgreSQLとQAデータは保持。人による試遊と公開HTTPS環境の検証は、実装完了と区別して残す。
