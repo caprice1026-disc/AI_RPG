@@ -43,6 +43,16 @@ class ScenarioProgressedPayload(Contract):
     to_scene_id: UUID | None
     add_flags: tuple[str, ...]
     ending_ref: str | None
+    elapsed_actions: NonNegativeInt = 0
+    alert_delta: int = 0
+    facts: tuple["GeneratedFact", ...] = ()
+
+
+class GeneratedFact(Contract):
+    fact_ref: str
+    kind: Literal["place", "person", "clue", "route"]
+    public_text: ShortText
+    scene_id: UUID
 
 
 class NarrationGeneratedPayload(Contract):

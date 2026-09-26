@@ -19,7 +19,7 @@ from ai_rpg.contracts import (
     CampaignStateResponse,
     TurnResponse,
 )
-from ai_rpg.contracts.responses import AdventureCombatState
+from ai_rpg.contracts.responses import AbilityDisplay, AdventureCombatState, AdventureFact
 from ai_rpg.scenarios import ScenarioCatalog
 
 
@@ -69,51 +69,77 @@ class TurnQueryService:
             scenario = await unit_of_work.scenarios.snapshot(campaign_id)
             if scenario is not None:
                 adventure = self._adventure_state(scenario)
+                combat = None
                 if scenario.status == "active":
                     combat = self._scenario_progressor.scene_for(scenario).combat
-                    if combat is not None:
-                        active = next(s for s in scenario.scenes if s.status == "active")
-                        canonical = await unit_of_work.canonical.snapshot(campaign_id, active.id)
-                        public_ids = {
-                            r["entity_id"] for r in canonical.scene_entities if r["is_public"]
-                        }
-                        enemy = next(
-                            (
-                                e
-                                for e in canonical.entities
-                                if e["ref"] == combat.enemy_ref
-                                and e["kind"] == "npc"
-                                and e["archived_at"] is None
-                                and e["id"] in public_ids
-                            ),
-                            None,
+                if combat is not None or scenario.scenario_version >= 3:
+                    scene = next(
+                        (s for s in scenario.scenes if s.status == "active"),
+                        scenario.scenes[-1],
+                    )
+                    canonical = await unit_of_work.canonical.snapshot(campaign_id, scene.id)
+                    if scenario.scenario_version >= 3 and response.player is not None:
+                        ability = next(
+                            (row for row in canonical.abilities
+                             if row["character_id"] == response.player.actor_id), None
                         )
-                        character = next(
-                            (
-                                c
-                                for c in canonical.characters
-                                if enemy is not None and c["entity_id"] == enemy["id"]
-                            ),
-                            None,
+                        if ability is not None:
+                            response = response.model_copy(update={
+                                "player": response.player.model_copy(update={
+                                    "abilities": AbilityDisplay.model_validate({
+                                        key: ability[key] for key in
+                                        ("strength", "agility", "insight", "presence")
+                                    }),
+                                    "specialty_skill": str(ability["specialty_skill"]),
+                                })
+                            })
+                if combat is not None:
+                    public_ids = {
+                        r["entity_id"] for r in canonical.scene_entities if r["is_public"]
+                    }
+                    enemy = next(
+                        (
+                            e
+                            for e in canonical.entities
+                            if e["ref"] == combat.enemy_ref
+                            and e["kind"] == "npc"
+                            and e["archived_at"] is None
+                            and e["id"] in public_ids
+                        ),
+                        None,
+                    )
+                    character = next(
+                        (
+                            c
+                            for c in canonical.characters
+                            if enemy is not None and c["entity_id"] == enemy["id"]
+                        ),
+                        None,
+                    )
+                    if enemy is not None and character is not None:
+                        adventure = adventure.model_copy(
+                            update={
+                                "combat": AdventureCombatState(
+                                    enemy_ref=combat.enemy_ref,
+                                    enemy_name=str(enemy["label"]),
+                                    current_hp=int(str(character["current_hp"])),
+                                    max_hp=int(str(character["max_hp"])),
+                                    active=combat.started_flag in scenario.flags,
+                                )
+                            }
                         )
-                        if enemy is not None and character is not None:
-                            adventure = adventure.model_copy(
-                                update={
-                                    "combat": AdventureCombatState(
-                                        enemy_ref=combat.enemy_ref,
-                                        enemy_name=str(enemy["label"]),
-                                        current_hp=int(str(character["current_hp"])),
-                                        max_hp=int(str(character["max_hp"])),
-                                        active=combat.started_flag in scenario.flags,
-                                    )
-                                }
-                            )
                 response = response.model_copy(update={"adventure": adventure})
             await unit_of_work.commit()
         return response
 
     def _adventure_state(self, snapshot: ScenarioRunSnapshot) -> AdventureState:
         definition = self._scenario_progressor.definition_for(snapshot)
+        scene_ref_by_id = {
+            runtime.id: defined.scene_ref
+            for runtime in snapshot.scenes
+            for defined in definition.scenes
+            if runtime.sequence == defined.sequence
+        }
         ending = None
         current_scene = None
         available_actions: list[AdventureAction] = []
@@ -136,7 +162,7 @@ class TurnQueryService:
         elif snapshot.status == "completed":
             discovered_facts = [
                 flag.public_fact for flag in definition.flags if flag.flag_ref in snapshot.flags
-            ]
+            ] + [fact.public_text for fact in snapshot.facts]
             ending_definition = next(
                 (
                     candidate
@@ -151,6 +177,8 @@ class TurnQueryService:
                 ending_ref=ending_definition.ending_ref,
                 title=ending_definition.title,
                 summary=ending_definition.summary,
+                reward=None if ending_definition.reward is None
+                       else ending_definition.reward.description,
             )
             status = "completed"
         else:
@@ -163,6 +191,16 @@ class TurnQueryService:
             status=status,
             current_scene=current_scene,
             discovered_facts=discovered_facts,
+            generated_facts=[
+                AdventureFact(
+                    fact_ref=fact.fact_ref, kind=fact.kind,
+                    public_text=fact.public_text,
+                    scene_ref=scene_ref_by_id[fact.scene_id],
+                )
+                for fact in snapshot.facts
+            ],
             available_actions=available_actions,
             ending=ending,
+            elapsed_actions=snapshot.elapsed_actions if snapshot.scenario_version >= 3 else None,
+            alert_level=snapshot.alert_level if snapshot.scenario_version >= 3 else None,
         )

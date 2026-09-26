@@ -8,6 +8,7 @@ from typing import Literal, Protocol, TypeAlias
 from uuid import UUID
 
 from ai_rpg.contracts import CampaignStateResponse, PlayerTurnInput, PublicEvent, TurnResponse
+from ai_rpg.contracts.llm_decisions import ActionIntent
 from ai_rpg.contracts.responses import MechanicalNarrationInput
 from ai_rpg.domain.commands import Command
 from ai_rpg.domain.events import EnemyReaction, RNGMetadata
@@ -116,6 +117,7 @@ class ResolutionWorkItem:
     recent_messages: tuple[RecentMessage, ...]
     route: Literal["narrative", "mechanical"] | None
     selected_action_ref: str | None = None
+    confirmed_proposal_id: UUID | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -142,6 +144,17 @@ class ScenarioRunSnapshot:
     ending_ref: str | None
     scenes: tuple[ScenarioSceneSnapshot, ...]
     flags: frozenset[str]
+    elapsed_actions: int = 0
+    alert_level: int = 0
+    facts: tuple["ScenarioFact", ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class ScenarioFact:
+    fact_ref: str
+    kind: Literal["place", "person", "clue", "route"]
+    public_text: str
+    scene_id: UUID
 
 
 @dataclass(frozen=True, slots=True)
@@ -156,6 +169,7 @@ class CanonicalSnapshot:
     entities: tuple[Mapping[str, object], ...]
     scene_entities: tuple[Mapping[str, object], ...] = ()
     scenario_run: ScenarioRunSnapshot | None = None
+    abilities: tuple[Mapping[str, object], ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -171,6 +185,9 @@ class ScenarioProgressUpdate:
     to_scene_id: UUID | None
     add_flags: tuple[str, ...]
     ending_ref: str | None
+    elapsed_actions: int = 0
+    alert_delta: int = 0
+    facts: tuple[ScenarioFact, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -267,6 +284,12 @@ class TurnRepository(Protocol):
     async def finalize_not_applied(
         self, turn_id: UUID, worker_epoch: int, narration: str
     ) -> bool: ...
+
+    async def save_risk_proposal(
+        self, work: ResolutionWorkItem, proposal: ActionIntent, risk_text: str,
+    ) -> UUID: ...
+
+    async def get_confirmed_proposal(self, work: ResolutionWorkItem) -> ActionIntent | None: ...
 
     async def commit_resolution(self, bundle: CommitBundle) -> int: ...
 

@@ -40,8 +40,16 @@ class NarrativeInput(GMInput):
     pass
 
 
+class OpenActionOptions(Contract):
+    current_scene_ref: Ref
+    destination_refs: list[Ref]
+    allowed_flag_refs: list[Ref]
+    ending_refs: list[Ref]
+
+
 class MechanicalInput(GMInput):
     supported_action_types: list[
-        Literal["attack", "skill_check", "use_item", "scenario_action"]
+        Literal["attack", "skill_check", "use_item", "scenario_action", "open_action"]
     ]
     supported_skill_refs: list[Ref]
+    open_action_options: OpenActionOptions | None = None

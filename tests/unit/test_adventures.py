@@ -10,6 +10,7 @@ from pydantic import ValidationError
 from ai_rpg.api import create_app
 from ai_rpg.application import AuthenticatedPrincipal
 from ai_rpg.cli import _parser
+from ai_rpg.contracts.adventures import CreateAdventureRequest
 
 
 async def authenticated() -> AuthenticatedPrincipal:
@@ -50,14 +51,55 @@ async def test_catalog_exposes_only_public_scenario_and_preset_fields() -> None:
     assert data["scenarios"] == [
         {
             "scenario_ref": "ruined_chapel",
-            "scenario_version": 2,
+            "scenario_version": 3,
             "title": "廃礼拝堂の聖印",
-            "objective": "廃礼拝堂の銀の聖印を回収し、村の共同庫へ持ち帰る",
+            "objective": "廃礼拝堂にある銀の聖印を村へ戻す。別の解決や撤退も選べる。",
+            "character_creation": {
+                "abilities": ["strength", "agility", "insight", "presence"],
+                "points": 2,
+                "specialties": [
+                    "athletics", "acrobatics", "perception", "stealth", "persuasion"
+                ],
+            },
         }
     ]
     assert {p["preset_ref"] for p in data["presets"]} == {"scout", "guardian"}
-    assert all(set(p) == {"preset_ref", "name", "description", "max_hp"} for p in data["presets"])
+    assert all(
+        set(p) == {"preset_ref", "name", "description", "max_hp", "base_abilities"}
+        for p in data["presets"]
+    )
     assert "private-subject" not in response.text
+
+
+@pytest.mark.parametrize(
+    ("scores", "specialty"),
+    [
+        ({"strength": 0, "agility": 0, "insight": 0, "presence": 0}, "athletics"),
+        ({"strength": 3, "agility": 0, "insight": 0, "presence": 0}, "athletics"),
+        ({"strength": 1, "agility": 1, "insight": 0, "presence": 0}, "alchemy"),
+    ],
+)
+def test_v3_creation_rejects_invalid_point_buy(
+    scores: dict[str, int], specialty: str
+) -> None:
+    with pytest.raises(ValidationError):
+        CreateAdventureRequest(
+            request_id=uuid4(), scenario_ref="ruined_chapel", scenario_version=3,
+            preset_ref="scout", player_name="Hero", ability_points=scores,
+            specialty_skill=specialty,
+        )
+
+
+def test_v3_creation_accepts_two_points_and_one_specialty() -> None:
+    request = CreateAdventureRequest(
+        request_id=uuid4(), scenario_ref="ruined_chapel", scenario_version=3,
+        preset_ref="scout", player_name="Hero",
+        ability_points={"strength": 1, "agility": 0, "insight": 1, "presence": 0},
+        specialty_skill="perception",
+    )
+
+    assert request.ability_points.strength == 1
+    assert request.specialty_skill == "perception"
 
 
 @pytest.mark.parametrize("name", ["", " ", "a" * 41, "hero\nadmin", "hero\x00"])

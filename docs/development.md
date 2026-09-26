@@ -9,7 +9,7 @@
 ## 処理の境界と構成
 
 LLMはプレイヤー入力から意図を提案し、保存済みの結果を描写します。
-判定・乱数・HP・在庫の変更は `mvp_v1` rulesetとGame Engineで計算し、Action、Event、Canonical State、Turnを同じDB transactionで確定します。
+判定・乱数・HP・在庫の変更はGame Engineで計算し、Action、Event、Canonical State、Turnを同じDB transactionで確定します。旧冒険は`mvp_v1`、新規の自由行動型v3は`mvp_v2`を使用します。
 Narrativeは通常会話、Mechanicalは判定や状態変更を伴う処理です。Turn Routerが経路を選び、必要ならNarrativeからMechanicalへ昇格します。
 
 | 境界 | 責務 |
@@ -32,7 +32,7 @@ src/ai_rpg/
 ├── engine/           # 決定的なゲームルール
 ├── infrastructure/   # PostgreSQL行lock、保存前値照合、Repository
 ├── llm/              # Pydantic AI Agent、モデル構成、Fake LLM
-└── scenarios/        # version付き固定Scenario定義
+└── scenarios/        # version付きScenario定義（固定v1・v2と自由行動型v3）
 migrations/           # Alembic migration
 frontend/             # Vue 3、TypeScript、Vite、画面の回帰テスト
 tests/                # Unit、contract、PostgreSQL integration等
@@ -113,10 +113,19 @@ timeoutや不正出力も予算を消費し、worker再生成後も予算とdead
 これらの自動テストは、実モデルの会話品質や人による試遊を評価するものではありません。
 
 <a id="scenario-compatibility"></a>
-## シナリオv1・v2と固定データ
+## シナリオv3と旧v1・v2
 
-ブラウザで新しく始める冒険は短編v2です。登録済みの行動候補は、現在のSceneと条件を確認して直接実行し、意図抽出LLMを呼びません。
-登録済みの攻撃は装備中の武器を使い、通常は結果描写の1回だけLLMを呼びます。再試行もDBの既存予算内で行います。
+ブラウザの新規冒険は短編v3です。開始時にプリセットを選び、`strength`・`agility`・`insight`・`presence`へ計2点を配分して、得意技能を1つ選びます。旧v1・v2の保存済み冒険は自動移行しません。
+
+v3の自由文は、LLMが`open_action`として方法、必要なら能力・技能・難易度と成功/失敗の効果を提案します。Applicationが現在地、到達可能な主要地点、許可されたflag、結末条件、生成事実の参照を出目より前に検証します。生成事実は公開文・安定した`fact_ref`・作られた主要地点を保存し、再開後のContextと状態APIへ戻します。核心の場所・人物を新たに説明する文は生成事実として受け付けません。小さな場所は独立したSceneではなく、同じ主要地点内で参照できる事実です。AIの提案でHP・在庫・報酬を直接更新しません。
+
+実行された行動は経過行動数を進めます。失敗時の警戒上昇などは保存され、確認質問・不正提案・重大リスクのキャンセルは時間を進めません。結末の確定、報酬を減らす代償、戦闘中の反撃によるHP喪失など、確定され得る効果から重大リスクを判定します。モデルが危険と表現しただけの通常判定は確認待ちにしません。確認対象の提案はDBに保存し、確認TurnではLLMを呼び直さずに権限と状態を再検証します。v3の公開状態は能力、警戒、経過行動数、結末の報酬説明を含みます。詳細は[ADR-0016](adr/0016-bounded-open-scenario.md)を参照してください。
+
+登録済みの行動候補はv3でも現在のSceneと条件を確認して直接実行し、意図抽出LLMを呼びません。登録済みの攻撃は装備中の武器を使い、通常は結果描写の1回だけLLMを呼びます。再試行もDBの既存予算内で行います。
+
+### 旧v1・v2の固定短編
+
+次の表は保存済みv2の固定進行です。v3では同じ主要地点を使っても行動候補だけに限定せず、判定結果に応じた効果を確定します。
 
 | Scene | 行動例 | 進行 |
 | --- | --- | --- |
@@ -158,7 +167,7 @@ uv run --frozen ai-rpg seed-dev
 ## HTTPとSSE
 
 `GET /campaigns/{campaign_id}/state` は正本のstate versionと最新Turnを返します。
-`adventure` には目的、現在Scene、公開済み事実、利用可能な登録済み行動、完了後のEndingが入り、内部flag名や未達条件は返しません。
+`adventure` には目的、現在Scene、公開済み事実、生成事実の参照と所属する主要地点、利用可能な登録済み行動、経過行動数、警戒、完了後のEndingと報酬説明が入ります。内部flag名や未達条件は返しません。
 完了後の新規Turnは `409 ADVENTURE_COMPLETED` になります。
 
 ### 開発用HTTPリクエスト

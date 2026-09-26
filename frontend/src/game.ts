@@ -28,12 +28,16 @@ function validPending(v: unknown): v is Pending {
   if (!b || typeof b.request_id !== 'string') return false
   if (p.kind === 'start') return typeof p.body.scenario_ref === 'string' && Number.isInteger(p.body.scenario_version)
     && typeof p.body.preset_ref === 'string' && typeof p.body.player_name === 'string' && (p.adventure === null || isId(p.adventure))
+    && (p.body.ability_points === undefined || ['strength', 'agility', 'insight', 'presence']
+      .every(key => Number.isInteger(p.body.ability_points?.[key as keyof typeof p.body.ability_points])))
+    && (p.body.specialty_skill === undefined || typeof p.body.specialty_skill === 'string')
   if (p.kind !== 'turn' || typeof p.campaignId !== 'string' || typeof p.displayText !== 'string'
     || !(p.turnId === null || typeof p.turnId === 'string') || !Number.isInteger(p.body.expected_state_version)
     || typeof p.body.actor_id !== 'string') return false
   const c = p.body.content
   return !!c && (c.kind === 'text' ? typeof c.text === 'string' : c.kind === 'choice'
-    ? typeof c.choice_id === 'string' : c.kind === 'scenario_action' && typeof c.action_ref === 'string')
+    ? typeof c.choice_id === 'string' : c.kind === 'scenario_action' ? typeof c.action_ref === 'string'
+      : c.kind === 'confirm_action' && typeof c.proposal_id === 'string')
 }
 
 export function createGame(options: Options = {}) {
@@ -373,8 +377,19 @@ export function createGame(options: Options = {}) {
       || [...input.player_name].length > 40 || /[\p{C}\p{Zl}\p{Zp}]/u.test(input.player_name)) {
       state.error = 'シナリオ、冒険者のタイプと1〜40文字の名前を確認してください。'; return
     }
+    const preset = state.catalog.presets.find(p => p.preset_ref === input.preset_ref)!
+    if (scenario.character_creation) {
+      const points = input.ability_points, base = preset.base_abilities
+      const abilities = scenario.character_creation.abilities
+      if (!points || !base || !input.specialty_skill || !scenario.character_creation.specialties.includes(input.specialty_skill)
+        || abilities.reduce((sum, key) => sum + points[key], 0) !== scenario.character_creation.points
+        || abilities.some(key => !Number.isInteger(points[key]) || points[key] < 0 || points[key] > 2 || base[key] + points[key] > 3)) {
+        state.error = '能力ポイントをすべて配分し、得意技能を選んでください。'; return
+      }
+    }
     const pending: Pending = { kind: 'start', body: { request_id: crypto.randomUUID(), scenario_ref: input.scenario_ref,
-      scenario_version: scenario.scenario_version, preset_ref: input.preset_ref, player_name: input.player_name }, adventure: null }
+      scenario_version: scenario.scenario_version, preset_ref: input.preset_ref, player_name: input.player_name,
+      ...(scenario.character_creation ? { ability_points: input.ability_points, specialty_skill: input.specialty_skill } : {}) }, adventure: null }
     if (persist(pending)) await retry(pending)
   }
   async function submit(content: Content, displayText: string) {
@@ -389,7 +404,8 @@ export function createGame(options: Options = {}) {
     if (current.adventure?.status !== 'active') return
     if (current.state_version !== knownVersion) { state.error = conflictMessage; return }
     if (content.kind === 'scenario_action' && !current.adventure.available_actions.some(a => a.action_ref === content.action_ref)
-      || content.kind === 'choice' && !current.latest_turn?.choices.some(c => c.id === content.choice_id)) {
+      || content.kind === 'choice' && !current.latest_turn?.choices.some(c => c.id === content.choice_id)
+      || content.kind === 'confirm_action' && current.latest_turn?.risk_preview?.proposal_id !== content.proposal_id) {
       state.error = 'その行動は現在利用できません。最新の候補を選んでください。'; return
     }
     const pending: Pending = { kind: 'turn', campaignId: selected.campaign_id, displayText, turnId: null,

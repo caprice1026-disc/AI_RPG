@@ -132,6 +132,33 @@ def test_builtin_ruined_chapel_is_typed_and_closed() -> None:
     }
 
 
+def test_open_chapel_keeps_core_facts_inside_an_authored_region() -> None:
+    scenario = BUILTIN_SCENARIOS.get("ruined_chapel", 3)
+
+    assert scenario.world is not None
+    assert scenario.world.region_name == "廃礼拝堂と周辺"
+    assert scenario.world.goal_scene_ref == "sanctum"
+    assert scenario.world.outside_ending_ref == "retreated"
+    assert any(
+        fact.fact_ref == "relic_location" and fact.scene_ref == "sanctum"
+        for fact in scenario.world.protected_facts
+    )
+    assert {scene.scene_ref for scene in scenario.scenes} >= {"entrance", "hall", "sanctum"}
+    assert {ending.ending_ref: ending.reward.tier for ending in scenario.endings} == {
+        "recovered": "full", "costly_success": "reduced",
+        "alternative_resolution": "reduced", "retreated": "none", "defeated": "none",
+    }
+
+
+def test_open_world_rejects_a_protected_fact_outside_its_landmarks() -> None:
+    scenario = BUILTIN_SCENARIOS.get("ruined_chapel", 3)
+    payload = scenario.model_dump()
+    payload["world"]["protected_facts"][0]["scene_ref"] = "invented_place"
+
+    with pytest.raises(ValidationError, match="protected fact"):
+        ScenarioDefinition.model_validate(payload)
+
+
 def test_builtin_alerted_outcomes_are_definition_driven() -> None:
     scenario = BUILTIN_SCENARIOS.get("ruined_chapel", 1)
     sanctum_actions = scenario.scenes[2].actions

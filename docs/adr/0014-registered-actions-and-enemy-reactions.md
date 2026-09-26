@@ -12,7 +12,7 @@
 
 登録済み候補は`content={kind:"scenario_action",action_ref:"..."}`として送る。受付時にCampaignをロックし、認可・version・現在Scene・条件を検証する。既存requestの同一入力再送は現在Sceneの検証より先に処理する。Turnへrefとサーバー側labelを保存し、解決時にも再検証して既存Intent/Commandへ変換する。意図抽出LLMは呼ばず、描写は通常のDB予算で生成する。LLMが生成したChoiceと自由入力は従来どおり解釈する。
 
-短編v2には入口、広間、記録庫、通路、祭壇、帰還を定義する。新規catalogはv2を返し、v1定義・保存済みrunは維持する。Sceneには公開NPC設定と、敵ref・戦闘開始flag・ダメージ式・敗北Endingを持つ型付きcombat設定を追加する。秘密の条件や未訪問SceneはLLMへ渡さない。
+短編v2には入口、広間、記録庫、通路、祭壇、帰還を定義する。この決定時は新規catalogがv2を返した。現在はv3が新規冒険の既定で、v1・v2定義と保存済みrunを維持する。v3の自由行動は[ADR-0016](0016-bounded-open-scenario.md)を参照する。Sceneには公開NPC設定と、敵ref・戦闘開始flag・ダメージ式・敗北Endingを持つ型付きcombat設定を追加する。秘密の条件や未訪問SceneはLLMへ渡さない。
 
 最初のプレイヤー攻撃で戦闘を開始する。以後、生存する敵は適用済みMechanical Turnの後に1回だけ反撃する。先行するプレイヤー行動のHP変更を反映してから既存Engineを呼ぶ。通常会話、未適用Turn、Scene遷移・Ending、敵HP0では反撃しない。PCのHP0は敗北Endingとする。戦闘中は交渉・隠密による突破候補を無効にする。
 

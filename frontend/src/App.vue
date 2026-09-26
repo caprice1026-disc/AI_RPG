@@ -9,10 +9,25 @@ const { canStart, canAct } = game
 const art = '/static/vue/art/ruined-chapel.png'
 const navOpen = ref(false), stateOpen = ref(false), actionInput = ref<HTMLTextAreaElement>()
 const timeline = ref<HTMLOListElement>()
-const start = reactive({ scenario_ref: '', preset_ref: '', player_name: '' })
+const start = reactive({ scenario_ref: '', preset_ref: '', player_name: '',
+  ability_points: { strength: 0, agility: 0, insight: 0, presence: 0 }, specialty_skill: '' })
 const scenario = computed(() => s.catalog.scenarios.find(x => x.scenario_ref === start.scenario_ref))
 const preset = computed(() => s.catalog.presets.find(x => x.preset_ref === start.preset_ref))
+const abilityNames = { strength: '筋力', agility: '器用さ', insight: '洞察', presence: '対話力' }
+const skillNames: Record<string, string> = {
+  athletics: '運動', acrobatics: '身のこなし', perception: '観察',
+  stealth: '隠密', persuasion: '説得',
+}
+const pointsSpent = computed(() => Object.values(start.ability_points).reduce((a, b) => a + b, 0))
+const buildReady = computed(() => !scenario.value?.character_creation || (pointsSpent.value === scenario.value.character_creation.points
+  && !!start.specialty_skill && Object.entries(start.ability_points).every(([key, value]) =>
+    value >= 0 && value <= 2 && (preset.value?.base_abilities?.[key as keyof typeof start.ability_points] ?? 0) + value <= 3)))
 const adventure = computed(() => s.campaign?.adventure), player = computed(() => s.campaign?.player)
+const dismissedRiskId = ref<string | null>(null)
+const riskPreview = computed(() => {
+  const preview = s.campaign?.latest_turn?.risk_preview
+  return preview && preview.proposal_id !== dismissedRiskId.value && adventure.value?.status === 'active' ? preview : null
+})
 const actions = computed(() => (adventure.value?.available_actions ?? []).map(action => ({ ...action,
   run: game.bindAction({ kind: 'scenario_action', action_ref: action.action_ref }, action.label),
 })))
@@ -92,7 +107,7 @@ function heal() { s.draft = '回復ポーションを使って、自分の傷を
         <ul class="adventure-list">
           <li v-for="item in s.adventures" :key="item.campaign_id">
             <button :data-adventure="item.campaign_id" :aria-current="s.selected?.campaign_id === item.campaign_id ? 'page' : undefined"
-              @click="game.selectAdventure(item); navOpen = false">
+              @click="dismissedRiskId = null; game.selectAdventure(item); navOpen = false">
               {{ item.title }}<small>{{ item.player_name }} · {{ item.status === 'completed' ? '完了' : '冒険中' }}</small>
             </button>
           </li>
@@ -119,9 +134,23 @@ function heal() { s.draft = '回復ポーションを使って、自分の傷を
             <option v-for="item in s.catalog.presets" :key="item.preset_ref" :value="item.preset_ref">{{ item.name }}</option>
           </select>
           <p id="preset-description" class="hint">{{ preset?.description }}<template v-if="preset">（HP {{ preset.max_hp }}）</template></p>
+          <fieldset v-if="scenario?.character_creation" class="character-build">
+            <legend>能力ポイントを配分する（残り {{ scenario.character_creation.points - pointsSpent }}）</legend>
+            <label v-for="key in scenario.character_creation.abilities" :key="key" :for="`ability-${key}`">
+              {{ abilityNames[key] }} <small>基礎 {{ preset?.base_abilities?.[key] ?? 0 }} / 合計 {{ (preset?.base_abilities?.[key] ?? 0) + start.ability_points[key] }}</small>
+              <select :id="`ability-${key}`" v-model.number="start.ability_points[key]" :disabled="!canStart">
+                <option v-for="value in [0, 1, 2]" :key="value" :value="value">＋{{ value }}</option>
+              </select>
+            </label>
+            <label for="specialty">得意技能</label>
+            <select id="specialty" v-model="start.specialty_skill" :disabled="!canStart" required>
+              <option value="" disabled>選択してください</option>
+              <option v-for="skill in scenario.character_creation.specialties" :key="skill" :value="skill">{{ skillNames[skill] ?? skill }}</option>
+            </select>
+          </fieldset>
           <label for="player-name">冒険者の名前</label>
           <input id="player-name" v-model="start.player_name" :disabled="!canStart" required maxlength="40" autocomplete="off" placeholder="1〜40文字">
-          <button class="primary" type="submit" :disabled="!canStart || !start.player_name.trim()">{{ s.busy ? '冒険を準備しています…' : '冒険を始める' }}</button>
+          <button class="primary" type="submit" :disabled="!canStart || !start.player_name.trim() || !buildReady">{{ s.busy ? '冒険を準備しています…' : '冒険を始める' }}</button>
         </form>
         <div v-if="s.pending" class="notice" role="status">
           <p>前の要求の結果が未確認です。保存した内容で再開できます。</p>
@@ -161,12 +190,18 @@ function heal() { s.draft = '回復ポーションを使って、自分の傷を
           <section v-if="adventure?.status === 'completed'" class="ending" aria-label="冒険の結末">
             <p class="eyebrow">冒険の結末</p><h2>{{ adventure.ending?.title || '冒険を終えました' }}</h2>
             <p>{{ adventure.ending?.summary || '保存された記録を振り返れます。' }}</p>
+            <p v-if="adventure.ending?.reward" class="hint">報酬: {{ adventure.ending.reward }}</p>
             <button class="primary" @click="game.goHome()">新しい冒険へ</button>
           </section>
           <div v-if="adventure?.available_actions.length" class="registered-actions" aria-label="行動候補">
             <button v-for="action in actions" :key="`${s.selected.campaign_id}:${s.campaign?.state_version}:${action.action_ref}`" :disabled="!canAct"
               @click="action.run">{{ action.label }}</button>
           </div>
+          <section v-if="riskPreview" class="risk-preview" aria-label="重大なリスクの確認">
+            <h2>実行前の確認</h2><p>{{ riskPreview.risk_text }}</p>
+            <button :disabled="!canAct" @click="game.submit({ kind: 'confirm_action', proposal_id: riskPreview.proposal_id }, '確認して実行する')">この行動を実行</button>
+            <button class="quiet" @click="dismissedRiskId = riskPreview.proposal_id">やめる</button>
+          </section>
           <details class="guidance"><summary>遊び方と保存について</summary>
             <p>候補から選ぶか、自由に入力できます。受け付けられた行動は自動保存され、再読み込みしても再開できます。結果が未確認なら「同じ要求を再送」で確認してください。</p>
             <p>HPが減ったら持ち物や回復を検討し、危険な場面では撤退も選べます。</p>
@@ -205,6 +240,13 @@ function heal() { s.draft = '回復ポーションを使って、自分の傷を
         <template v-if="player">
           <div class="hp-label"><span>HP</span><span>{{ player.current_hp }} / {{ player.max_hp }}</span></div>
           <meter :value="player.current_hp" min="0" :max="Math.max(1, player.max_hp)" aria-label="冒険者のHP" />
+          <section v-if="player.abilities" class="ability-status"><h3>能力と得意技能</h3>
+            <p>筋力 {{ player.abilities.strength }} · 器用さ {{ player.abilities.agility }} · 洞察 {{ player.abilities.insight }} · 対話力 {{ player.abilities.presence }}</p>
+            <p class="hint">得意技能: {{ skillNames[player.specialty_skill ?? ''] ?? player.specialty_skill }}</p>
+          </section>
+          <section v-if="adventure && adventure.elapsed_actions != null" class="pressure-status"><h3>冒険の状況</h3>
+            <p>行動数 {{ adventure.elapsed_actions }} · 警戒 {{ adventure.alert_level ?? 0 }} / 5</p>
+          </section>
           <section v-if="adventure?.combat" class="combat">
             <h3>{{ adventure.combat.enemy_name }}</h3><p class="hint">{{ adventure.combat.active ? '戦闘中' : '戦闘なし' }}</p>
             <div class="hp-label"><span>敵のHP</span><span>{{ adventure.combat.current_hp }} / {{ adventure.combat.max_hp }}</span></div>

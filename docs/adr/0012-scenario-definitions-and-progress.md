@@ -3,7 +3,7 @@
 - 状態: 採用
 - 決定日: 2026-09-20
 
-このADRは現行の固定短編を記述する。自由行動型シナリオへの将来の変更方針は[ADR-0016](0016-bounded-open-scenario.md)を参照する。
+このADRは固定短編v1・v2の判断を記録する。新規冒険で使う自由行動型v3は[ADR-0016](0016-bounded-open-scenario.md)を参照する。
 
 ## 文脈と決定
 
@@ -25,7 +25,7 @@ Scenario runを持たない既存Campaignは従来どおり動作し、公開状
 ## 却下した案
 
 - **Scenario定義全体をDBへ保存する**: Stage 1では編集APIや運用中の定義変更を扱わず、JSONとDBの二重管理になる。
-- **LLMに遷移とEndingを決めさせる**: 未登録の遷移や状態変更をCanonicalへ持ち込むため、既存のEngine／Application境界と一致しない。
+- **LLMに遷移とEndingを直接決めさせる**: 未検証の遷移や状態変更をCanonicalへ持ち込めない。v3でもLLMの提案をApplicationが検証してから確定する。
 - **自由なflag mutationを許す**: 定義に存在しない状態を保存でき、公開文と進行条件の対応を検証できない。
 - **Scenario専用のScene対応表を追加する**: 一つの固定Scenarioを扱う段階では、既存の一意なScene `sequence`で対応できる。
 

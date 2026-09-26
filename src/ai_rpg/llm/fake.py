@@ -140,6 +140,10 @@ class DevelopmentFakeLLM(_FakeLLM):
                     if isinstance(scene_context, dict) and isinstance(
                         scene_context.get("available_actions"), list
                     ):
+                        if "open_action" in payload.get("supported_action_types", []):
+                            open_action = self._open_intent(player_text, scene_context)
+                            if open_action is not None:
+                                return {"kind": "action_plan", "actions": [open_action]}
                         available_actions = {
                             str(action["action_ref"])
                             for action in scene_context["available_actions"]
@@ -204,7 +208,7 @@ class DevelopmentFakeLLM(_FakeLLM):
                         return {"kind": "action_plan", "actions": [intent]}
                 return {
                     "kind": "clarification_required",
-                    "question": "現在の場面で可能な行動を指定してください。",
+                    "question": "何を試し、何を変えたいかをもう少し教えてください。",
                 }
             if "攻撃" in player_text:
                 return {
@@ -262,3 +266,41 @@ class DevelopmentFakeLLM(_FakeLLM):
         )
         narration = " / ".join(facts) if facts else "判定結果が確定した。"
         return {"narration": narration, "choices": []}
+
+    @staticmethod
+    def _open_intent(player_text: str, scene: dict[str, object]) -> dict[str, object] | None:
+        title = str(scene.get("scene_title", ""))
+        if "撤退" in player_text or "村へ戻る" in player_text:
+            return {"kind": "open_action", "approach": "礼拝堂を離れて村へ戻る",
+                    "check": None, "success": {"ending_ref": "retreated"}, "failure": None,
+                    "major_risk": "礼拝堂を離れると、この冒険は撤退として終わります。"}
+        if "広間" in title and "長椅子" in player_text:
+            return {"kind": "open_action", "approach": "長椅子を足場にする",
+                    "check": {"ability": "agility", "skill_ref": "acrobatics",
+                              "difficulty": "normal"},
+                    "success": {"next_scene_ref": "passage", "add_flags": ["shortcut_found"],
+                                "facts": [{"fact_ref": "high_window_step", "kind": "route",
+                                           "public_text": "高窓へ通じる長椅子の足場"}]},
+                    "failure": {"alert_delta": 1, "add_flags": ["alerted"]}}
+        if "祭壇" in title and ("交渉" in player_text or "話し" in player_text):
+            return {"kind": "open_action", "approach": "見張りに事情を説明する",
+                    "check": {"ability": "presence", "skill_ref": "persuasion",
+                              "difficulty": "normal"},
+                    "success": {"add_flags": ["guard_agreed"]},
+                    "failure": {"alert_delta": 1, "add_flags": ["alerted"]}}
+        if "祭壇" in title and "聖印" in player_text and any(
+            marker in player_text for marker in ("取る", "手に", "回収")
+        ):
+            return {"kind": "open_action", "approach": "祭壇の聖印を回収する",
+                    "check": {"ability": "agility", "skill_ref": "stealth", "difficulty": "normal"},
+                    "success": {"add_flags": ["relic_recovered"]},
+                    "failure": {"alert_delta": 1, "add_flags": ["alerted"]}}
+        if "祭壇" in title and "別の解決" in player_text:
+            return {"kind": "open_action", "approach": "見張りとの争いを別の方法で収める",
+                    "check": {"ability": "presence", "skill_ref": "persuasion",
+                              "difficulty": "hard"},
+                    "success": {"add_flags": ["alternative_resolved"],
+                                "ending_ref": "alternative_resolution"},
+                    "failure": {"alert_delta": 1, "add_flags": ["alerted"]},
+                    "major_risk": "この交渉が成立すると、聖印を持ち帰らずに冒険が終わります。"}
+        return None

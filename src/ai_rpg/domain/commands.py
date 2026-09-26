@@ -46,7 +46,16 @@ class ScenarioActionCommand(CommandBase):
     action_ref: Ref
 
 
+class OpenActionCommand(CommandBase):
+    kind: Literal["open_action"]
+    approach: ShortText
+    ability: Literal["strength", "agility", "insight", "presence"] | None
+    skill_ref: Ref | None
+    modifier: SignedInt | None
+    difficulty_class: PositiveInt | None
+
+
 Command: TypeAlias = Annotated[
-    AttackCommand | SkillCheckCommand | UseItemCommand | ScenarioActionCommand,
+    AttackCommand | SkillCheckCommand | UseItemCommand | ScenarioActionCommand | OpenActionCommand,
     Field(discriminator="kind"),
 ]

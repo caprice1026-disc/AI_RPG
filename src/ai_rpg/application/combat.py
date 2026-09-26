@@ -128,5 +128,8 @@ def resolve_enemy_reaction(
             to_scene_id=None,
             add_flags=tuple(new_flags),
             ending_ref=combat.defeat_ending_ref if defeated else None,
+            elapsed_actions=0 if scenario_update is None else scenario_update.elapsed_actions,
+            alert_delta=0 if scenario_update is None else scenario_update.alert_delta,
+            facts=() if scenario_update is None else scenario_update.facts,
         )
     return CombatResolution((reaction,), scenario_update)

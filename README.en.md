@@ -7,9 +7,10 @@ The LLM interprets player intent and narrates confirmed outcomes. The Game Engin
 
 ## What you can do
 
-- Choose a scenario and a preset adventurer in the browser, then start the short adventure “The Holy Seal of the Ruined Chapel.”
-- Explore, negotiate, sneak, fight, heal, and face enemy counterattacks, reaching success, success at a cost, retreat, or defeat.
-- View HP, inventory, objectives, discovered information, and enemy HP from saved game state.
+- Choose “The Holy Seal of the Ruined Chapel,” allocate two ability points to a preset adventurer, and select one specialty skill.
+- Try your own approaches between major locations. Discover small places, people, and clues; failed checks can raise alert and consume an action, leaving room to retry or change tactics.
+- Explore, negotiate, sneak, fight, heal, and face enemy counterattacks. The story can end in success, success at a cost, an alternative resolution, retreat, or defeat; early success and abandoning the goal are valid.
+- View HP, inventory, abilities, objectives, discoveries, alert, elapsed actions, and enemy HP from saved game state. Major irreversible risks require confirmation.
 - Resume a saved adventure as the same player, or revisit previous inputs, narration, and endings.
 - Run playtests for users whose OIDC accounts are registered in the application in advance, and optionally save feedback to a text file.
 
@@ -102,9 +103,9 @@ It is never enabled implicitly for a normal API launch. Use `--dev-principal <UU
 
 ### 4. Play, stop, and resume
 
-Open [http://127.0.0.1:8000/](http://127.0.0.1:8000/), choose a scenario, adventurer, and name, then select 「冒険を始める」 (Start adventure).
-You do not need Campaign or Actor UUIDs or the `seed-dev` command. Start with the suggested actions and wait for narration to finish before the next input.
-Fake mode recognizes only limited text patterns; during combat, 「回復ポーションを飲む」 means “drink a healing potion.”
+Open [http://127.0.0.1:8000/](http://127.0.0.1:8000/), choose a scenario, adventurer, name, ability allocation, and specialty, then select 「冒険を始める」 (Start adventure).
+You do not need Campaign or Actor UUIDs or the `seed-dev` command. Suggested actions are reliable shortcuts; you can also describe another approach in free text. A major-risk preview can be confirmed or cancelled.
+Fake mode recognizes only a few example phrases, such as using a bench as a step. Use a real model for varied wording. During combat, 「回復ポーションを飲む」 means “drink a healing potion.”
 
 Stop the API and workers with `Ctrl+C` in each terminal. Stop and restart the database with:
 

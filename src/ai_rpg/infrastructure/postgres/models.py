@@ -304,7 +304,7 @@ class TurnModel(Base):
         CheckConstraint("input_schema_version>0"),
         CheckConstraint("jsonb_typeof(input_payload)='object'"),
         CheckConstraint("octet_length(request_hash)=32"),
-        CheckConstraint("input_kind IN ('text','choice','scenario_action')"),
+        CheckConstraint("input_kind IN ('text','choice','scenario_action','confirm_action')"),
         CheckConstraint("expected_state_version>=0"),
         CheckConstraint("committed_state_version>=0"),
         CheckConstraint("route IN ('narrative','mechanical')"),
@@ -341,7 +341,10 @@ class TurnModel(Base):
             "AND selected_action_ref IS NULL) OR "
             "(input_kind='scenario_action' AND input_text IS NOT NULL AND length(input_text) "
             "BETWEEN 1 AND 8000 AND selected_choice_id IS NULL AND selected_action_ref IS NOT NULL "
-            "AND length(selected_action_ref) BETWEEN 1 AND 120)"
+            "AND length(selected_action_ref) BETWEEN 1 AND 120) OR "
+            "(input_kind='confirm_action' AND input_text IS NOT NULL AND length(input_text) "
+            "BETWEEN 1 AND 8000 AND selected_choice_id IS NULL AND selected_action_ref IS NOT NULL "
+            "AND length(selected_action_ref)=36)"
         ),
         CheckConstraint("(resolution_status='committed')=(committed_state_version IS NOT NULL)"),
         CheckConstraint("(resolution_status='committed')=(committed_at IS NOT NULL)"),
@@ -590,6 +593,8 @@ class MvpScenarioRunModel(Base):
     scenario_version: Mapped[int] = mapped_column(Integer, nullable=False)
     status: Mapped[str] = mapped_column(Text, nullable=False)
     ending_ref: Mapped[str | None] = mapped_column(Text)
+    elapsed_actions: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"))
+    alert_level: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"))
 
     __table_args__ = (
         CheckConstraint("scenario_ref ~ '^[a-z][a-z0-9_]{0,63}$'"),
@@ -597,6 +602,90 @@ class MvpScenarioRunModel(Base):
         CheckConstraint("status IN ('active','completed')"),
         CheckConstraint("(status='completed') = (ending_ref IS NOT NULL)"),
         CheckConstraint("ending_ref IS NULL OR ending_ref ~ '^[a-z][a-z0-9_]{0,63}$'"),
+        CheckConstraint("elapsed_actions >= 0", name="scenario_elapsed_nonnegative"),
+        CheckConstraint("alert_level BETWEEN 0 AND 5", name="scenario_alert_bounded"),
+    )
+
+
+class MvpCharacterAbilityModel(Base):
+    __tablename__ = "mvp_character_abilities"
+
+    campaign_id: Mapped[UUID] = mapped_column(PG_UUID(as_uuid=True), primary_key=True)
+    character_id: Mapped[UUID] = mapped_column(PG_UUID(as_uuid=True), primary_key=True)
+    strength: Mapped[int] = mapped_column(Integer, nullable=False)
+    agility: Mapped[int] = mapped_column(Integer, nullable=False)
+    insight: Mapped[int] = mapped_column(Integer, nullable=False)
+    presence: Mapped[int] = mapped_column(Integer, nullable=False)
+    specialty_skill: Mapped[str] = mapped_column(Text, nullable=False)
+
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["campaign_id", "character_id"],
+            ["mvp_characters.campaign_id", "mvp_characters.entity_id"],
+        ),
+        CheckConstraint("strength BETWEEN 0 AND 3"),
+        CheckConstraint("agility BETWEEN 0 AND 3"),
+        CheckConstraint("insight BETWEEN 0 AND 3"),
+        CheckConstraint("presence BETWEEN 0 AND 3"),
+        CheckConstraint(
+            "specialty_skill IN ('athletics','acrobatics','perception','stealth','persuasion')"
+        ),
+    )
+
+
+class MvpScenarioFactModel(Base):
+    __tablename__ = "mvp_scenario_facts"
+
+    id: Mapped[UUID] = mapped_column(PG_UUID(as_uuid=True), primary_key=True)
+    campaign_id: Mapped[UUID] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("mvp_scenario_runs.campaign_id"), nullable=False
+    )
+    fact_ref: Mapped[str] = mapped_column(Text, nullable=False)
+    scene_id: Mapped[UUID] = mapped_column(PG_UUID(as_uuid=True), nullable=False)
+    kind: Mapped[str] = mapped_column(Text, nullable=False)
+    public_text: Mapped[str] = mapped_column(Text, nullable=False)
+    created_by_turn_id: Mapped[UUID] = mapped_column(PG_UUID(as_uuid=True), nullable=False)
+
+    __table_args__ = (
+        UniqueConstraint("campaign_id", "id"),
+        UniqueConstraint("campaign_id", "fact_ref"),
+        ForeignKeyConstraint(["campaign_id", "scene_id"], ["scenes.campaign_id", "scenes.id"]),
+        ForeignKeyConstraint(
+            ["campaign_id", "created_by_turn_id"], ["turns.campaign_id", "turns.id"]
+        ),
+        CheckConstraint("kind IN ('place','person','clue','route')"),
+        CheckConstraint("fact_ref ~ '^[a-z][a-z0-9_]{0,63}$'"),
+        CheckConstraint("length(public_text) BETWEEN 1 AND 500"),
+        Index("scenario_facts_location", "campaign_id", "scene_id"),
+    )
+
+
+class MvpActionProposalModel(Base):
+    __tablename__ = "mvp_action_proposals"
+
+    id: Mapped[UUID] = mapped_column(PG_UUID(as_uuid=True), primary_key=True)
+    campaign_id: Mapped[UUID] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("mvp_scenario_runs.campaign_id"), nullable=False
+    )
+    actor_id: Mapped[UUID] = mapped_column(PG_UUID(as_uuid=True), nullable=False)
+    source_turn_id: Mapped[UUID] = mapped_column(PG_UUID(as_uuid=True), unique=True, nullable=False)
+    state_version: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    payload: Mapped[dict[str, object]] = mapped_column(JSONB, nullable=False)
+    risk_text: Mapped[str] = mapped_column(Text, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=text("now()")
+    )
+
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["campaign_id", "actor_id"], ["mvp_characters.campaign_id", "mvp_characters.entity_id"]
+        ),
+        ForeignKeyConstraint(
+            ["campaign_id", "source_turn_id"], ["turns.campaign_id", "turns.id"]
+        ),
+        CheckConstraint("state_version >= 0"),
+        CheckConstraint("jsonb_typeof(payload) = 'object'"),
+        CheckConstraint("length(risk_text) BETWEEN 1 AND 500"),
     )
 
 

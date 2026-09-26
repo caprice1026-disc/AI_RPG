@@ -60,6 +60,11 @@ class Choice(Contract):
     label: ShortText
 
 
+class RiskPreview(Contract):
+    proposal_id: UUID
+    risk_text: ShortText
+
+
 ResolutionStatus: TypeAlias = Literal["pending", "resolving", "committed", "not_applied", "failed"]
 NarrationStatus: TypeAlias = Literal["pending", "generating", "completed", "fallback"]
 
@@ -75,6 +80,7 @@ class TurnResponse(Contract):
     action_results: list[ResolvedAction]
     enemy_reactions: list[ResolvedEnemyReaction] = Field(default_factory=list)
     recovery: TurnRecovery
+    risk_preview: RiskPreview | None = None
 
     @model_validator(mode="after")
     def consistent_status(self) -> Self:
@@ -111,6 +117,7 @@ class AdventureEnding(Contract):
     ending_ref: Ref
     title: ShortText
     summary: ShortText
+    reward: ShortText | None = None
 
 
 class AdventureCombatState(Contract):
@@ -121,6 +128,13 @@ class AdventureCombatState(Contract):
     active: StrictBool
 
 
+class AdventureFact(Contract):
+    fact_ref: Ref
+    kind: Literal["place", "person", "clue", "route"]
+    public_text: ShortText
+    scene_ref: Ref
+
+
 class AdventureState(Contract):
     scenario_ref: Ref
     title: ShortText
@@ -128,9 +142,19 @@ class AdventureState(Contract):
     status: Literal["active", "completed"]
     current_scene: AdventureScene | None
     discovered_facts: list[ShortText]
+    generated_facts: list[AdventureFact] = Field(default_factory=list)
     available_actions: list[AdventureAction]
     ending: AdventureEnding | None
     combat: AdventureCombatState | None = None
+    elapsed_actions: NonNegativeInt | None = None
+    alert_level: int | None = Field(default=None, ge=0, le=5)
+
+
+class AbilityDisplay(Contract):
+    strength: int = Field(ge=0, le=3)
+    agility: int = Field(ge=0, le=3)
+    insight: int = Field(ge=0, le=3)
+    presence: int = Field(ge=0, le=3)
 
 
 class InventoryItem(Contract):
@@ -147,6 +171,8 @@ class PlayerState(Contract):
     current_hp: NonNegativeInt
     max_hp: NonNegativeInt
     inventory: list[InventoryItem] = Field(default_factory=list)
+    abilities: AbilityDisplay | None = None
+    specialty_skill: Ref | None = None
 
 
 class CampaignStateResponse(Contract):

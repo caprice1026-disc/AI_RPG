@@ -152,7 +152,7 @@ async def test_development_fake_does_not_invent_unavailable_scenario_action() ->
 
     assert decision == {
         "kind": "clarification_required",
-        "question": "現在の場面で可能な行動を指定してください。",
+        "question": "何を試し、何を変えたいかをもう少し教えてください。",
     }
 
 

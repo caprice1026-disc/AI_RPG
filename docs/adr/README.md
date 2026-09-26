@@ -19,7 +19,7 @@
 | [0013](0013-pydantic-ai-orchestration.md) | 用途別Pydantic AI Agentとモデル切替 |
 | [0014](0014-registered-actions-and-enemy-reactions.md) | 登録済み行動の直接実行と敵の反撃 |
 | [0015](0015-browser-oidc-sessions.md) | ブラウザOIDCとサーバー管理セッション |
-| [0016](0016-bounded-open-scenario.md) | 探索領域を定めた自由行動型シナリオ（設計方針、未実装） |
+| [0016](0016-bounded-open-scenario.md) | 探索領域を定めた自由行動型シナリオ（v3で実装） |
 
 ## 共通方針
 

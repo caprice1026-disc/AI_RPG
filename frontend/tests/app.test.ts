@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, expect, it, vi } from 'vitest'
 import { flushPromises, mount, type VueWrapper } from '@vue/test-utils'
 import App from '../src/App.vue'
-import { campaign, deferred, Events, response, saved, server, session, turn, waiting } from './fixtures'
+import { campaign, catalog, deferred, Events, response, saved, server, session, turn, waiting } from './fixtures'
 
 const wrappers: VueWrapper[] = []
 async function render(api = server()) {
@@ -52,6 +52,43 @@ it('registered start form sends actual scenario, preset and exact name; direct a
   await button(w, '周囲を見る').trigger('click'); await flushPromises()
   expect(JSON.parse(String(api.posts()[1]!.init.body)).content).toEqual({ kind: 'scenario_action', action_ref: 'look' })
   expect((w.get('#action-text').element as HTMLTextAreaElement).value).toBe('unfinished draft')
+})
+it('v3 start requires two points and a specialty and sends the saved build', async () => {
+  const v3 = { ...catalog, scenarios: [{ scenario_ref: 'chapel', scenario_version: 3,
+    title: '廃礼拝堂', objective: '聖印を探す', character_creation: {
+      abilities: ['strength', 'agility', 'insight', 'presence'], points: 2,
+      specialties: ['athletics', 'acrobatics', 'perception', 'stealth', 'persuasion'],
+    } }], presets: catalog.presets.map(p => ({ ...p, base_abilities: {
+    strength: 0, agility: 1, insight: 1, presence: 0,
+  } })) }
+  const api = server(path => path === '/adventures/catalog' ? response(v3) : undefined)
+  const w = await render(api)
+  await w.get('#player-name').setValue('葵')
+  expect((button(w, '冒険を始める').element as HTMLButtonElement).disabled).toBe(true)
+  await w.get('#ability-agility').setValue('1')
+  await w.get('#ability-insight').setValue('1')
+  await w.get('#specialty').setValue('perception')
+  expect((button(w, '冒険を始める').element as HTMLButtonElement).disabled).toBe(false)
+  await w.get('#start-form').trigger('submit'); await flushPromises()
+  expect(JSON.parse(String(api.posts()[0]!.init.body))).toMatchObject({ scenario_version: 3,
+    ability_points: { strength: 0, agility: 1, insight: 1, presence: 0 }, specialty_skill: 'perception' })
+})
+it('risk preview can be cancelled locally or confirmed without rerunning free text', async () => {
+  const risky = { ...turn(), resolution_status: 'not_applied' as const, committed_state_version: null,
+    risk_preview: { proposal_id: 'proposal-a', risk_text: '離れると冒険が終わります。' } }
+  const api = server((path, init) => path.endsWith('/state') ? response(campaign({ latest_turn: risky }))
+    : init.method === 'POST' ? response(waiting('confirm-turn')) : undefined)
+  const w = await render(api)
+  await w.get('[data-adventure="campaign-a"]').trigger('click'); await flushPromises()
+  expect(w.text()).toContain('離れると冒険が終わります。')
+  await button(w, 'やめる').trigger('click'); await flushPromises()
+  expect(api.posts()).toHaveLength(0)
+  expect(button(w, 'この行動を実行')).toBeUndefined()
+  await w.get('[data-adventure="campaign-a"]').trigger('click'); await flushPromises()
+  await button(w, 'この行動を実行').trigger('click'); await flushPromises()
+  expect(JSON.parse(String(api.posts()[0]!.init.body)).content).toEqual({
+    kind: 'confirm_action', proposal_id: 'proposal-a',
+  })
 })
 it('development note, resume, separate enemy reactions and safe text rendering', async () => {
   const result = { kind: 'applied' as const, outcome: 'success' as const, facts: ['@hero は @goblin を攻撃した。'], dice: [] }

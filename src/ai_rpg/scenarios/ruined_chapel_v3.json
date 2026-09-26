@@ -1,0 +1,106 @@
+{
+  "scenario_ref": "ruined_chapel",
+  "version": 3,
+  "ruleset_ref": "mvp_v2",
+  "title": "廃礼拝堂の聖印",
+  "objective": "廃礼拝堂にある銀の聖印を村へ戻す。別の解決や撤退も選べる。",
+  "world": {
+    "region_name": "廃礼拝堂と周辺",
+    "boundary": "礼拝堂、裏庭、崩れた塀とその周辺まで。村へ戻るとこの冒険は終わる。",
+    "goal_scene_ref": "sanctum",
+    "goal_flag_ref": "relic_recovered",
+    "outside_ending_ref": "retreated",
+    "protected_terms": ["聖印", "依頼品", "ゴブリン", "守衛", "見張り", "村", "祭壇", "奥の部屋"],
+    "protected_facts": [
+      {"fact_ref": "relic_location", "kind": "location", "statement": "銀の聖印は祭壇の部屋にある。", "scene_ref": "sanctum"},
+      {"fact_ref": "guard_motive", "kind": "motive", "statement": "ゴブリンは聖印の持ち出し理由を知りたくて祭壇を見張っている。", "scene_ref": "sanctum"},
+      {"fact_ref": "region_limit", "kind": "rule", "statement": "村と遠方はこの短編の探索領域外である。"}
+    ]
+  },
+  "scenes": [
+    {
+      "scene_ref": "entrance", "sequence": 1, "title": "依頼書のある入口",
+      "description": "崩れた礼拝堂の入口に依頼書がある。奥の祭壇の銀の聖印を村へ戻してほしいという。扉の隙間から傾いた長椅子が見え、裏手には崩れた塀もある。",
+      "open_flags": ["quest_accepted", "alerted", "costly"],
+      "open_destinations": ["hall"],
+      "actions": [
+        {"kind": "scenario_action", "action_ref": "enter_chapel", "label": "礼拝堂へ入る", "public_fact": "礼拝堂の広間に入った。", "success": {"next_scene_ref": "hall"}},
+        {"kind": "scenario_action", "action_ref": "leave_entrance", "label": "村へ引き返す", "public_fact": "礼拝堂から引き返した。", "success": {"ending_ref": "retreated"}}
+      ]
+    },
+    {
+      "scene_ref": "hall", "sequence": 2, "title": "長椅子の広間",
+      "description": "傾いた長椅子が床に並ぶ。古い案内板は記録庫を指し、高窓と裏庭への崩れた壁も見える。入口へ戻る道は開いている。",
+      "open_flags": ["shortcut_found", "alerted", "costly"],
+      "open_destinations": ["entrance", "archive", "passage"],
+      "actions": [
+        {"kind": "scenario_action", "action_ref": "walk_to_archive", "label": "記録庫へ向かう", "public_fact": "記録庫へ進んだ。", "success": {"next_scene_ref": "archive"}},
+        {"kind": "scenario_action", "action_ref": "back_to_entrance", "label": "入口へ戻る", "public_fact": "入口へ戻った。", "success": {"next_scene_ref": "entrance"}}
+      ]
+    },
+    {
+      "scene_ref": "archive", "sequence": 3, "title": "雨漏りする記録庫",
+      "description": "濡れた記録帳と祭壇を描いた挿絵がある。奥には狭い通路が続く。広間にも戻れる。",
+      "open_flags": ["archive_clue", "alerted", "costly"],
+      "open_destinations": ["hall", "passage"],
+      "actions": [
+        {"kind": "scenario_action", "action_ref": "walk_to_passage", "label": "奥の通路へ進む", "public_fact": "奥の通路へ進んだ。", "success": {"next_scene_ref": "passage"}},
+        {"kind": "scenario_action", "action_ref": "back_to_hall", "label": "広間へ戻る", "public_fact": "広間へ戻った。", "success": {"next_scene_ref": "hall"}}
+      ]
+    },
+    {
+      "scene_ref": "passage", "sequence": 4, "title": "祭壇前の通路",
+      "description": "半開きの扉の向こうから声が聞こえる。壁の割れ目と崩れた石の隙間にも通れる余地がある。記録庫へ戻れる。",
+      "open_flags": ["alerted", "costly"],
+      "open_destinations": ["archive", "sanctum"],
+      "npc_notes": ["扉の向こうから、見張りのゴブリンの声が聞こえる。"],
+      "actions": [
+        {"kind": "scenario_action", "action_ref": "approach_sanctum", "label": "祭壇の部屋へ進む", "public_fact": "祭壇の部屋に入った。", "success": {"next_scene_ref": "sanctum"}},
+        {"kind": "scenario_action", "action_ref": "back_to_archive", "label": "記録庫へ戻る", "public_fact": "記録庫へ戻った。", "success": {"next_scene_ref": "archive"}}
+      ]
+    },
+    {
+      "scene_ref": "sanctum", "sequence": 5, "title": "ゴブリンの守る祭壇",
+      "description": "銀の聖印は石の祭壇にある。見張りのゴブリンが理由を尋ねている。傾いた長椅子が壁沿いにあり、通路へ戻る扉も開いている。",
+      "open_flags": ["relic_recovered", "alternative_resolved", "guard_agreed", "passed_guard", "alerted", "costly"],
+      "open_destinations": ["passage", "return"],
+      "npc_notes": ["ゴブリンは聖印を持ち出す理由を聞きたがっている。"],
+      "combat": {"enemy_ref": "goblin", "started_flag": "combat_started", "defeat_ending_ref": "defeated", "damage_expression": "1d4"},
+      "actions": [
+        {"kind": "attack", "action_ref": "defeat_guard", "label": "ゴブリンと戦う", "target_ref": "goblin", "defeated": {"add_flags": ["guard_defeated"]}},
+        {"kind": "scenario_action", "action_ref": "leave_with_relic", "label": "聖印を持って帰路へ進む", "public_fact": "聖印を持ち、村への帰路へ進んだ。", "required_flags": ["relic_recovered"], "success": {"next_scene_ref": "return"}},
+        {"kind": "scenario_action", "action_ref": "back_to_passage", "label": "通路へ戻る", "public_fact": "通路へ戻った。", "success": {"next_scene_ref": "passage"}}
+      ]
+    },
+    {
+      "scene_ref": "return", "sequence": 6, "title": "帰路",
+      "description": "礼拝堂の入口と村へ続く道が見える。聖印を届けるか、ここで別の決断を下せる。",
+      "open_flags": ["costly"],
+      "open_destinations": ["sanctum", "entrance"],
+      "actions": [
+        {"kind": "scenario_action", "action_ref": "return_relic", "label": "聖印を村の共同庫へ届ける", "public_fact": "聖印を村の共同庫へ届けた。", "required_flags": ["relic_recovered"], "success": {"ending_ref": "recovered", "overrides": [{"requires_flags": ["costly"], "ending_ref": "costly_success"}]}},
+        {"kind": "scenario_action", "action_ref": "back_to_sanctum", "label": "祭壇へ戻る", "public_fact": "祭壇へ引き返した。", "success": {"next_scene_ref": "sanctum"}}
+      ]
+    }
+  ],
+  "flags": [
+    {"flag_ref": "quest_accepted", "public_fact": "聖印の回収依頼を引き受けた。"},
+    {"flag_ref": "shortcut_found", "public_fact": "別の通り道を見つけた。"},
+    {"flag_ref": "archive_clue", "public_fact": "記録庫で手掛かりを見つけた。"},
+    {"flag_ref": "alerted", "public_fact": "礼拝堂の奥の見張りが警戒している。"},
+    {"flag_ref": "costly", "public_fact": "礼拝堂で時間と手間を費やした。"},
+    {"flag_ref": "relic_recovered", "public_fact": "祭壇の銀の聖印を手に入れた。"},
+    {"flag_ref": "alternative_resolved", "public_fact": "聖印を持ち帰らない別の解決を見つけた。"},
+    {"flag_ref": "guard_agreed", "public_fact": "ゴブリンは行動を妨げないことにした。"},
+    {"flag_ref": "passed_guard", "public_fact": "ゴブリンの見張りを通り抜けた。"},
+    {"flag_ref": "combat_started", "public_fact": "ゴブリンとの戦闘が始まった。"},
+    {"flag_ref": "guard_defeated", "public_fact": "ゴブリンは戦えなくなった。"}
+  ],
+  "endings": [
+    {"ending_ref": "recovered", "title": "聖印の帰還", "summary": "銀の聖印を村へ持ち帰った。", "required_flags": ["relic_recovered"], "reward": {"tier": "full", "description": "村から依頼達成の謝礼を受ける。"}},
+    {"ending_ref": "costly_success", "title": "代償付きの帰還", "summary": "代償を払いながら銀の聖印を村へ届けた。", "required_flags": ["relic_recovered", "costly"], "reward": {"tier": "reduced", "description": "依頼達成を認められるが、代償の分だけ謝礼は少ない。"}},
+    {"ending_ref": "alternative_resolution", "title": "別の解決", "summary": "聖印を持ち帰る以外の方法で争いを収めた。", "required_flags": ["alternative_resolved"], "reward": {"tier": "reduced", "description": "村から争いを収めたことへの謝意を受ける。"}},
+    {"ending_ref": "retreated", "title": "撤退", "summary": "聖印を持ち帰らずに礼拝堂を離れた。", "reward": {"tier": "none", "description": "依頼の謝礼はない。"}},
+    {"ending_ref": "defeated", "title": "祭壇での敗北", "summary": "祭壇で行動不能となった。", "reward": {"tier": "none", "description": "依頼の謝礼はない。"}}
+  ]
+}

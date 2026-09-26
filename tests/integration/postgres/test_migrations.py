@@ -976,6 +976,8 @@ def _guard_empty_database(url: str) -> Generator[str, None, None]:
                 if "actions" in _public_tables(cleanup_engine):
                     with cleanup_engine.begin() as connection:
                         connection.execute(text("TRUNCATE TABLE turns,events,actions CASCADE"))
+                        if "mvp_character_abilities" in _public_tables(cleanup_engine):
+                            connection.execute(text("TRUNCATE TABLE campaigns CASCADE"))
                 cleanup_engine.dispose()
                 _run_alembic(url, "downgrade", "base")
                 cleanup_engine = create_engine(url)
@@ -1039,6 +1041,9 @@ def test_empty_database_upgrades_and_downgrades(empty_database_url: str) -> None
             "mvp_scene_entities",
             "mvp_scenario_runs",
             "mvp_scenario_flags",
+            "mvp_character_abilities",
+            "mvp_scenario_facts",
+            "mvp_action_proposals",
             "principals",
             "principal_identities",
         } <= _public_tables(engine)
@@ -1136,6 +1141,9 @@ def test_scenario_progress_upgrade_has_no_backfill_and_downgrades_in_dependency_
             "adventure_start_requests",
             "login_attempts",
             "browser_sessions",
+            "mvp_character_abilities",
+            "mvp_scenario_facts",
+            "mvp_action_proposals",
         }
         with engine.connect() as connection:
             assert connection.scalar(text("SELECT count(*) FROM mvp_scenario_runs")) == 0
@@ -1202,7 +1210,7 @@ def test_scenario_commit_action_kind_migration_is_forward_only_with_live_rows(
         )
         with engine.connect() as connection:
             assert connection.scalar(text("SELECT version_num FROM alembic_version")) == (
-                "0013_browser_sessions"
+                "0014_bounded_open_scenario"
             )
             assert connection.scalar(
                 text("SELECT kind FROM actions WHERE id=:action"),
@@ -1332,6 +1340,9 @@ def test_scene_entity_upgrade_has_no_backfill_and_rollback_preserves_data(
             "adventure_start_requests",
             "login_attempts",
             "browser_sessions",
+            "mvp_character_abilities",
+            "mvp_scenario_facts",
+            "mvp_action_proposals",
         }
         with engine.begin() as connection:
             assert connection.scalar(text("SELECT count(*) FROM mvp_scene_entities")) == 0
@@ -4198,6 +4209,8 @@ def test_fake_llm_skill_check_round_trip_reopens_turn_acceptance(
                     "name": "主人公",
                     "current_hp": 10,
                     "max_hp": 10,
+                    "abilities": None,
+                    "specialty_skill": None,
                     "inventory": [
                         {"item_id": WEAPON_A, "item_ref": "iron_sword", "name": "鉄の剣",
                          "quantity": 1, "equipped": True},
@@ -8097,6 +8110,7 @@ def test_ruined_chapel_recovered_after_successful_search_and_negotiation(
         "ending_ref": "recovered",
         "title": "回収成功",
         "summary": "銀の聖印を無事に回収した。",
+        "reward": None,
     }
     assert [turn["committed_state_version"] for turn in turns] == [1, 2, 3]
     assert all(
@@ -8136,6 +8150,7 @@ def test_ruined_chapel_costly_success_after_failed_search_and_negotiation(
         "ending_ref": "costly_success",
         "title": "代償付き成功",
         "summary": "代償を払いながらも銀の聖印を回収した。",
+        "reward": None,
     }
     assert [turn["committed_state_version"] for turn in turns] == [1, 2, 3]
     assert _ruined_chapel_counts(database) == (3, 11, 3, 1)
@@ -8165,6 +8180,7 @@ def test_ruined_chapel_can_end_by_retreating(database: Engine) -> None:
         "ending_ref": "retreated",
         "title": "撤退",
         "summary": "銀の聖印の回収を断念し、廃礼拝堂から撤退した。",
+        "reward": None,
     }
     assert [turn["committed_state_version"] for turn in turns] == [1, 2, 3]
     assert _ruined_chapel_counts(database) == (3, 10, 3, 1)
@@ -8202,6 +8218,7 @@ def test_ruined_chapel_combat_recovers_relic_when_goblin_reaches_zero_hp(
         "ending_ref": "recovered",
         "title": "回収成功",
         "summary": "銀の聖印を無事に回収した。",
+        "reward": None,
     }
     assert [turn["committed_state_version"] for turn in turns] == [1, 2, 3, 4]
     with database.connect() as connection:

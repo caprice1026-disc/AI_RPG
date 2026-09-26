@@ -1,5 +1,6 @@
 """バージョン固定されたゲーム規則。"""
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import ClassVar, Literal
 
@@ -101,6 +102,7 @@ class MvpV1Ruleset:
             ],
         )
 
+
     def resolve_use_item(
         self,
         command: UseItemCommand,
@@ -150,3 +152,34 @@ class MvpV1Ruleset:
                 ),
             ],
         )
+
+
+@dataclass(frozen=True, slots=True)
+class MvpV2Ruleset:
+    """Free actions use four abilities and a single chosen specialty."""
+
+    dice: DiceEngine
+    ruleset_id: str = "mvp_v2"
+
+    _skill_ability: ClassVar[dict[str, str]] = {
+        "athletics": "strength",
+        "acrobatics": "agility",
+        "perception": "insight",
+        "stealth": "agility",
+        "persuasion": "presence",
+    }
+
+    def open_modifier(
+        self, *, ability: str, skill_ref: str | None,
+        scores: Mapping[str, int], specialty: str,
+    ) -> int:
+        if ability not in {"strength", "agility", "insight", "presence"}:
+            raise ValueError("Unknown ability")
+        if skill_ref is not None and self._skill_ability.get(skill_ref) != ability:
+            raise ValueError("Skill and ability do not match")
+        score = scores.get(ability)
+        if type(score) is not int or not 0 <= score <= 3:
+            raise ValueError("Invalid saved ability")
+        if specialty not in self._skill_ability:
+            raise ValueError("Invalid saved specialty")
+        return score + (2 if skill_ref == specialty else 0)

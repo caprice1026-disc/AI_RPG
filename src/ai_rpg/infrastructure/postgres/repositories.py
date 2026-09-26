@@ -8,6 +8,7 @@ from collections.abc import Callable, Mapping, Sequence
 from typing import Literal
 from uuid import UUID, uuid4
 
+from pydantic import TypeAdapter
 from sqlalchemy import RowMapping, and_, exists, or_, select, text
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
@@ -37,6 +38,7 @@ from ai_rpg.application.ports.repositories import (
     RecentMessage,
     ResolutionWorkItem,
     ScenarioActionNotAvailableError,
+    ScenarioFact,
     ScenarioRepository,
     ScenarioRunSnapshot,
     ScenarioSceneSnapshot,
@@ -59,6 +61,7 @@ from ai_rpg.contracts import (
     PublicTurnEventPayload,
     TurnResponse,
 )
+from ai_rpg.contracts.llm_decisions import ActionIntent
 from ai_rpg.contracts.responses import (
     InventoryItem,
     MechanicalNarrationInput,
@@ -66,7 +69,12 @@ from ai_rpg.contracts.responses import (
     RecoveryReason,
     TurnRecovery,
 )
-from ai_rpg.domain.commands import AttackCommand, ScenarioActionCommand, UseItemCommand
+from ai_rpg.domain.commands import (
+    AttackCommand,
+    OpenActionCommand,
+    ScenarioActionCommand,
+    UseItemCommand,
+)
 from ai_rpg.domain.events import NarrationGeneratedPayload
 from ai_rpg.domain.results import AppliedResult, NotApplicableResult
 from ai_rpg.infrastructure.postgres.models import (
@@ -75,8 +83,11 @@ from ai_rpg.infrastructure.postgres.models import (
     CampaignModel,
     EntityModel,
     EventModel,
+    MvpActionProposalModel,
+    MvpCharacterAbilityModel,
     MvpCharacterModel,
     MvpInventoryModel,
+    MvpScenarioFactModel,
     MvpScenarioFlagModel,
     MvpScenarioRunModel,
     MvpSceneEntityModel,
@@ -92,6 +103,9 @@ from ai_rpg.scenarios import BUILTIN_SCENARIOS
 
 def _json(value: object) -> str:
     return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str)
+
+
+_risk_action_adapter: TypeAdapter[ActionIntent] = TypeAdapter(ActionIntent)
 
 
 def _public_action_summary(result: Mapping[str, object]) -> str | None:
@@ -399,6 +413,10 @@ class PostgresTurnRepository:
                     "fallback": row["narration_status"] == "fallback",
                     "reason": _public_recovery_reason(row["recovery_reason"]),
                 },
+                "risk_preview": None if row["risk_proposal_id"] is None else {
+                    "proposal_id": row["risk_proposal_id"],
+                    "risk_text": row["risk_text"],
+                },
             }
         )
 
@@ -435,7 +453,11 @@ class PostgresTurnRepository:
                                'result', e.payload->'result') ORDER BY e.sequence)
                            FROM events AS e
                            WHERE e.turn_id=t.id AND e.type='EnemyReactionResolved'
-                       ), '[]'::jsonb) AS replay_enemy_reactions
+                       ), '[]'::jsonb) AS replay_enemy_reactions,
+                       (SELECT p.id FROM mvp_action_proposals AS p
+                        WHERE p.source_turn_id=t.id) AS risk_proposal_id,
+                       (SELECT p.risk_text FROM mvp_action_proposals AS p
+                        WHERE p.source_turn_id=t.id) AS risk_text
                 FROM turns AS t
                 WHERE t.id=:turn AND t.campaign_id=:campaign
                 """
@@ -642,6 +664,25 @@ class PostgresTurnRepository:
             except ScenarioActionUnavailableError as error:
                 raise ScenarioActionNotAvailableError(str(error)) from error
             input_text = binding.label
+        if turn.content.kind == "confirm_action":
+            proposal = (
+                await self._session.execute(
+                    select(MvpActionProposalModel, TurnModel)
+                    .join(TurnModel, TurnModel.id == MvpActionProposalModel.source_turn_id)
+                    .where(
+                        MvpActionProposalModel.id == turn.content.proposal_id,
+                        MvpActionProposalModel.campaign_id == campaign_id,
+                        MvpActionProposalModel.actor_id == turn.actor_id,
+                        MvpActionProposalModel.state_version == current_version,
+                        TurnModel.created_by == principal_id,
+                        TurnModel.resolution_status == "not_applied",
+                    )
+                )
+            ).one_or_none()
+            if proposal is None:
+                raise ScenarioActionNotAvailableError("Risk proposal is stale or unavailable")
+            saved, source = proposal
+            input_text = source.input_text or str(saved.payload["approach"])
         if turn.content.kind == "choice":
             available_choice = await self._session.execute(
                 text(
@@ -695,7 +736,7 @@ class PostgresTurnRepository:
             "input_kind": content["kind"],
             "input_text": input_text,
             "selected_choice_id": content.get("choice_id"),
-            "selected_action_ref": content.get("action_ref"),
+            "selected_action_ref": content.get("action_ref") or content.get("proposal_id"),
             "expected_state_version": turn.expected_state_version,
             "max_actions": max_actions,
             "llm_call_budget": llm_call_budget,
@@ -898,6 +939,7 @@ class PostgresTurnRepository:
                         t.expected_state_version,
                         t.route,
                         t.selected_action_ref,
+                        t.input_kind,
                         t.created_at,
                         COALESCE(t.input_text,c.label) AS player_text
                     FROM turns AS t
@@ -930,7 +972,10 @@ class PostgresTurnRepository:
             player_text=str(row["player_text"]),
             recent_messages=recent_messages,
             route=row["route"],
-            selected_action_ref=row["selected_action_ref"],
+            selected_action_ref=(None if row["input_kind"] == "confirm_action"
+                                 else row["selected_action_ref"]),
+            confirmed_proposal_id=(UUID(str(row["selected_action_ref"]))
+                                   if row["input_kind"] == "confirm_action" else None),
         )
 
     async def record_initial_route(
@@ -991,6 +1036,58 @@ class PostgresTurnRepository:
             .returning(TurnModel.id)
         )
         return result.scalar_one_or_none() is not None
+
+    async def save_risk_proposal(
+        self, work: ResolutionWorkItem, proposal: ActionIntent, risk_text: str,
+    ) -> UUID:
+        await self._session.scalar(
+            select(CampaignModel.id).where(CampaignModel.id == work.campaign_id).with_for_update()
+        )
+        turn = (
+            await self._session.execute(
+                select(TurnModel).where(
+                    TurnModel.id == work.turn_id,
+                    TurnModel.campaign_id == work.campaign_id,
+                ).with_for_update()
+            )
+        ).scalar_one()
+        if (
+            turn.resolution_status != "resolving" or turn.worker_epoch != work.worker_epoch
+            or turn.actor_id != work.actor_id or turn.scene_id != work.scene_id
+        ):
+            raise StateVersionConflictError("Risk proposal owner changed")
+        await _assert_resolution_lease_current(self._session, work.turn_id, work.worker_epoch)
+        current_version = await self._session.scalar(
+            select(CampaignModel.state_version).where(CampaignModel.id == work.campaign_id)
+        )
+        if current_version != work.expected_state_version:
+            raise StateVersionConflictError("Risk proposal state changed")
+        if not await _lock_actor_authorization(
+            self._session, work.campaign_id, work.principal_id, work.actor_id,
+        ):
+            raise AuthorizationError("actor operation right expired")
+        proposal_id = uuid4()
+        await self._session.execute(insert(MvpActionProposalModel).values(
+            id=proposal_id, campaign_id=work.campaign_id, actor_id=work.actor_id,
+            source_turn_id=work.turn_id, state_version=current_version,
+            payload=proposal.model_dump(mode="json"), risk_text=risk_text,
+        ))
+        return proposal_id
+
+    async def get_confirmed_proposal(self, work: ResolutionWorkItem) -> ActionIntent | None:
+        if work.confirmed_proposal_id is None:
+            return None
+        row = (
+            await self._session.execute(
+                select(MvpActionProposalModel).where(
+                    MvpActionProposalModel.id == work.confirmed_proposal_id,
+                    MvpActionProposalModel.campaign_id == work.campaign_id,
+                    MvpActionProposalModel.actor_id == work.actor_id,
+                    MvpActionProposalModel.state_version == work.expected_state_version,
+                )
+            )
+        ).scalar_one_or_none()
+        return None if row is None else _risk_action_adapter.validate_python(row.payload)
 
     async def finalize_not_applied(self, turn_id: UUID, worker_epoch: int, narration: str) -> bool:
         campaign_id = await self._session.scalar(
@@ -1102,7 +1199,8 @@ class PostgresTurnRepository:
                 (
                     await self._session.execute(
                         text(
-                            "SELECT status FROM mvp_scenario_runs WHERE campaign_id=:c FOR UPDATE"
+                            "SELECT status,scenario_version,alert_level FROM mvp_scenario_runs "
+                            "WHERE campaign_id=:c FOR UPDATE"
                         ),
                         {"c": bundle.campaign_id},
                     )
@@ -1134,11 +1232,13 @@ class PostgresTurnRepository:
                     await self._session.execute(
                         text(
                             "SELECT id FROM scenes "
-                            "WHERE campaign_id=:c AND id=:s AND status='planned'"
+                            "WHERE campaign_id=:c AND id=:s AND "
+                            "(status='planned' OR (:v >= 3 AND status='closed'))"
                         ),
                         {
                             "c": bundle.campaign_id,
                             "s": scenario_update.to_scene_id,
+                            "v": int(run["scenario_version"]),
                         },
                     )
                 ).scalar_one_or_none()
@@ -1149,6 +1249,17 @@ class PostgresTurnRepository:
 
             if scenario_update.ending_ref is not None and scenario_update.to_scene_id is not None:
                 raise InvalidCommitBundleError("Scenarioのto SceneとEndingは排他的です")
+            if (
+                scenario_update.elapsed_actions < 0
+                or not 0 <= int(run["alert_level"]) + scenario_update.alert_delta <= 5
+                or (int(run["scenario_version"]) < 3 and (
+                    scenario_update.elapsed_actions or scenario_update.alert_delta
+                    or scenario_update.facts
+                ))
+                or any(fact.scene_id != scenario_update.from_scene_id
+                       for fact in scenario_update.facts)
+            ):
+                raise InvalidCommitBundleError("Scenarioの時間・警戒・追加事実が不正です")
 
             other_active_count = int(
                 (
@@ -1256,6 +1367,7 @@ class PostgresTurnRepository:
             if updated.scalar_one_or_none() is None:
                 raise InvalidCommitBundleError("Canonical更新対象が消失しました")
         if scenario_update is not None:
+            assert run is not None
             for flag_ref in scenario_update.add_flags:
                 await self._session.execute(
                     text("INSERT INTO mvp_scenario_flags(campaign_id,flag_ref) VALUES(:c,:flag)"),
@@ -1282,12 +1394,14 @@ class PostgresTurnRepository:
                     await self._session.execute(
                         text(
                             "UPDATE scenes SET status='active' "
-                            "WHERE campaign_id=:c AND id=:s AND status='planned' "
+                            "WHERE campaign_id=:c AND id=:s AND "
+                            "(status='planned' OR (:v >= 3 AND status='closed')) "
                             "RETURNING id"
                         ),
                         {
                             "c": bundle.campaign_id,
                             "s": scenario_update.to_scene_id,
+                            "v": int(run["scenario_version"]),
                         },
                     )
                 ).scalar_one_or_none()
@@ -1310,6 +1424,22 @@ class PostgresTurnRepository:
                 ).scalar_one_or_none()
                 if completed_campaign_id is None:
                     raise InvalidCommitBundleError("Scenario runの完了更新に失敗しました")
+            if scenario_update.elapsed_actions or scenario_update.alert_delta:
+                await self._session.execute(
+                    text("UPDATE mvp_scenario_runs SET "
+                         "elapsed_actions=elapsed_actions+:elapsed, "
+                         "alert_level=alert_level+:alert WHERE campaign_id=:c"),
+                    {"c": bundle.campaign_id, "elapsed": scenario_update.elapsed_actions,
+                     "alert": scenario_update.alert_delta},
+                )
+            for fact in scenario_update.facts:
+                await self._session.execute(
+                    insert(MvpScenarioFactModel).values(
+                        id=uuid4(), campaign_id=bundle.campaign_id,
+                        scene_id=fact.scene_id, fact_ref=fact.fact_ref, kind=fact.kind,
+                        public_text=fact.public_text, created_by_turn_id=bundle.turn_id,
+                    )
+                )
         version = projection.committed_state_version
         await self._session.execute(
             text(
@@ -1335,7 +1465,10 @@ class PostgresTurnRepository:
         )
         for action in projection.actions:
             command = action.command
-            target_id = None if isinstance(command, ScenarioActionCommand) else command.target_id
+            target_id = (
+                None if isinstance(command, (ScenarioActionCommand, OpenActionCommand))
+                else command.target_id
+            )
             item_id = (
                 command.weapon_id
                 if isinstance(command, AttackCommand)
@@ -1542,6 +1675,8 @@ class PostgresScenarioRepository:
                         MvpScenarioRunModel.scenario_version,
                         MvpScenarioRunModel.status,
                         MvpScenarioRunModel.ending_ref,
+                        MvpScenarioRunModel.elapsed_actions,
+                        MvpScenarioRunModel.alert_level,
                     ).where(MvpScenarioRunModel.campaign_id == campaign_id)
                 )
             )
@@ -1563,6 +1698,13 @@ class PostgresScenarioRepository:
                 MvpScenarioFlagModel.campaign_id == campaign_id
             )
         )
+        facts = await self._session.execute(
+            select(MvpScenarioFactModel.fact_ref, MvpScenarioFactModel.kind,
+                   MvpScenarioFactModel.public_text,
+                   MvpScenarioFactModel.scene_id)
+            .where(MvpScenarioFactModel.campaign_id == campaign_id)
+            .order_by(MvpScenarioFactModel.created_by_turn_id, MvpScenarioFactModel.id)
+        )
         return ScenarioRunSnapshot(
             campaign_id=run["campaign_id"],
             scenario_ref=run["scenario_ref"],
@@ -1574,6 +1716,10 @@ class PostgresScenarioRepository:
                 for row in scene_rows
             ),
             flags=frozenset(flags.scalars()),
+            elapsed_actions=int(run["elapsed_actions"]),
+            alert_level=int(run["alert_level"]),
+            facts=tuple(ScenarioFact(row.fact_ref, row.kind, row.public_text, row.scene_id)
+                        for row in facts),
         )
 
 
@@ -1615,6 +1761,7 @@ class PostgresCanonicalRepository:
             await rows(EntityModel.__table__),
             scene_entities=tuple(dict(row) for row in scene_entities.mappings()),
             scenario_run=await PostgresScenarioRepository(self._session).snapshot(campaign_id),
+            abilities=await rows(MvpCharacterAbilityModel.__table__),
         )
 
     async def update_with_campaign_lock(

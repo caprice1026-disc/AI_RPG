@@ -23,8 +23,14 @@ class ScenarioActionInput(Contract):
     action_ref: Ref
 
 
+class ConfirmActionInput(Contract):
+    kind: Literal["confirm_action"]
+    proposal_id: UUID
+
+
 PlayerContent: TypeAlias = Annotated[
-    TextInput | ChoiceInput | ScenarioActionInput, Field(discriminator="kind")
+    TextInput | ChoiceInput | ScenarioActionInput | ConfirmActionInput,
+    Field(discriminator="kind"),
 ]
 
 

@@ -1,8 +1,8 @@
 """LLMの権限を型で制限する構造化出力契約。"""
 
-from typing import Annotated, Any, Literal, TypeAlias
+from typing import Annotated, Any, Literal, Self, TypeAlias
 
-from pydantic import Field, TypeAdapter, create_model
+from pydantic import Field, TypeAdapter, create_model, model_validator
 
 from ai_rpg.contracts.common import Contract, NarrationText, Ref, ShortText
 
@@ -31,8 +31,50 @@ class ScenarioActionIntent(Contract):
     action_ref: Ref
 
 
+class OpenCheck(Contract):
+    ability: Literal["strength", "agility", "insight", "presence"]
+    skill_ref: Literal["athletics", "acrobatics", "perception", "stealth", "persuasion"] | None
+    difficulty: Literal["easy", "normal", "hard"]
+
+
+class OpenFact(Contract):
+    fact_ref: Ref
+    kind: Literal["place", "person", "clue", "route"]
+    public_text: ShortText
+
+
+class OpenEffect(Contract):
+    next_scene_ref: Ref | None = None
+    ending_ref: Ref | None = None
+    add_flags: list[Ref] = Field(default_factory=list, max_length=2)
+    alert_delta: int = Field(default=0, strict=True, ge=-1, le=2)
+    facts: list[OpenFact] = Field(default_factory=list, max_length=2)
+
+    @model_validator(mode="after")
+    def one_destination(self) -> Self:
+        if self.next_scene_ref is not None and self.ending_ref is not None:
+            raise ValueError("An action cannot move and end the adventure together")
+        return self
+
+
+class OpenActionIntent(Contract):
+    kind: Literal["open_action"]
+    approach: ShortText
+    target_fact_ref: Ref | None = None
+    check: OpenCheck | None
+    success: OpenEffect
+    failure: OpenEffect | None
+    major_risk: ShortText | None = None
+
+    @model_validator(mode="after")
+    def both_check_outcomes(self) -> Self:
+        if (self.check is None) != (self.failure is None):
+            raise ValueError("A check needs both outcomes; a direct action needs one")
+        return self
+
+
 ActionIntent: TypeAlias = Annotated[
-    AttackIntent | SkillCheckIntent | UseItemIntent | ScenarioActionIntent,
+    AttackIntent | SkillCheckIntent | UseItemIntent | ScenarioActionIntent | OpenActionIntent,
     Field(discriminator="kind"),
 ]
 

@@ -21,6 +21,7 @@ from ai_rpg.infrastructure.postgres.models import (
     CampaignMemberModel,
     CampaignModel,
     EntityModel,
+    MvpCharacterAbilityModel,
     MvpCharacterModel,
     MvpInventoryModel,
     MvpScenarioRunModel,
@@ -64,7 +65,7 @@ class PostgresAdventureStore:
         preset: CharacterPreset,
     ) -> CreateAdventureResponse:
         campaign_id, actor_id = uuid4(), uuid4()
-        payload = request.model_dump(mode="json")
+        payload = request.model_dump(mode="json", exclude_none=True)
         async with self._sessions.begin() as session:
             # The unique key waits for a competing transaction to commit or roll back.
             # Deferred FKs let us claim the request before constructing any game state.
@@ -104,7 +105,7 @@ class PostgresAdventureStore:
                 )
 
             await session.execute(
-                insert(CampaignModel).values(id=campaign_id, ruleset_version="mvp_v1")
+                insert(CampaignModel).values(id=campaign_id, ruleset_version=scenario.ruleset_ref)
             )
             await session.execute(
                 insert(CampaignMemberModel).values(
@@ -185,6 +186,23 @@ class PostgresAdventureStore:
                     },
                 ],
             )
+            if scenario.ruleset_ref == "mvp_v2":
+                assert request.ability_points is not None
+                assert request.specialty_skill is not None
+                assert preset.summary.base_abilities is not None
+                base = preset.summary.base_abilities
+                points = request.ability_points
+                await session.execute(
+                    insert(MvpCharacterAbilityModel).values(
+                        campaign_id=campaign_id,
+                        character_id=actor_id,
+                        **{
+                            key: getattr(base, key) + getattr(points, key)
+                            for key in ("strength", "agility", "insight", "presence")
+                        },
+                        specialty_skill=request.specialty_skill,
+                    )
+                )
             await session.execute(
                 insert(MvpWeaponModel).values(
                     campaign_id=campaign_id,

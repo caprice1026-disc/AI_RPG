@@ -74,6 +74,8 @@ class SceneDefinition(Contract):
     actions: tuple[ScenarioActionDefinition, ...]
     npc_notes: tuple[ShortText, ...] = ()
     combat: ScenarioCombatDefinition | None = None
+    open_flags: tuple[Ref, ...] = ()
+    open_destinations: tuple[Ref, ...] = ()
 
 
 class ScenarioFlagDefinition(Contract):
@@ -81,10 +83,34 @@ class ScenarioFlagDefinition(Contract):
     public_fact: ShortText
 
 
+class RewardRule(Contract):
+    tier: Literal["full", "reduced", "none"]
+    description: ShortText
+
+
 class EndingDefinition(Contract):
     ending_ref: Ref
     title: ShortText
     summary: ShortText
+    required_flags: tuple[Ref, ...] = ()
+    reward: RewardRule | None = None
+
+
+class ProtectedFact(Contract):
+    fact_ref: Ref
+    kind: Literal["location", "motive", "rule"]
+    statement: ShortText
+    scene_ref: Ref | None = None
+
+
+class BoundedWorld(Contract):
+    region_name: ShortText
+    boundary: ShortText
+    goal_scene_ref: Ref
+    goal_flag_ref: Ref
+    outside_ending_ref: Ref
+    protected_facts: tuple[ProtectedFact, ...] = Field(min_length=1)
+    protected_terms: tuple[ShortText, ...] = ()
 
 
 class ScenarioDefinition(Contract):
@@ -95,6 +121,8 @@ class ScenarioDefinition(Contract):
     scenes: tuple[SceneDefinition, ...]
     flags: tuple[ScenarioFlagDefinition, ...]
     endings: tuple[EndingDefinition, ...]
+    ruleset_ref: Ref = "mvp_v1"
+    world: BoundedWorld | None = None
 
     @model_validator(mode="after")
     def valid_graph(self) -> Self:
@@ -119,7 +147,30 @@ class ScenarioDefinition(Contract):
         known_scenes = set(scene_refs)
         known_flags = set(flag_refs)
         known_endings = set(ending_refs)
+        if self.world is not None:
+            world = self.world
+            if world.goal_scene_ref not in known_scenes:
+                raise ValueError("world goal scene references an unknown Scene")
+            if world.goal_flag_ref not in known_flags:
+                raise ValueError("world goal flag references an unknown Flag")
+            if world.outside_ending_ref not in known_endings:
+                raise ValueError("world outside ending references an unknown Ending")
+            fact_refs = [fact.fact_ref for fact in world.protected_facts]
+            if len(fact_refs) != len(set(fact_refs)):
+                raise ValueError("protected fact references must be unique")
+            if any(fact.scene_ref is not None and fact.scene_ref not in known_scenes
+                   for fact in world.protected_facts):
+                raise ValueError("protected fact references an unknown Scene")
+            if any(ending.reward is None for ending in self.endings):
+                raise ValueError("bounded scenario endings need a reward rule")
+        for ending in self.endings:
+            if not set(ending.required_flags) <= known_flags:
+                raise ValueError("Ending references an unknown Flag")
         for scene in self.scenes:
+            if not set(scene.open_flags) <= known_flags:
+                raise ValueError("Scene open_flags references an unknown Flag")
+            if not set(scene.open_destinations) <= known_scenes:
+                raise ValueError("Scene open_destinations references an unknown Scene")
             if scene.combat is not None:
                 combat = scene.combat
                 if not any(
