@@ -3,6 +3,8 @@
 - 状態: 採用
 - 決定日: 2026-09-20
 
+このADRは現行の固定短編を記述する。自由行動型シナリオへの将来の変更方針は[ADR-0016](0016-bounded-open-scenario.md)を参照する。
+
 ## 文脈と決定
 
 固定Scenarioの構造は、version付きの型付きJSONとしてリポジトリへ置く。定義にはScene、公開説明、登録済み行動、遷移条件、公開flag、Endingを含め、起動時に参照整合性を検証する。Campaignは開始時の`scenario_ref`と`scenario_version`を保存し、別versionの定義へ暗黙に切り替えない。
