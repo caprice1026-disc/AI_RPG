@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, expect, it, vi } from 'vitest'
 import { flushPromises, mount, type VueWrapper } from '@vue/test-utils'
 import App from '../src/App.vue'
-import { campaign, Events, response, saved, server, session, turn, waiting } from './fixtures'
+import { campaign, deferred, Events, response, saved, server, session, turn, waiting } from './fixtures'
 
 const wrappers: VueWrapper[] = []
 async function render(api = server()) {
@@ -70,7 +70,10 @@ it.each(['victory', 'defeat', 'withdrawal'])('%s ending blocks actions, permits 
   const w = await render(server(path => path.endsWith('/state') ? response(c) : undefined))
   await w.get('[data-adventure="campaign-a"]').trigger('click'); await flushPromises()
   expect(w.text()).toContain('記録された結末')
-  expect((w.get('#action-text').element as HTMLTextAreaElement).disabled).toBe(true)
+  expect(w.find('#action-text').exists()).toBe(false)
+  expect(w.get('.composer').text()).toContain('この冒険は完了しました')
+  expect(button(w, '送信')).toBeUndefined()
+  expect(button(w, '回復する行動を入力')).toBeUndefined()
   expect((button(w, '周囲を見る').element as HTMLButtonElement).disabled).toBe(true)
   await button(w, '新しい冒険へ').trigger('click'); await flushPromises()
   expect(w.find('#start-form').exists()).toBe(true)
@@ -89,6 +92,22 @@ it('narration humanizes known public refs as text without changing the API value
   expect(w.get('.narration').text()).toBe('葵はゴブリンを見た。葵 は <img src=x onerror=alert(1)> を読んだ。@unknown @hero_other')
   expect(w.find('img[src="x"]').exists()).toBe(false)
   expect(t.narration).toBe(original)
+})
+it.each([
+  ['success', '技能判定：成功（合計19）'],
+  ['failure', '技能判定：失敗（合計19）'],
+] as const)('renders legacy %s skill facts in Japanese without rewriting saved text', async (outcome, displayed) => {
+  const fact = `技能判定は${outcome}(合計19)`
+  const t = { ...turn(), narration: 'successという文字を見つけた。', action_results: [
+    { action_id: 'skill', ordinal: 1, result: { kind: 'applied' as const, outcome,
+      facts: [fact, '@hero は success と書かれた紙を見た。'], dice: [] } },
+  ] }
+  const w = await render(server(path => path.endsWith('/state') ? response(campaign({ latest_turn: t })) : undefined))
+  await w.get('[data-adventure="campaign-a"]').trigger('click'); await flushPromises()
+  expect(w.get('.result-block').text()).toContain(displayed)
+  expect(w.get('.result-block').text()).toContain('葵 は success と書かれた紙を見た。')
+  expect(w.get('.narration').text()).toBe('successという文字を見つけた。')
+  expect(t.action_results[0]!.result.facts[0]).toBe(fact)
 })
 it('keeps observed enemy names in history when the scene leaves combat', async () => {
   let completed = false
@@ -223,4 +242,21 @@ it('reveals the same latest record when narration arrives over SSE', async () =>
   expect(scroll).toHaveBeenCalled()
   expect((scroll.mock.contexts.at(-1) as HTMLElement).dataset.turnId).toBe('live')
   expect(w.get('.narration').text()).toBe('扉が開いた。')
+})
+it('reveals the latest result again after the initial history arrives on resume', async () => {
+  const page = deferred<Response>(), latest = turn('recent', 1)
+  const w = await render(server(path => path.endsWith('/state')
+    ? response(campaign({ latest_turn: latest, state_version: 1 }))
+    : path.includes('/history?') ? page.promise : undefined))
+  await w.get('[data-adventure="campaign-a"]').trigger('click'); await flushPromises()
+  const scroll = vi.mocked(HTMLElement.prototype.scrollIntoView)
+  expect(scroll).toHaveBeenCalled(); scroll.mockClear()
+  page.resolve(response({ items: [
+    { created_at: '2026-09-22', player_input: '古い記録', turn: turn('older', 0) },
+    { created_at: '2026-09-23', player_input: '最新の入力', turn: latest },
+  ], next_before_turn_id: null }))
+  await flushPromises()
+  expect(w.findAll('[data-turn-id]').map(r => r.attributes('data-turn-id'))).toEqual(['older', 'recent'])
+  expect(scroll).toHaveBeenCalledTimes(1)
+  expect((scroll.mock.contexts.at(-1) as HTMLElement).dataset.turnId).toBe('recent')
 })

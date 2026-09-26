@@ -7,7 +7,9 @@ const choices = computed(() => props.record.turn.choices.filter(choice => !props
 const reasons = { target_unavailable: '対象を見つけられませんでした。', resource_unavailable: '必要な持ち物がありません。', rule_precondition: '今はその行動を実行できません。' }
 function lines(result: Result): string[] {
   return result.kind === 'not_applicable' ? [reasons[result.reason]] : [
-    ...result.facts, ...result.dice.map(d => `${d.expression}: ${d.rolls.join(', ')} ${d.modifier >= 0 ? '+' : ''}${d.modifier} = ${d.total}`),
+    ...result.facts.map(fact => fact.replace(/^技能判定は(success|failure)\(合計(-?\d+)\)$/,
+      (_, outcome: string, total: string) => `技能判定：${outcome === 'success' ? '成功' : '失敗'}（合計${total}）`)),
+    ...result.dice.map(d => `${d.expression}: ${d.rolls.join(', ')} ${d.modifier >= 0 ? '+' : ''}${d.modifier} = ${d.total}`),
   ]
 }
 function humanize(text: string, names: Record<string, string>) {

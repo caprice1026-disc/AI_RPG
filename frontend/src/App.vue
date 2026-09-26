@@ -33,7 +33,7 @@ function revealLatest() {
   const record = Array.from(timeline.value?.children ?? []).find(node => (node as HTMLElement).dataset.turnId === turnId)
   record?.scrollIntoView({ block: 'start', behavior: 'auto' })
 }
-watch([() => s.selected?.campaign_id, () => s.campaign?.latest_turn?.turn_id,
+watch([() => s.selected?.campaign_id, () => s.historyLoaded, () => s.campaign?.latest_turn?.turn_id,
   () => s.campaign?.latest_turn?.narration_status, () => s.campaign?.latest_turn?.narration], async () => {
   await nextTick()
   revealLatest()
@@ -184,13 +184,16 @@ function heal() { s.draft = '回復ポーションを使って、自分の傷を
         </div>
         <div v-if="s.trackingError" class="recovery" role="status"><p>{{ s.trackingError }}</p><button type="button" @click="game.recover()">結果を再確認</button></div>
         <button v-if="!s.stateReady && !s.loading" type="button" @click="game.recover()">状態を再取得</button>
-        <label class="visually-hidden" for="action-text">行動を入力</label>
-        <div class="composer-row">
-          <textarea id="action-text" ref="actionInput" v-model="s.draft" rows="2" maxlength="8000" :disabled="!canAct"
-            placeholder="どのように行動しますか？" @keydown.ctrl.enter.prevent="sendText" />
-          <button class="primary" type="submit" :disabled="!canAct || !s.draft.trim()">{{ s.busy || s.tracking ? '処理中…' : '送信' }}</button>
-        </div>
-        <p class="composer-hint">行動を選ぶか、自由に入力 · 受付後に自動保存</p>
+        <template v-if="adventure?.status !== 'completed'">
+          <label class="visually-hidden" for="action-text">行動を入力</label>
+          <div class="composer-row">
+            <textarea id="action-text" ref="actionInput" v-model="s.draft" rows="2" maxlength="8000" :disabled="!canAct"
+              placeholder="どのように行動しますか？" @keydown.ctrl.enter.prevent="sendText" />
+            <button class="primary" type="submit" :disabled="!canAct || !s.draft.trim()">{{ s.busy || s.tracking ? '処理中…' : '送信' }}</button>
+          </div>
+          <p class="composer-hint">行動を選ぶか、自由に入力 · 受付後に自動保存</p>
+        </template>
+        <p v-else class="composer-hint">この冒険は完了しました。記録を読み返すか、「新しい冒険へ」から次の物語を始められます。</p>
       </form>
     </section>
 
@@ -210,7 +213,7 @@ function heal() { s.draft = '回復ポーションを使って、自分の傷を
           <section><h3>持ち物</h3>
             <ul class="public-list"><li v-for="item in player.inventory" :key="item.item_id">{{ item.name }} × {{ item.quantity }}<small v-if="item.equipped">（装備中）</small></li></ul>
             <p v-if="!player.inventory.length" class="hint">持ち物はありません。</p>
-            <button v-if="player.inventory.some(item => item.name.includes('回復ポーション') && item.quantity > 0)" class="quiet" :disabled="!canAct" @click="heal">回復する行動を入力</button>
+            <button v-if="adventure?.status !== 'completed' && player.inventory.some(item => item.name.includes('回復ポーション') && item.quantity > 0)" class="quiet" :disabled="!canAct" @click="heal">回復する行動を入力</button>
           </section>
         </template>
         <section><h3>発見したこと</h3>

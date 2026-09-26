@@ -8277,10 +8277,10 @@ def test_independent_cli_processes_complete_fake_round_trip(database: Engine) ->
                 output = api.stdout.read() if api.stdout is not None else ""
                 pytest.fail(f"API process exited before readiness: {output}")
             try:
-                with Client(base_url=base_url) as client:
+                with Client(base_url=base_url, trust_env=False, timeout=1.0) as client:
                     if client.get("/health").status_code == 200:
                         break
-            except OSError:
+            except (httpx.ConnectError, httpx.TimeoutException):
                 pass
             if time.monotonic() >= deadline:
                 pytest.fail("API process did not become ready")
