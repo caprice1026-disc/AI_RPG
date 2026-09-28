@@ -261,8 +261,11 @@ class ScenarioProgressor:
             )
             if ending is None or not set(ending.required_flags) <= resulting_flags:
                 raise ScenarioActionUnavailableError("Ending conditions are not met")
-        if not 0 <= snapshot.alert_level + effect.alert_delta <= 5:
-            raise ScenarioActionUnavailableError("Alert would exceed its bounds")
+        # The meter saturates; reaching its cap must not make an otherwise legal
+        # failure branch impossible before the dice are rolled.
+        alert_delta = (
+            max(0, min(5, snapshot.alert_level + effect.alert_delta)) - snapshot.alert_level
+        )
         to_scene_id = None
         if effect.next_scene_ref is not None:
             target = next(
@@ -298,7 +301,7 @@ class ScenarioProgressor:
             from_scene_id=active.id, to_scene_id=to_scene_id,
             add_flags=tuple(flag for flag in effect.add_flags if flag not in snapshot.flags),
             ending_ref=effect.ending_ref, elapsed_actions=1,
-            alert_delta=effect.alert_delta,
+            alert_delta=alert_delta,
             facts=tuple(ScenarioFact(fact.fact_ref, fact.kind, fact.public_text, active.id)
                         for fact in effect.facts
                         if all(previous.fact_ref != fact.fact_ref for previous in snapshot.facts)),

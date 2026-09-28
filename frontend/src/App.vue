@@ -224,8 +224,9 @@ function sendText() { if (s.draft.trim()) void game.submit({ kind: 'text', text:
           </div>
           <section v-if="riskPreview" class="risk-preview" aria-label="重大なリスクの確認">
             <h2>実行前の確認</h2><p>{{ riskPreview.risk_text }}</p>
+            <p class="hint">確認しなければ実行されません。見送るとこの画面では隠れますが、再開すると再表示されます。</p>
             <button :disabled="!canAct" @click="game.submit({ kind: 'confirm_action', proposal_id: riskPreview.proposal_id }, '確認して実行する')">この行動を実行</button>
-            <button class="quiet" @click="dismissedRiskId = riskPreview.proposal_id">やめる</button>
+            <button class="quiet" @click="dismissedRiskId = riskPreview.proposal_id">今回は見送る</button>
           </section>
         </div>
       </div>

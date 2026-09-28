@@ -86,11 +86,15 @@ it('risk preview can be cancelled locally or confirmed without rerunning free te
   const w = await render(api)
   await w.get('[data-adventure="campaign-a"]').trigger('click'); await flushPromises()
   expect(w.text()).toContain('離れると冒険が終わります。')
-  await button(w, 'やめる').trigger('click'); await flushPromises()
+  expect(w.get('.risk-preview').text()).toContain('再開すると再表示')
+  await button(w, '今回は見送る').trigger('click'); await flushPromises()
   expect(api.posts()).toHaveLength(0)
   expect(button(w, 'この行動を実行')).toBeUndefined()
-  await w.get('[data-adventure="campaign-a"]').trigger('click'); await flushPromises()
-  await button(w, 'この行動を実行').trigger('click'); await flushPromises()
+  w.unmount()
+  const resumed = await render(api)
+  await resumed.get('[data-adventure="campaign-a"]').trigger('click'); await flushPromises()
+  expect(api.posts()).toHaveLength(0)
+  await button(resumed, 'この行動を実行').trigger('click'); await flushPromises()
   expect(JSON.parse(String(api.posts()[0]!.init.body)).content).toEqual({
     kind: 'confirm_action', proposal_id: 'proposal-a',
   })

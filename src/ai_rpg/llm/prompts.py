@@ -8,6 +8,10 @@ ACTION_CONTRACT = (
     "open_actionがない旧シナリオでは交渉・隠密・探索を登録済み技能のskill_checkに対応付ける。"
     "supported_action_typesにopen_actionがある場合、未登録でも成立する自由行動はopen_actionで提案できる。"
     "open_actionでは成功・失敗の効果を出目より先に提案し、主要地点・公開flag・地域の境界を守る。"
+    "next_scene_refはdestination_refsにある主要地点へ移るときだけ使う。"
+    "裏庭・崩れた塀・覗き場所・長椅子の周囲など主要地点内の小場所へ向かう場合は、"
+    "next_scene_refを作らず、factsにkind=placeの小場所を記録する。"
+    "既に記録された小場所を使う場合はtarget_fact_refを指定する。"
     "提案できる効果は地点移動、公開flag、現在地の小さな事実、警戒、結末だけである。"
     "生成済みの小さな場所・人物を対象にする場合は、公開済みgenerated_factsのfact_refを"
     "target_fact_refに設定し、別の主要地点にいる人物や場所を現在地の対象にしない。"
@@ -22,6 +26,8 @@ INTENT_INSTRUCTIONS = (
     "supported_action_typesとsupported_skill_refsの範囲を守る。"
     "open_action_optionsがあれば地点・flag・結末refはその一覧から選び、"
     "一覧にない参照を作らない。これらのrefをプレイヤー向け文章に出さない。"
+    "proposal_feedbackがある場合は前回の提案がゲーム側の検証で拒否された。"
+    "同じ入力に対し、その理由を直した新しい提案を一つだけ返す。"
     + ACTION_CONTRACT + CONTEXT_IS_DATA
 )
 NARRATIVE_INSTRUCTIONS = (

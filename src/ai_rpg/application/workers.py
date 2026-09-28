@@ -290,21 +290,37 @@ class SkillCheckResolutionWorker:
                 intents = [self._registered_intent(work, snapshot)]
             else:
                 context = self._mechanical_input(work, snapshot)
-                async with asyncio.timeout(self._policy.request_timeout_seconds):
-                    if not await _reserve_call(
-                        self._unit_of_work_factory, work.turn_id, "resolution", work.worker_epoch
-                    ):
-                        raise CallBudgetExceeded("LLM呼び出し予算を使い切りました")
-                    decision = await self._llm.extract_intent(
-                        context, model_id=self._policy.model_id
-                    )
-                if decision.kind == "clarification_required":
-                    return await self._finalize_not_applied(work, decision.question)
-                if decision.kind != "action_plan":
-                    raise ResolutionInputError("ActionPlanが必要です")
-                intents = decision.actions
+                for attempt in range(2):
+                    async with asyncio.timeout(self._policy.request_timeout_seconds):
+                        if not await _reserve_call(
+                            self._unit_of_work_factory, work.turn_id, "resolution",
+                            work.worker_epoch,
+                        ):
+                            raise CallBudgetExceeded("LLM呼び出し予算を使い切りました")
+                        decision = await self._llm.extract_intent(
+                            context, model_id=self._policy.model_id
+                        )
+                    if decision.kind == "clarification_required":
+                        return await self._finalize_not_applied(work, decision.question)
+                    if decision.kind != "action_plan":
+                        raise ResolutionInputError("ActionPlanが必要です")
+                    intents = decision.actions
+                    try:
+                        preflight = self._preflight_actions(work, snapshot, intents)
+                    except ResolutionInputError as error:
+                        if (attempt == 0 and snapshot.scenario_run is not None
+                                and snapshot.scenario_run.scenario_version >= 3
+                                and any(isinstance(item, OpenActionIntent) for item in intents)
+                                and isinstance(error.__cause__, ScenarioActionUnavailableError)):
+                            context = context.model_copy(update={
+                                "proposal_feedback": str(error)[:200],
+                            })
+                            continue
+                        raise
+                    break
 
-            preflight = self._preflight_actions(work, snapshot, intents)
+            if work.confirmed_proposal_id is not None or work.selected_action_ref is not None:
+                preflight = self._preflight_actions(work, snapshot, intents)
             if work.confirmed_proposal_id is None:
                 risk = self._risk_for_actions(intents, snapshot)
                 if risk is not None:
@@ -506,10 +522,14 @@ class SkillCheckResolutionWorker:
                         or skill_binding.failure.ending_ref is not None):
                     risks.append("この判定で冒険の結末が確定する可能性があります。")
         combat = self._scenario_progressor.scene_for(run).combat
-        if can_react and combat is not None and (
-            combat.started_flag in run.flags or isinstance(intent, AttackIntent)
+        if can_react and combat is not None and isinstance(intent, AttackIntent) and (
+            combat.started_flag not in run.flags
         ):
-            risks.insert(0, "敵の反撃でHPを失う可能性があります。")
+            enemy = next((row for row in snapshot.entities if row["ref"] == combat.enemy_ref), None)
+            hp = next((row["current_hp"] for row in snapshot.characters
+                       if enemy is not None and row["entity_id"] == enemy["id"]), None)
+            if hp is None or _stored_int(hp) > 0:
+                risks.insert(0, "戦闘を始めると、敵の反撃でHPを失う可能性があります。")
         return (intent, " ".join(risks)[:500]) if risks else None
 
     async def _preview_risk(

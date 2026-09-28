@@ -1,11 +1,13 @@
 """Bounded free actions must be typed before the worker may roll dice."""
 
-from unittest.mock import Mock
+from dataclasses import replace
+from unittest.mock import AsyncMock, Mock
 from uuid import UUID
 
 import pytest
 from pydantic import ValidationError
 
+import ai_rpg.application.workers as worker_module
 from ai_rpg.application.ports import (
     CanonicalSnapshot,
     ResolutionWorkItem,
@@ -17,6 +19,7 @@ from ai_rpg.application.ports.repositories import ScenarioFact
 from ai_rpg.application.scenarios import ScenarioActionUnavailableError, ScenarioProgressor
 from ai_rpg.application.workers import SkillCheckResolutionWorker, WorkerPhasePolicy
 from ai_rpg.contracts.llm_decisions import (
+    ActionPlan,
     AttackIntent,
     OpenActionIntent,
     ScenarioActionIntent,
@@ -100,6 +103,33 @@ def test_open_success_can_take_a_shortcut_and_failure_can_raise_alert() -> None:
     assert success.elapsed_actions == 1
     assert failure.to_scene_id is None
     assert failure.alert_delta == 1
+
+
+def test_minor_failure_at_max_alert_still_allows_the_action() -> None:
+    progressor = ScenarioProgressor(BUILTIN_SCENARIOS)
+    run = replace(_run(), alert_level=5)
+    intent = OpenActionIntent(
+        kind="open_action", approach="長椅子を動かす",
+        check={"ability": "strength", "skill_ref": "athletics", "difficulty": "normal"},
+        success={"facts": [{"fact_ref": "bench_aligned", "kind": "route",
+                             "public_text": "長椅子が高窓への足場になった"}]},
+        failure={"alert_delta": 1, "add_flags": ["alerted"]},
+    )
+    assert progressor.progress_open(run, intent, "success").alert_delta == 0
+    assert progressor.progress_open(run, intent, "failure").alert_delta == 0
+
+
+def test_minor_local_place_can_be_saved_without_a_major_scene_transition() -> None:
+    progressor = ScenarioProgressor(BUILTIN_SCENARIOS)
+    entrance = _run(1)
+    intent = OpenActionIntent(
+        kind="open_action", approach="裏庭への崩れた塀に向かう", check=None,
+        success={"facts": [{"fact_ref": "yard_wall", "kind": "place",
+                            "public_text": "崩れた塀の陰に足を運んだ"}]}, failure=None,
+    )
+    update = progressor.progress_open(entrance, intent, "success")
+    assert update.to_scene_id is None
+    assert update.facts[0].fact_ref == "yard_wall"
 
 
 def test_open_cannot_rewrite_goal_or_finish_without_required_flag() -> None:
@@ -262,6 +292,30 @@ def test_v3_combat_exit_does_not_warn_of_an_impossible_counterattack() -> None:
     assert worker._risk_for_actions([retreat], sanctum) is None
 
 
+def test_combat_risk_is_confirmed_once_and_not_after_enemy_is_defeated() -> None:
+    worker = SkillCheckResolutionWorker(
+        Mock(), Mock(spec=ResolutionLLM), MvpV1Ruleset(DiceEngine(SeededRandomSource(0))),
+        WorkerPhasePolicy(60, 3, 120, "unused"),
+        scenario_progressor=ScenarioProgressor(BUILTIN_SCENARIOS),
+    )
+    enemy_id = UUID(int=30)
+    attack = AttackIntent(kind="attack", target_ref="goblin", weapon_ref="iron_sword")
+
+    def combat_snapshot(flags: frozenset[str], hp: int) -> CanonicalSnapshot:
+        return CanonicalSnapshot(
+            campaign_id=UUID(int=1), state_version=0, characters=(
+                {"entity_id": enemy_id, "current_hp": hp},),
+            skills=(), equipment=(), inventory=(), skill_checks=(),
+            entities=({"id": enemy_id, "ref": "goblin", "kind": "npc",
+                       "archived_at": None},), scenario_run=_run(5, flags),
+        )
+
+    assert worker._risk_for_actions([attack], combat_snapshot(frozenset(), 4)) is not None
+    ongoing = combat_snapshot(frozenset({"combat_started"}), 4)
+    assert worker._risk_for_actions([attack], ongoing) is None
+    assert worker._risk_for_actions([attack], combat_snapshot(frozenset(), 0)) is None
+
+
 def test_v3_minor_setback_does_not_need_risk_confirmation_even_if_model_labels_it_major() -> None:
     worker = SkillCheckResolutionWorker(
         Mock(), Mock(spec=ResolutionLLM), MvpV1Ruleset(DiceEngine(SeededRandomSource(0))),
@@ -323,3 +377,54 @@ def test_worker_resolves_bench_shortcut_with_saved_ability() -> None:
     assert records[0].command.modifier == 5
     assert resolved[0].result.outcome == "success"
     assert update is not None and update.to_scene_id == run.scenes[3].id
+
+
+@pytest.mark.asyncio
+async def test_invalid_yard_scene_proposal_is_repaired_as_a_local_place(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    run = _run(1)
+    actor = UUID(int=10)
+    work = ResolutionWorkItem(
+        turn_id=UUID(int=11), campaign_id=run.campaign_id,
+        scene_id=run.scenes[0].id, principal_id=UUID(int=12), actor_id=actor,
+        actor_authorized=True, worker_epoch=1, max_actions=1,
+        expected_state_version=0, player_text="裏庭への崩れた壁の方に向かう",
+        recent_messages=(), route="mechanical",
+    )
+    snapshot = CanonicalSnapshot(
+        campaign_id=run.campaign_id, state_version=0,
+        characters=({"entity_id": actor, "current_hp": 10, "max_hp": 10,
+                     "defense": 12, "attack_bonus": 1},),
+        skills=(), equipment=(), inventory=(), skill_checks=(),
+        entities=({"id": actor, "ref": "hero", "label": "旅人", "kind": "pc",
+                   "archived_at": None},), scenario_run=run,
+        abilities=({"character_id": actor, "strength": 0, "agility": 0,
+                    "insight": 0, "presence": 0, "specialty_skill": "perception"},),
+    )
+    invalid = OpenActionIntent(kind="open_action", approach=work.player_text, check=None,
+                               success={"next_scene_ref": "yard"}, failure=None)
+    valid = OpenActionIntent(kind="open_action", approach=work.player_text, check=None,
+                             success={"facts": [{"fact_ref": "yard_wall", "kind": "place",
+                                                 "public_text": "崩れた塀の陰に移動した"}]},
+                             failure=None)
+    llm = Mock(spec=ResolutionLLM)
+    llm.extract_intent = AsyncMock(side_effect=[
+        ActionPlan(kind="action_plan", actions=[invalid]),
+        ActionPlan(kind="action_plan", actions=[valid]),
+    ])
+    reserve = AsyncMock(return_value=True)
+    monkeypatch.setattr(worker_module, "_reserve_call", reserve)
+    worker = SkillCheckResolutionWorker(
+        Mock(), llm, MvpV1Ruleset(DiceEngine(SeededRandomSource(0))),
+        WorkerPhasePolicy(60, 3, 120, "unused"),
+        scenario_progressor=ScenarioProgressor(BUILTIN_SCENARIOS),
+    )
+    committed = AsyncMock(return_value=True)
+    monkeypatch.setattr(worker, "_commit_mechanical", committed)
+
+    assert await worker._resolve_mechanical(work, snapshot)
+    assert reserve.await_count == 2
+    assert llm.extract_intent.await_count == 2
+    assert "Destination" in llm.extract_intent.await_args_list[1].args[0].proposal_feedback
+    assert committed.await_args.args[-1].facts[0].fact_ref == "yard_wall"

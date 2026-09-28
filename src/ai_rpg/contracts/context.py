@@ -53,3 +53,4 @@ class MechanicalInput(GMInput):
     ]
     supported_skill_refs: list[Ref]
     open_action_options: OpenActionOptions | None = None
+    proposal_feedback: ShortText | None = None
