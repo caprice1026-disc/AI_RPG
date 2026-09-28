@@ -7,7 +7,7 @@ import Feedback from './Feedback.vue'
 const game = createGame(), s = game.state
 const { canStart, canAct } = game
 const art = '/static/vue/art/ruined-chapel.png'
-const navOpen = ref(false), stateOpen = ref(false), actionInput = ref<HTMLTextAreaElement>()
+const navOpen = ref(false), stateOpen = ref(false)
 const timeline = ref<HTMLOListElement>()
 const start = reactive({ scenario_ref: '', preset_ref: '', player_name: '',
   ability_points: { strength: 0, agility: 0, insight: 0, presence: 0 }, specialty_skill: '' })
@@ -31,6 +31,26 @@ const riskPreview = computed(() => {
 const actions = computed(() => (adventure.value?.available_actions ?? []).map(action => ({ ...action,
   run: game.bindAction({ kind: 'scenario_action', action_ref: action.action_ref }, action.label),
 })))
+const inventory = computed(() => (player.value?.inventory ?? []).map(item => {
+  if (item.item_ref !== 'healing_potion') return { ...item, use: null }
+  const reason = adventure.value?.status === 'completed' ? 'この冒険は完了しました。'
+    : s.busy || s.tracking ? '行動を処理中です。'
+    : !s.stateReady || s.loading ? '冒険の状態を確認してください。'
+    : s.pending ? '前の要求の結果を確認してください。'
+    : !canAct.value ? (s.error || '現在は使用できません。')
+    : item.quantity <= 0 ? '残りがありません。'
+    : player.value!.current_hp >= player.value!.max_hp ? 'HPは満タンです。' : ''
+  const text = '回復ポーションを使って、自分の傷を回復する。'
+  return { ...item, use: { reason, run: game.bindAction({ kind: 'text', text }, text) } }
+}))
+const waitingPhase = computed(() => {
+  const turn = s.campaign?.latest_turn
+  if (!s.tracking || !turn) return null
+  if (turn.resolution_status === 'pending' || turn.resolution_status === 'resolving') return 'roll'
+  if (turn.resolution_status === 'committed' && turn.narration_status !== 'completed'
+    && turn.narration_status !== 'fallback') return 'narration'
+  return null
+})
 const names = computed(() => s.names)
 const loginError = ref('')
 const loginMessages: Record<string, string> = {
@@ -63,7 +83,6 @@ onMounted(() => {
 })
 onUnmounted(game.dispose)
 function sendText() { if (s.draft.trim()) void game.submit({ kind: 'text', text: s.draft }, s.draft) }
-function heal() { s.draft = '回復ポーションを使って、自分の傷を回復する。'; actionInput.value?.focus() }
 </script>
 
 <template>
@@ -115,6 +134,13 @@ function heal() { s.draft = '回復ポーションを使って、自分の傷を
         <button class="new-adventure" @click="game.goHome(); navOpen = false">＋ 新しい冒険</button>
         <p v-if="s.homeError" class="error" role="alert">{{ s.homeError }}</p>
         <button class="quiet" :disabled="s.homeLoading" @click="game.refreshHome()">一覧を更新</button>
+        <div class="nav-support">
+          <details class="guidance"><summary>遊び方と保存について</summary>
+            <p>候補から選ぶか、自由に入力できます。受け付けられた行動は自動保存され、再読み込みしても「続きから」で再開できます。結果が未確認なら「同じ要求を再送」で確認してください。</p>
+            <p>HPが減ったら持ち物の回復ポーションを使用できます。危険な場面では撤退も選べます。</p>
+          </details>
+          <Feedback />
+        </div>
       </nav>
     </aside>
 
@@ -157,11 +183,6 @@ function heal() { s.draft = '回復ポーションを使って、自分の傷を
           <button :disabled="s.busy || s.tracking" @click="game.retry(s.pending)">{{ s.pending.kind === 'start' && s.pending.adventure ? '作成済みの冒険を開く' : '同じ要求を再送' }}</button>
         </div>
         <p v-if="s.error" class="error" role="alert">{{ s.error }}</p>
-        <details class="guidance"><summary>遊び方と保存について</summary>
-          <p>候補から行動を選ぶか、自由に言葉を入力してください。受け付けられた行動は自動で保存されます。ページを閉じても「続きから」で再開できます。</p>
-          <p>戦闘ではHPが減ることがあります。持ち物で回復したり、危険なときは撤退する行動を選んだりできます。</p>
-        </details>
-        <Feedback />
       </div>
     </section>
 
@@ -183,6 +204,10 @@ function heal() { s.draft = '回復ポーションを使って、自分の傷を
               :hidden-choice-labels="record.turn.turn_id === s.campaign?.latest_turn?.turn_id ? actions.map(action => action.label) : []"
               @choice="(id, label) => game.submit({ kind: 'choice', choice_id: id }, label)" />
           </ol>
+          <div v-if="waitingPhase === 'roll'" class="dice-wait" role="status">
+            <span class="die-spinner" aria-hidden="true">?</span><span>ダイスで判定しています…</span>
+          </div>
+          <p v-else-if="waitingPhase === 'narration'" class="narration-wait" role="status">判定は保存済みです。GMが描写を準備しています…</p>
           <p v-if="!s.records.length && s.historyLoaded && !s.loading" class="hint">まだ行動の記録はありません。最初の一歩を選んでみましょう。</p>
           <div v-if="s.pending?.kind === 'turn' && s.pending.campaignId === s.selected.campaign_id && !s.pending.turnId" class="player-input">
             <span class="speaker">確認待ち</span>{{ s.pending.displayText }}
@@ -202,11 +227,6 @@ function heal() { s.draft = '回復ポーションを使って、自分の傷を
             <button :disabled="!canAct" @click="game.submit({ kind: 'confirm_action', proposal_id: riskPreview.proposal_id }, '確認して実行する')">この行動を実行</button>
             <button class="quiet" @click="dismissedRiskId = riskPreview.proposal_id">やめる</button>
           </section>
-          <details class="guidance"><summary>遊び方と保存について</summary>
-            <p>候補から選ぶか、自由に入力できます。受け付けられた行動は自動保存され、再読み込みしても再開できます。結果が未確認なら「同じ要求を再送」で確認してください。</p>
-            <p>HPが減ったら持ち物や回復を検討し、危険な場面では撤退も選べます。</p>
-          </details>
-          <Feedback />
         </div>
       </div>
       <form class="composer" @submit.prevent="sendText">
@@ -222,7 +242,7 @@ function heal() { s.draft = '回復ポーションを使って、自分の傷を
         <template v-if="adventure?.status !== 'completed'">
           <label class="visually-hidden" for="action-text">行動を入力</label>
           <div class="composer-row">
-            <textarea id="action-text" ref="actionInput" v-model="s.draft" rows="2" maxlength="8000" :disabled="!canAct"
+            <textarea id="action-text" v-model="s.draft" rows="2" maxlength="8000" :disabled="!canAct"
               placeholder="どのように行動しますか？" @keydown.ctrl.enter.prevent="sendText" />
             <button class="primary" type="submit" :disabled="!canAct || !s.draft.trim()">{{ s.busy || s.tracking ? '処理中…' : '送信' }}</button>
           </div>
@@ -253,9 +273,16 @@ function heal() { s.draft = '回復ポーションを使って、自分の傷を
             <meter :value="adventure.combat.current_hp" min="0" :max="Math.max(1, adventure.combat.max_hp)" aria-label="敵のHP" />
           </section>
           <section><h3>持ち物</h3>
-            <ul class="public-list"><li v-for="item in player.inventory" :key="item.item_id">{{ item.name }} × {{ item.quantity }}<small v-if="item.equipped">（装備中）</small></li></ul>
+            <ul class="public-list inventory"><li v-for="item in inventory" :key="`${s.selected.campaign_id}:${s.campaign?.state_version}:${item.item_id}`">
+              <div class="inventory-row">
+                <span>{{ item.name }} × {{ item.quantity }}<small v-if="item.equipped">（装備中）</small></span>
+                <button v-if="item.use" type="button" :disabled="!!item.use.reason"
+                  :aria-label="`${item.name}を使用する`" :aria-describedby="item.use.reason ? `item-reason-${item.item_id}` : undefined"
+                  @click="item.use.run">使用する</button>
+              </div>
+              <p v-if="item.use?.reason" :id="`item-reason-${item.item_id}`" class="hint">{{ item.use.reason }}</p>
+            </li></ul>
             <p v-if="!player.inventory.length" class="hint">持ち物はありません。</p>
-            <button v-if="adventure?.status !== 'completed' && player.inventory.some(item => item.name.includes('回復ポーション') && item.quantity > 0)" class="quiet" :disabled="!canAct" @click="heal">回復する行動を入力</button>
           </section>
         </template>
         <section><h3>発見したこと</h3>

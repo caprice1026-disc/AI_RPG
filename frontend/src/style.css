@@ -43,7 +43,9 @@ img { display: block; width: 100%; }
 .landing-copy > .quiet { display: flex; padding-left: 0; }
 .shell { max-width: 1600px; margin: auto; display: grid; grid-template-columns: 220px minmax(0, 1fr); min-height: calc(100dvh - 74px); }
 .shell.playing { grid-template-columns: 210px minmax(0, 1fr) 260px; }
-.adventure-rail { padding: 1.7rem 1rem; border-right: 1px solid var(--line); background: #0e1a23; }
+.adventure-rail { display: flex; flex-direction: column; min-width: 0; padding: 1.7rem 1rem; border-right: 1px solid var(--line); background: #0e1a23; }
+#adventure-nav { display: flex; flex: 1; flex-direction: column; }
+.nav-support { margin-top: auto; padding-top: 1rem; }
 .adventure-rail h2 { color: var(--brass); padding: 0 .5rem; margin-top: 0; }
 .adventure-list, .public-list { list-style: none; padding: 0; margin: 0; }
 .adventure-list li { margin-bottom: .5rem; }
@@ -81,6 +83,10 @@ input:disabled, select:disabled, textarea:disabled { opacity: .65; }
 .result-block { border-left: 2px solid var(--brass); padding: .5rem .9rem; margin: 1rem 0; background: #d6b77707; font-size: .87rem; }
 .result-block h3 { margin: 0 0 .4rem; color: var(--brass); font-size: .8rem; }
 .result-block p { margin: .2rem 0; white-space: pre-wrap; }
+.dice-wait { display: flex; align-items: center; gap: .8rem; margin: 1rem 0; color: var(--teal); font-size: .88rem; }
+.die-spinner { display: grid; place-items: center; width: 44px; height: 44px; flex: 0 0 44px; clip-path: polygon(50% 0, 93% 25%, 93% 75%, 50% 100%, 7% 75%, 7% 25%); background: var(--brass); color: #14202a; font-weight: 700; animation: dice-turn 1.2s ease-in-out infinite; }
+.narration-wait { margin: 1rem 0; color: var(--teal); font-size: .88rem; }
+@keyframes dice-turn { 50% { transform: rotate(180deg) scale(.87); } to { transform: rotate(360deg); } }
 .enemy-reaction { border-color: #af857b; }
 .enemy-reaction h3 { color: var(--danger); }
 .fallback { border-left: 2px solid var(--teal); padding-left: .8rem; }
@@ -114,6 +120,10 @@ meter::-moz-meter-bar { background: var(--teal); }
 .character-panel section { margin: 1.5rem 0 0; padding-top: .9rem; border-top: 1px solid var(--line); }
 .character-panel section h3 { margin: .5rem 0 .8rem; }
 .public-list li { margin: .6rem 0; font-size: .88rem; line-height: 1.8; }
+.inventory-row { display: flex; align-items: center; gap: .5rem; }
+.inventory-row > span { flex: 1; min-width: 0; }
+.inventory-row button { flex-shrink: 0; padding: .4rem .6rem; }
+.inventory .hint { margin: .3rem 0 0; }
 .combat .hint { margin-bottom: .5rem; }
 .guidance, .feedback { border-top: 1px solid var(--line); margin-top: 1.5rem; padding-top: 1rem; font-size: .85rem; color: var(--muted); }
 summary { cursor: pointer; padding: .5rem 0; min-height: 44px; color: #c9d2d0; }
@@ -159,4 +169,4 @@ details[open] summary { margin-bottom: .7rem; }
   .landing h1 { font-size: 1.9rem; }
   .lead { font-size: 1.1rem; }
 }
-@media (prefers-reduced-motion: reduce) { *, *::before, *::after { scroll-behavior: auto !important; } }
+@media (prefers-reduced-motion: reduce) { *, *::before, *::after { scroll-behavior: auto !important; animation: none !important; } }

@@ -9,6 +9,11 @@ async function render(api = server()) {
   const wrapper = mount(App); wrappers.push(wrapper); await flushPromises(); return wrapper
 }
 const button = (w: VueWrapper, label: string) => w.findAll('button').find(b => b.text() === label)!
+function healingCampaign() {
+  const c = campaign()
+  c.player!.inventory[0]!.item_ref = 'healing_potion'
+  return c
+}
 beforeEach(() => {
   localStorage.clear(); history.replaceState(null, '', '/')
   Object.defineProperty(HTMLElement.prototype, 'scrollIntoView', { configurable: true, writable: true, value: vi.fn() })
@@ -101,6 +106,54 @@ it('development note, resume, separate enemy reactions and safe text rendering',
   expect(w.text().match(/反撃で3のダメージ。/g)).toHaveLength(1)
   expect(w.text()).toContain('<img src=x onerror=alert(1)>'); expect(w.find('img[src="x"]').exists()).toBe(false)
   expect(result.facts).toEqual(['@hero は @goblin を攻撃した。'])
+})
+it('keeps guidance and feedback in the adventure rail rather than the story', async () => {
+  const w = await render()
+  const feedback = w.get('.feedback').element
+  expect(w.findAll('.guidance')).toHaveLength(1)
+  expect(w.findAll('.feedback')).toHaveLength(1)
+  expect(w.get('#adventure-nav .nav-support .feedback').element).toBe(feedback)
+  await w.get('#feedback-lost').setValue('入口で迷った')
+  await w.get('[data-adventure="campaign-a"]').trigger('click'); await flushPromises()
+  expect(w.find('.story .guidance, .story .feedback').exists()).toBe(false)
+  expect(w.get('.feedback').element).toBe(feedback)
+  expect((w.get('#feedback-lost').element as HTMLTextAreaElement).value).toBe('入口で迷った')
+})
+it('uses a healing potion beside its inventory row without changing the draft', async () => {
+  const c = healingCampaign()
+  c.player!.inventory.push({ item_id: 'sword', item_ref: 'iron_sword', name: '鉄の剣', quantity: 1, equipped: true })
+  const api = server((path, init) => path.endsWith('/state') ? response(c)
+    : init.method === 'POST' ? response(turn()) : undefined)
+  const w = await render(api); await w.get('[data-adventure="campaign-a"]').trigger('click'); await flushPromises()
+  const rows = w.findAll('.inventory li')
+  expect(rows[0]!.get('button').text()).toBe('使用する')
+  expect(rows[1]!.text()).toContain('鉄の剣 × 1（装備中）')
+  expect(rows[1]!.find('button').exists()).toBe(false)
+  expect(button(w, '回復する行動を入力')).toBeUndefined()
+  await w.get('#action-text').setValue('書きかけの行動')
+  await rows[0]!.get('button').trigger('click'); await flushPromises()
+  expect(JSON.parse(String(api.posts()[0]!.init.body)).content).toEqual({
+    kind: 'text', text: '回復ポーションを使って、自分の傷を回復する。',
+  })
+  expect((w.get('#action-text').element as HTMLTextAreaElement).value).toBe('書きかけの行動')
+})
+it('disables potion use with a reason when the player cannot benefit from it', async () => {
+  const c = healingCampaign()
+  c.player!.current_hp = c.player!.max_hp
+  const w = await render(server(path => path.endsWith('/state') ? response(c) : undefined))
+  await w.get('[data-adventure="campaign-a"]').trigger('click'); await flushPromises()
+  expect(w.get('.inventory button').attributes('disabled')).toBeDefined()
+  expect(w.get('.inventory .hint').text()).toContain('HPは満タン')
+})
+it('shows a rolling placeholder only until the result is committed', async () => {
+  Events.instances = []; vi.stubGlobal('EventSource', Events)
+  const api = server(path => path.endsWith('/state') ? response(campaign({ latest_turn: waiting() })) : undefined)
+  const w = await render(api); await w.get('[data-adventure="campaign-a"]').trigger('click'); await flushPromises()
+  expect(w.get('.dice-wait').text()).toContain('判定しています')
+  expect(w.get('.dice-wait').text()).not.toMatch(/\b\d{1,2}\b/)
+  Events.instances.at(-1)!.emit({ ...turn(), narration_status: 'generating', narration: null }); await flushPromises()
+  expect(w.find('.dice-wait').exists()).toBe(false)
+  expect(w.get('.narration-wait').text()).toContain('描写')
 })
 it.each(['victory', 'defeat', 'withdrawal'])('%s ending blocks actions, permits restart and feedback', async ending => {
   const c = campaign(); c.adventure!.status = 'completed'; c.adventure!.ending = { ending_ref: ending, title: ending, summary: '記録された結末' }
