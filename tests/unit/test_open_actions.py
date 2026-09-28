@@ -132,6 +132,74 @@ def test_minor_local_place_can_be_saved_without_a_major_scene_transition() -> No
     assert update.facts[0].fact_ref == "yard_wall"
 
 
+def test_free_bench_search_can_propose_a_new_route_on_either_outcome() -> None:
+    progressor = ScenarioProgressor(BUILTIN_SCENARIOS)
+    intent = OpenActionIntent(
+        kind="open_action", approach="礼拝堂の長椅子を全てどけて隠し扉を探す",
+        check={"ability": "strength", "skill_ref": "athletics", "difficulty": "normal"},
+        success={"facts": [{"fact_ref": "bench_floor_seam", "kind": "route",
+                            "public_text": "長椅子の下に床の継ぎ目を見つけた"}]},
+        failure={"facts": [{"fact_ref": "bench_heavy", "kind": "clue",
+                            "public_text": "長椅子は動かなかったが床に継ぎ目が見えた"}],
+                 "alert_delta": 1},
+    )
+    assert progressor.progress_open(_run(2), intent, "success").facts[0].fact_ref == (
+        "bench_floor_seam"
+    )
+    assert progressor.progress_open(_run(2), intent, "failure").facts[0].fact_ref == (
+        "bench_heavy"
+    )
+
+
+def test_impossible_space_trip_is_rejected_before_model_or_world_update() -> None:
+    progressor = ScenarioProgressor(BUILTIN_SCENARIOS)
+    with pytest.raises(ScenarioActionUnavailableError, match="探索領域"):
+        progressor.validate_player_request(_run(2), "崩れた壁から宇宙に向かう")
+    intent = OpenActionIntent(
+        kind="open_action", approach="崩れた壁から宇宙に向かう", check=None,
+        success={"facts": [{"fact_ref": "space_path", "kind": "place",
+                            "public_text": "宇宙へ移動した"}]}, failure=None,
+    )
+    with pytest.raises(ScenarioActionUnavailableError, match="探索領域"):
+        progressor.progress_open(_run(2), intent, "success")
+    progressor.validate_player_request(_run(2), "長椅子をどけ、宇宙を描いた古い壁画を探す")
+
+
+@pytest.mark.asyncio
+async def test_space_trip_spends_no_model_budget_or_dice(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    run = _run(2)
+    work = ResolutionWorkItem(
+        turn_id=UUID(int=11), campaign_id=run.campaign_id,
+        scene_id=run.scenes[1].id, principal_id=UUID(int=12), actor_id=UUID(int=10),
+        actor_authorized=True, worker_epoch=1, max_actions=1,
+        expected_state_version=0, player_text="崩れた壁から宇宙に向かう",
+        recent_messages=(), route="mechanical",
+    )
+    snapshot = CanonicalSnapshot(
+        campaign_id=run.campaign_id, state_version=0,
+        characters=(), skills=(), equipment=(), inventory=(), skill_checks=(),
+        entities=(), scenario_run=run,
+    )
+    llm = Mock(spec=ResolutionLLM)
+    llm.extract_intent = AsyncMock()
+    reserve = AsyncMock(return_value=True)
+    monkeypatch.setattr(worker_module, "_reserve_call", reserve)
+    worker = SkillCheckResolutionWorker(
+        Mock(), llm, MvpV1Ruleset(DiceEngine(SeededRandomSource(0))),
+        WorkerPhasePolicy(60, 3, 120, "unused"),
+        scenario_progressor=ScenarioProgressor(BUILTIN_SCENARIOS),
+    )
+    finalize = AsyncMock(return_value=True)
+    monkeypatch.setattr(worker, "_finalize_not_applied", finalize)
+
+    assert await worker._resolve_mechanical(work, snapshot)
+    assert "探索領域" in finalize.await_args.args[1]
+    llm.extract_intent.assert_not_awaited()
+    reserve.assert_not_awaited()
+
+
 def test_open_cannot_rewrite_goal_or_finish_without_required_flag() -> None:
     progressor = ScenarioProgressor(BUILTIN_SCENARIOS)
     base = {"kind": "open_action", "approach": "抜け道を探す", "check": None,

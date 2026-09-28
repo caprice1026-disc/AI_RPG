@@ -8,6 +8,7 @@ ACTION_CONTRACT = (
     "open_actionがない旧シナリオでは交渉・隠密・探索を登録済み技能のskill_checkに対応付ける。"
     "supported_action_typesにopen_actionがある場合、未登録でも成立する自由行動はopen_actionで提案できる。"
     "open_actionでは成功・失敗の効果を出目より先に提案し、主要地点・公開flag・地域の境界を守る。"
+    "探索領域の外や物理的に不可能な移動は、通れたことにせずclarification_requiredで説明する。"
     "next_scene_refはdestination_refsにある主要地点へ移るときだけ使う。"
     "裏庭・崩れた塀・覗き場所・長椅子の周囲など主要地点内の小場所へ向かう場合は、"
     "next_scene_refを作らず、factsにkind=placeの小場所を記録する。"

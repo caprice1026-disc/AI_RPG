@@ -111,6 +111,7 @@ class BoundedWorld(Contract):
     outside_ending_ref: Ref
     protected_facts: tuple[ProtectedFact, ...] = Field(min_length=1)
     protected_terms: tuple[ShortText, ...] = ()
+    impossible_destinations: tuple[ShortText, ...] = ()
 
 
 class ScenarioDefinition(Contract):

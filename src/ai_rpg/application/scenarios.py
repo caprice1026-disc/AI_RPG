@@ -1,5 +1,6 @@
 """Scenario定義と保存済みrunから進行を評価する純粋Application component。"""
 
+import re
 from dataclasses import dataclass
 from typing import Literal, TypeAlias
 
@@ -62,6 +63,18 @@ def _action_is_available(action: ScenarioActionBinding, flags: frozenset[str]) -
     return set(action.required_flags) <= flags and flags.isdisjoint(action.disabled_flags)
 
 
+def _impossible_trip(text: str, destinations: tuple[str, ...]) -> bool:
+    # ponytail: catches explicit impossible travel, not every metaphor or paraphrase;
+    # use semantic review only if playtests show this narrow guard is insufficient.
+    return any(
+        re.search(
+            rf"{re.escape(destination)}(?:へ|に|まで).{{0,6}}(?:向か|行|移動|飛|ワープ)", text
+        )
+        is not None
+        for destination in destinations
+    )
+
+
 class ScenarioProgressor:
     def __init__(self, catalog: ScenarioCatalog) -> None:
         self._catalog = catalog
@@ -71,6 +84,13 @@ class ScenarioProgressor:
             return self._catalog.get(snapshot.scenario_ref, snapshot.scenario_version)
         except KeyError as error:
             raise ScenarioStateError("Scenario定義と保存versionが一致しません") from error
+
+    def validate_player_request(self, snapshot: ScenarioRunSnapshot, text: str) -> None:
+        definition = self.definition_for(snapshot)
+        if definition.world is not None and _impossible_trip(
+            text, definition.world.impossible_destinations
+        ):
+            raise ScenarioActionUnavailableError("探索領域の外へ移動することはできません")
 
     def bind_registered_action(
         self, snapshot: ScenarioRunSnapshot, action_ref: str
@@ -229,6 +249,7 @@ class ScenarioProgressor:
         definition, scene, active = self._current_scene(snapshot)
         if definition.world is None or definition.ruleset_ref != "mvp_v2":
             raise ScenarioActionUnavailableError("This scenario does not accept open actions")
+        self.validate_player_request(snapshot, intent.approach)
         if intent.target_fact_ref is not None:
             target_fact = next(
                 (fact for fact in snapshot.facts if fact.fact_ref == intent.target_fact_ref), None
@@ -285,6 +306,7 @@ class ScenarioProgressor:
         if len(proposed_refs) != len(set(proposed_refs)):
             raise ScenarioActionUnavailableError("Duplicate generated fact references")
         for fact in effect.facts:
+            self.validate_player_request(snapshot, fact.public_text)
             if fact.fact_ref in {item.fact_ref for item in definition.world.protected_facts}:
                 raise ScenarioActionUnavailableError("Generated fact reference is protected")
             if any(term.casefold() in fact.public_text.casefold()

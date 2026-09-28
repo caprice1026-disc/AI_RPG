@@ -289,6 +289,17 @@ class SkillCheckResolutionWorker:
             elif work.selected_action_ref is not None:
                 intents = [self._registered_intent(work, snapshot)]
             else:
+                if (snapshot.scenario_run is not None and self._scenario_progressor is not None
+                        and snapshot.scenario_run.scenario_version >= 3):
+                    try:
+                        self._scenario_progressor.validate_player_request(
+                            snapshot.scenario_run, work.player_text
+                        )
+                    except ScenarioActionUnavailableError:
+                        return await self._finalize_not_applied(
+                            work, "この冒険の探索領域の外へは移動できません。"
+                            "礼拝堂と周辺で行動するか、撤退を選んでください。",
+                        )
                 context = self._mechanical_input(work, snapshot)
                 for attempt in range(2):
                     async with asyncio.timeout(self._policy.request_timeout_seconds):
