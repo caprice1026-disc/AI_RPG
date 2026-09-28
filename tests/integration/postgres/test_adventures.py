@@ -377,6 +377,13 @@ def test_v3_risk_preview_waits_for_confirm_without_recalling_model(database: Eng
                 "actor_id": created["actor_id"],
                 "content": {"kind": "confirm_action", "proposal_id": preview["proposal_id"]},
             }
+            outsider = replace(PRINCIPAL, principal_id=uuid4())
+            async with client_for(factory, outsider) as other_client:
+                forbidden = await other_client.post(base + "/turns", json=confirm_body)
+                assert forbidden.status_code == 403
+            unchanged = (await client.get(base + "/state")).json()
+            assert unchanged["state_version"] == 0
+            assert unchanged["adventure"]["elapsed_actions"] == 0
             concurrent = await asyncio.gather(
                 *(client.post(base + "/turns", json=confirm_body) for _ in range(2))
             )

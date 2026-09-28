@@ -18,7 +18,7 @@ The game UI and scenarios are in Japanese; this English README does not add an E
 Fake LLM mode lets you try the suggested actions without an API key. Use a real model such as Gemini for open-ended conversation and varied wording.
 
 This is a short-adventure MVP. The target duration of 20–30 minutes, conversation quality, and enjoyment still require human playtesting.
-[Latest verification record (Japanese)](docs/verification-20260926.md) distinguishes automated tests from agent-operated browser checks.
+[Latest verification record (Japanese)](docs/verification-20260928.md) distinguishes automated tests from agent-operated browser checks.
 
 ## Quickstart: play locally with Fake LLM
 

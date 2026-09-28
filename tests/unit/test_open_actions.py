@@ -15,7 +15,7 @@ from ai_rpg.application.ports import (
     ScenarioSceneSnapshot,
 )
 from ai_rpg.application.ports.llm import ResolutionLLM
-from ai_rpg.application.ports.repositories import ScenarioFact
+from ai_rpg.application.ports.repositories import ScenarioFact, ScenarioProgressUpdate
 from ai_rpg.application.scenarios import ScenarioActionUnavailableError, ScenarioProgressor
 from ai_rpg.application.workers import (
     ResolutionInputError,
@@ -130,6 +130,20 @@ def test_minor_failure_at_max_alert_still_allows_the_action() -> None:
     assert progressor.progress_open(replace(run, alert_level=0), calm,
                                     "success").alert_delta == 0
     assert progressor.progress_open(run, calm, "success").alert_delta == -1
+
+
+def test_alert_change_is_available_to_the_result_narrator() -> None:
+    run = replace(_run(), alert_level=2)
+    worker = SkillCheckResolutionWorker(
+        Mock(), Mock(spec=ResolutionLLM), MvpV1Ruleset(DiceEngine(SeededRandomSource(0))),
+        WorkerPhasePolicy(60, 3, 120, "unused"),
+        scenario_progressor=ScenarioProgressor(BUILTIN_SCENARIOS),
+    )
+    update = ScenarioProgressUpdate(
+        from_scene_id=run.scenes[1].id, to_scene_id=None,
+        add_flags=(), ending_ref=None, elapsed_actions=1, alert_delta=1,
+    )
+    assert "警戒が3" in worker._scenario_public_state_after(run, update).content
 
 
 def test_minor_local_place_can_be_saved_without_a_major_scene_transition() -> None:

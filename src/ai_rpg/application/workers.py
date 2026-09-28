@@ -1549,6 +1549,8 @@ class SkillCheckResolutionWorker:
         parts.extend(
             flag.public_fact for flag in definition.flags if flag.flag_ref in update.add_flags
         )
+        if update.alert_delta:
+            parts.append(f"警戒が{run.alert_level + update.alert_delta}になった。")
         return ContextFragment(
             source=source,
             trust_level="trusted",
