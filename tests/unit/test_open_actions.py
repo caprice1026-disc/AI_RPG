@@ -212,6 +212,32 @@ def test_search_does_not_move_to_the_passage_without_player_travel_intent() -> N
     progressor.validate_transition_request("隠し扉から通路へ進む", proposed_travel)
 
 
+@pytest.mark.parametrize("player_text", [
+    "裏庭へ回り、高窓から礼拝堂に侵入してみる",
+    "裏庭を回って高窓を探し、そこから礼拝堂へ侵入してみる",
+    "裏庭から高窓をよじ登って礼拝堂へ忍び込む",
+    "高窓から礼拝堂の中へ入り込む",
+])
+def test_explicit_window_intrusion_allows_entrance_to_hall_transition(player_text: str) -> None:
+    progressor = ScenarioProgressor(BUILTIN_SCENARIOS)
+    intent = OpenActionIntent(
+        kind="open_action", approach="高窓から礼拝堂へ侵入する", check=None,
+        success={"next_scene_ref": "hall"}, failure=None,
+    )
+    progressor.validate_transition_request(player_text, intent)
+    assert progressor.progress_open(_run(1), intent, "success").to_scene_id == UUID(int=3)
+
+
+def test_looking_for_an_intrusion_route_does_not_move_the_player() -> None:
+    intent = OpenActionIntent(
+        kind="open_action", approach="高窓から礼拝堂へ侵入する", check=None,
+        success={"next_scene_ref": "hall"}, failure=None,
+    )
+    for text in ("高窓からの侵入経路を探す", "高窓に忍び込み口があるか調べる"):
+        with pytest.raises(ScenarioActionUnavailableError, match="移動"):
+            ScenarioProgressor.validate_transition_request(text, intent)
+
+
 def test_impossible_space_trip_is_rejected_before_model_or_world_update() -> None:
     progressor = ScenarioProgressor(BUILTIN_SCENARIOS)
     with pytest.raises(ScenarioActionUnavailableError, match="探索領域"):
