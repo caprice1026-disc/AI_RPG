@@ -75,6 +75,21 @@ def _impossible_trip(text: str, destinations: tuple[str, ...]) -> bool:
     )
 
 
+def _contradicts_chapel_lore(text: str, protected_terms: tuple[str, ...]) -> bool:
+    # ponytail: narrow v3 chapel claims, not general semantic consistency;
+    # grow the evaluated examples before replacing this with a broader policy.
+    if not any(term in text for term in protected_terms):
+        return False
+    patterns = (
+        r"(?:最奥の間|奥の部屋|祭壇).{0,25}(?:空|誰も.{0,5}(?:いな|おらず)|何も.{0,8}(?:ない|置かれていな)|品物も存在しない)",
+        r"(?:聖印|依頼品).{0,20}(?:存在しない|消えた|奪われた|もうない)",
+        r"(?:聖印|依頼品).{0,25}(?:広間|長椅子|記録庫|裏庭).{0,10}(?:ある|置かれ|隠され)",
+        r"(?:広間|長椅子|記録庫|裏庭).{0,12}(?:聖印|依頼品).{0,12}(?:ある|置かれ|隠され)",
+        r"(?:ゴブリン|守衛|見張り).{0,40}(?:いない|おらず|立ち去|見張りをやめ|理由を聞かず)",
+    )
+    return any(re.search(pattern, text) for pattern in patterns)
+
+
 class ScenarioProgressor:
     def __init__(self, catalog: ScenarioCatalog) -> None:
         self._catalog = catalog
@@ -91,6 +106,23 @@ class ScenarioProgressor:
             text, definition.world.impossible_destinations
         ):
             raise ScenarioActionUnavailableError("探索領域の外へ移動することはできません")
+
+    @staticmethod
+    def validate_transition_request(player_text: str, intent: OpenActionIntent) -> None:
+        effects = (intent.success, intent.failure)
+        if not any(effect is not None and effect.next_scene_ref is not None
+                   for effect in effects):
+            return
+        if re.search(
+            r"(?:へ|に|から|を).{0,12}(?:向か(?:う|った|いたい)|行(?:く|った|きたい)"
+            r"|入(?:る|った|りたい)|進(?:む|んだ|んで|みたい)|戻(?:る|った|りたい)"
+            r"|抜け(?:る|たい)|移動(?:する|したい)|渡(?:る|った|りたい)"
+            r"|登(?:る|った|りたい)|通(?:る|った|りたい))",
+            player_text,
+        ) is None:
+            raise ScenarioActionUnavailableError(
+                "主要地点の移動はプレイヤーが明示した場合だけ確定できます"
+            )
 
     def bind_registered_action(
         self, snapshot: ScenarioRunSnapshot, action_ref: str
@@ -309,9 +341,11 @@ class ScenarioProgressor:
             self.validate_player_request(snapshot, fact.public_text)
             if fact.fact_ref in {item.fact_ref for item in definition.world.protected_facts}:
                 raise ScenarioActionUnavailableError("Generated fact reference is protected")
-            if any(term.casefold() in fact.public_text.casefold()
-                   for term in definition.world.protected_terms):
-                raise ScenarioActionUnavailableError("A proposed fact mentions protected lore")
+            if (definition.scenario_ref == "ruined_chapel" and definition.version == 3
+                    and _contradicts_chapel_lore(
+                        fact.public_text, definition.world.protected_terms
+                    )):
+                raise ScenarioActionUnavailableError("A proposed fact contradicts protected lore")
             previous = next((value for value in snapshot.facts
                              if value.fact_ref == fact.fact_ref), None)
             if previous is not None and (

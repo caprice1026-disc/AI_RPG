@@ -3,6 +3,8 @@
 import asyncio
 import json
 import os
+import subprocess
+import sys
 from collections.abc import AsyncIterator, Iterator
 from contextlib import asynccontextmanager
 from dataclasses import replace
@@ -15,6 +17,7 @@ from pydantic_ai.messages import ModelResponse, TextPart
 from pydantic_ai.models.function import FunctionModel
 from sqlalchemy import Engine, create_engine, event, text
 from test_migrations import (
+    ROOT,
     _guard_empty_database,
     _postgres_sessions,
     _run_alembic,
@@ -106,6 +109,39 @@ def test_v3_creation_persists_ruleset_and_abilities(database: Engine) -> None:
         runner.run(run())
 
 
+def test_v3_downgrade_refuses_to_drop_saved_character_build(database: Engine) -> None:
+    async def create() -> str:
+        async with _postgres_sessions(URL) as factory, client_for(factory) as client:
+            response = await client.post("/adventures", json=payload(
+                scenario_version=3,
+                ability_points={"strength": 0, "agility": 1, "insight": 1, "presence": 0},
+                specialty_skill="perception",
+            ))
+            assert response.status_code == 201, response.text
+            return response.json()["campaign_id"]
+
+    with asyncio.Runner(loop_factory=asyncio.SelectorEventLoop) as runner:
+        campaign_id = runner.run(create())
+    assert URL
+    downgrade = subprocess.run(
+        [sys.executable, "-m", "alembic", "-x", f"url={URL}", "downgrade",
+         "0013_browser_sessions"],
+        cwd=ROOT, env={**os.environ, "AIRPG_DATABASE_URL": URL},
+        capture_output=True, text=True, check=False,
+    )
+    assert downgrade.returncode != 0
+    assert "cannot downgrade: bounded scenario state still exists" in (
+        downgrade.stdout + downgrade.stderr
+    )
+    with database.connect() as connection:
+        assert connection.scalar(text("SELECT version_num FROM alembic_version")) == (
+            "0014_bounded_open_scenario"
+        )
+        assert connection.scalar(text(
+            "SELECT count(*) FROM mvp_character_abilities WHERE campaign_id=:id"
+        ), {"id": campaign_id}) == 1
+
+
 def test_v3_open_action_persists_shortcut_pressure_and_fact(database: Engine) -> None:
     async def run() -> None:
         async with _postgres_sessions(URL) as factory, client_for(factory) as client:
@@ -137,7 +173,7 @@ def test_v3_open_action_persists_shortcut_pressure_and_fact(database: Engine) ->
             first = await client.post(base + "/turns", json={
                 "request_id": str(uuid4()), "expected_state_version": 1,
                 "actor_id": created["actor_id"],
-                "content": {"kind": "text", "text": "長椅子を動かして高窓への道を作る"},
+                "content": {"kind": "text", "text": "長椅子を動かして高窓から通路へ進む"},
             })
             assert first.status_code == 202, first.text
             fake = ScriptedFakeLLM([{"kind": "action_plan", "actions": [{
@@ -168,6 +204,137 @@ def test_v3_open_action_persists_shortcut_pressure_and_fact(database: Engine) ->
             }]
             assert fake.request_count == 1
             assert not await worker.run_once(UUID(first.json()["turn_id"]))
+
+    with asyncio.Runner(loop_factory=asyncio.SelectorEventLoop) as runner:
+        runner.run(run())
+
+
+def test_v3_search_repairs_unrequested_travel_and_stays_in_hall(database: Engine) -> None:
+    async def run() -> None:
+        async with _postgres_sessions(URL) as factory, client_for(factory) as client:
+            created = (await client.post(
+                "/adventures", json=payload(
+                    scenario_version=3,
+                    ability_points={"strength": 0, "agility": 1, "insight": 1, "presence": 0},
+                    specialty_skill="perception",
+                )
+            )).json()
+            base = f"/campaigns/{created['campaign_id']}"
+            uow = lambda: PostgresUnitOfWork(factory)  # noqa: E731
+            worker = SkillCheckResolutionWorker(
+                uow, ScriptedFakeLLM([]),
+                MvpV1Ruleset(DiceEngine(_SequenceRandom([10]))),
+                WorkerPhasePolicy(60, 3, 120, "fake"),
+                scenario_progressor=ScenarioProgressor(BUILTIN_SCENARIOS),
+            )
+            entered = (await client.post(base + "/turns", json={
+                "request_id": str(uuid4()), "expected_state_version": 0,
+                "actor_id": created["actor_id"],
+                "content": {"kind": "scenario_action", "action_ref": "enter_chapel"},
+            })).json()
+            assert await worker.run_once(UUID(entered["turn_id"]))
+            narrator = NarrationWorker(
+                uow, ScriptedFakeLLM([{"narration": "広間に入った。", "choices": []}]),
+                WorkerPhasePolicy(60, 3, 120, "fake"),
+            )
+            assert await narrator.run_once(UUID(entered["turn_id"]))
+            asked = (await client.post(base + "/turns", json={
+                "request_id": str(uuid4()), "expected_state_version": 1,
+                "actor_id": created["actor_id"],
+                "content": {"kind": "text", "text": "礼拝堂の長椅子を全てどけて隠し扉を探す"},
+            })).json()
+            fake = ScriptedFakeLLM([
+                {"kind": "action_plan", "actions": [{
+                    "kind": "open_action", "approach": "長椅子の下を探す", "check": None,
+                    "success": {"next_scene_ref": "passage"}, "failure": None,
+                }]},
+                {"kind": "action_plan", "actions": [{
+                    "kind": "open_action", "approach": "長椅子の下を探す", "check": None,
+                    "success": {"facts": [{
+                        "fact_ref": "bench_floor_seam", "kind": "route",
+                        "public_text": "長椅子の下に床の継ぎ目を見つけた",
+                    }]}, "failure": None,
+                }]},
+            ])
+            repair_worker = SkillCheckResolutionWorker(
+                uow, fake, MvpV1Ruleset(DiceEngine(_SequenceRandom([10]))),
+                WorkerPhasePolicy(60, 3, 120, "fake"),
+                scenario_progressor=ScenarioProgressor(BUILTIN_SCENARIOS),
+            )
+            assert await repair_worker.run_once(UUID(asked["turn_id"]))
+            assert fake.request_count == 2
+            state = (await client.get(base + "/state")).json()
+            assert state["state_version"] == 2
+            assert state["adventure"]["current_scene"]["scene_ref"] == "hall"
+            assert "長椅子の下に床の継ぎ目を見つけた" in state["adventure"]["discovered_facts"]
+            with database.connect() as connection:
+                calls = connection.scalar(text("SELECT llm_call_count FROM turns WHERE id=:id"),
+                                          {"id": asked["turn_id"]})
+            assert calls == 2
+
+    with asyncio.Runner(loop_factory=asyncio.SelectorEventLoop) as runner:
+        runner.run(run())
+
+
+def test_v3_event_failure_rolls_back_generated_fact_alert_and_time(database: Engine) -> None:
+    async def run() -> None:
+        async with _postgres_sessions(URL) as factory, client_for(factory) as client:
+            created = (await client.post("/adventures", json=payload(
+                scenario_version=3,
+                ability_points={"strength": 0, "agility": 1, "insight": 1, "presence": 0},
+                specialty_skill="perception",
+            ))).json()
+            base = f"/campaigns/{created['campaign_id']}"
+            asked = (await client.post(base + "/turns", json={
+                "request_id": str(uuid4()), "expected_state_version": 0,
+                "actor_id": created["actor_id"],
+                "content": {"kind": "text", "text": "崩れた塀を調べる"},
+            })).json()
+            fake = ScriptedFakeLLM([{"kind": "action_plan", "actions": [{
+                "kind": "open_action", "approach": "崩れた塀を調べる", "check": None,
+                "success": {"alert_delta": 1, "facts": [{
+                    "fact_ref": "wall_gap", "kind": "route",
+                    "public_text": "崩れた塀に狭い隙間を見つけた",
+                }]}, "failure": None,
+            }]}])
+            worker = SkillCheckResolutionWorker(
+                lambda: PostgresUnitOfWork(factory), fake,
+                MvpV1Ruleset(DiceEngine(_SequenceRandom([]))),
+                WorkerPhasePolicy(60, 3, 120, "fake"),
+                scenario_progressor=ScenarioProgressor(BUILTIN_SCENARIOS),
+            )
+            engine = factory.kw["bind"].sync_engine
+
+            def fail_event(
+                conn: object, cursor: object, statement: str, *args: object
+            ) -> None:
+                if statement.lstrip().lower().startswith("insert into events"):
+                    raise RuntimeError("injected event failure")
+
+            event.listen(engine, "before_cursor_execute", fail_event)
+            try:
+                with pytest.raises(RuntimeError, match="injected event failure"):
+                    await worker.run_once(UUID(asked["turn_id"]))
+            finally:
+                event.remove(engine, "before_cursor_execute", fail_event)
+            with database.connect() as connection:
+                campaign = connection.execute(text(
+                    "SELECT state_version,event_sequence FROM campaigns WHERE id=:id"
+                ), {"id": created["campaign_id"]}).one()
+                progress = connection.execute(text(
+                    "SELECT elapsed_actions,alert_level FROM mvp_scenario_runs "
+                    "WHERE campaign_id=:id"
+                ), {"id": created["campaign_id"]}).one()
+                for table in ("actions", "mvp_scenario_facts"):
+                    assert connection.scalar(text(
+                        f"SELECT count(*) FROM {table} WHERE campaign_id=:id"
+                    ), {"id": created["campaign_id"]}) == 0
+                status = connection.scalar(text(
+                    "SELECT resolution_status FROM turns WHERE id=:id"
+                ), {"id": asked["turn_id"]})
+            assert tuple(campaign) == (0, 0)
+            assert tuple(progress) == (0, 0)
+            assert status == "resolving"
 
     with asyncio.Runner(loop_factory=asyncio.SelectorEventLoop) as runner:
         runner.run(run())
@@ -210,8 +377,12 @@ def test_v3_risk_preview_waits_for_confirm_without_recalling_model(database: Eng
                 "actor_id": created["actor_id"],
                 "content": {"kind": "confirm_action", "proposal_id": preview["proposal_id"]},
             }
-            confirmed = await client.post(base + "/turns", json=confirm_body)
-            assert confirmed.status_code == 202, confirmed.text
+            concurrent = await asyncio.gather(
+                *(client.post(base + "/turns", json=confirm_body) for _ in range(2))
+            )
+            assert all(reply.status_code == 202 for reply in concurrent)
+            assert concurrent[0].json() == concurrent[1].json()
+            confirmed = concurrent[0]
             assert await worker.run_once(UUID(confirmed.json()["turn_id"]))
             assert (await client.post(base + "/turns", json=confirm_body)).json() == (
                 await client.get(base + f"/turns/{confirmed.json()['turn_id']}")
@@ -221,6 +392,64 @@ def test_v3_risk_preview_waits_for_confirm_without_recalling_model(database: Eng
             assert after["adventure"]["status"] == "completed"
             assert after["adventure"]["ending"]["ending_ref"] == "retreated"
             assert fake.request_count == 1
+
+    with asyncio.Runner(loop_factory=asyncio.SelectorEventLoop) as runner:
+        runner.run(run())
+
+
+def test_v3_risk_preview_reopens_without_acting_and_stales_after_world_change(
+    database: Engine,
+) -> None:
+    async def run() -> None:
+        async with _postgres_sessions(URL) as factory, client_for(factory) as client:
+            created = (await client.post("/adventures", json=payload(
+                scenario_version=3, ability_points={"strength": 0, "agility": 1,
+                                                    "insight": 1, "presence": 0},
+                specialty_skill="perception",
+            ))).json()
+            base = f"/campaigns/{created['campaign_id']}"
+            worker = SkillCheckResolutionWorker(
+                lambda: PostgresUnitOfWork(factory), ScriptedFakeLLM([]),
+                MvpV1Ruleset(DiceEngine(_SequenceRandom([]))),
+                WorkerPhasePolicy(60, 3, 120, "fake"),
+                scenario_progressor=ScenarioProgressor(BUILTIN_SCENARIOS),
+            )
+            preview_turn = await client.post(base + "/turns", json={
+                "request_id": str(uuid4()), "expected_state_version": 0,
+                "actor_id": created["actor_id"],
+                "content": {"kind": "scenario_action", "action_ref": "leave_entrance"},
+            })
+            assert preview_turn.status_code == 202, preview_turn.text
+            assert await worker.run_once(UUID(preview_turn.json()["turn_id"]))
+            before = (await client.get(base + "/state")).json()
+            proposal_id = before["latest_turn"]["risk_preview"]["proposal_id"]
+            assert before["state_version"] == 0
+            assert before["adventure"]["elapsed_actions"] == 0
+            assert before["adventure"]["alert_level"] == 0
+            hp = before["player"]["current_hp"]
+            async with client_for(factory) as reopened:
+                again = (await reopened.get(base + "/state")).json()
+                assert again["latest_turn"]["risk_preview"]["proposal_id"] == proposal_id
+                assert again["state_version"] == 0
+
+            advance = await client.post(base + "/turns", json={
+                "request_id": str(uuid4()), "expected_state_version": 0,
+                "actor_id": created["actor_id"],
+                "content": {"kind": "scenario_action", "action_ref": "enter_chapel"},
+            })
+            assert advance.status_code == 202, advance.text
+            assert await worker.run_once(UUID(advance.json()["turn_id"]))
+            stale = await client.post(base + "/turns", json={
+                "request_id": str(uuid4()), "expected_state_version": 1,
+                "actor_id": created["actor_id"],
+                "content": {"kind": "confirm_action", "proposal_id": proposal_id},
+            })
+            assert stale.status_code == 409, stale.text
+            after = (await client.get(base + "/state")).json()
+            assert after["state_version"] == 1
+            assert after["adventure"]["elapsed_actions"] == 1
+            assert after["adventure"]["alert_level"] == 0
+            assert after["player"]["current_hp"] == hp
 
     with asyncio.Runner(loop_factory=asyncio.SelectorEventLoop) as runner:
         runner.run(run())
@@ -328,6 +557,72 @@ def test_v3_attack_risk_confirmation_reuses_registered_intent(database: Engine) 
             assert after["latest_turn"]["resolution_status"] == "committed"
             assert after["latest_turn"]["action_results"]
             assert fake.request_count == 0
+
+    with asyncio.Runner(loop_factory=asyncio.SelectorEventLoop) as runner:
+        runner.run(run())
+
+
+def test_v3_improvised_attack_repairs_unregistered_weapon(database: Engine) -> None:
+    async def run() -> None:
+        async with _postgres_sessions(URL) as factory, client_for(factory) as client:
+            created = (await client.post("/adventures", json=payload(
+                scenario_version=3,
+                ability_points={"strength": 0, "agility": 1, "insight": 1, "presence": 0},
+                specialty_skill="acrobatics",
+            ))).json()
+            base = f"/campaigns/{created['campaign_id']}"
+            uow = lambda: PostgresUnitOfWork(factory)  # noqa: E731
+            fake = ScriptedFakeLLM([
+                {"kind": "action_plan", "actions": [{
+                    "kind": "attack", "target_ref": "goblin", "weapon_ref": "bench",
+                }]},
+                {"kind": "action_plan", "actions": [{
+                    "kind": "attack", "target_ref": "goblin", "weapon_ref": None,
+                }]},
+            ])
+            worker = SkillCheckResolutionWorker(
+                uow, fake, MvpV1Ruleset(DiceEngine(_SequenceRandom([20, 1, 1]))),
+                WorkerPhasePolicy(60, 3, 120, "fake"),
+                scenario_progressor=ScenarioProgressor(BUILTIN_SCENARIOS),
+            )
+            narrator = NarrationWorker(
+                uow, DevelopmentFakeLLM(), WorkerPhasePolicy(60, 3, 120, "fake"),
+            )
+            for version, action_ref in enumerate((
+                "enter_chapel", "walk_to_archive", "walk_to_passage", "approach_sanctum",
+            )):
+                entered = (await client.post(base + "/turns", json={
+                    "request_id": str(uuid4()), "expected_state_version": version,
+                    "actor_id": created["actor_id"],
+                    "content": {"kind": "scenario_action", "action_ref": action_ref},
+                })).json()
+                turn_id = UUID(entered["turn_id"])
+                assert await worker.run_once(turn_id)
+                assert await narrator.run_once(turn_id)
+            asked = (await client.post(base + "/turns", json={
+                "request_id": str(uuid4()), "expected_state_version": 4,
+                "actor_id": created["actor_id"],
+                "content": {"kind": "text", "text": "傾いた長椅子をゴブリンに投げつける"},
+            })).json()
+            assert await worker.run_once(UUID(asked["turn_id"]))
+            preview = (await client.get(base + "/state")).json()["latest_turn"]["risk_preview"]
+            assert preview is not None
+            assert fake.request_count == 2
+            confirmed = (await client.post(base + "/turns", json={
+                "request_id": str(uuid4()), "expected_state_version": 4,
+                "actor_id": created["actor_id"],
+                "content": {"kind": "confirm_action", "proposal_id": preview["proposal_id"]},
+            })).json()
+            assert await worker.run_once(UUID(confirmed["turn_id"]))
+            state = (await client.get(base + "/state")).json()
+            assert state["latest_turn"]["resolution_status"] == "committed"
+            assert state["latest_turn"]["action_results"][0]["result"]["kind"] == "applied"
+            with database.connect() as connection:
+                action_kind = connection.scalar(text(
+                    "SELECT kind FROM actions WHERE turn_id=:id"
+                ), {"id": confirmed["turn_id"]})
+            assert action_kind == "attack"
+            assert fake.request_count == 2
 
     with asyncio.Runner(loop_factory=asyncio.SelectorEventLoop) as runner:
         runner.run(run())

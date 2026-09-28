@@ -320,9 +320,7 @@ class SkillCheckResolutionWorker:
                         preflight = self._preflight_actions(work, snapshot, intents)
                     except ResolutionInputError as error:
                         if (attempt == 0 and snapshot.scenario_run is not None
-                                and snapshot.scenario_run.scenario_version >= 3
-                                and any(isinstance(item, OpenActionIntent) for item in intents)
-                                and isinstance(error.__cause__, ScenarioActionUnavailableError)):
+                                and snapshot.scenario_run.scenario_version >= 3):
                             context = context.model_copy(update={
                                 "proposal_feedback": str(error)[:200],
                             })
@@ -1079,6 +1077,10 @@ class SkillCheckResolutionWorker:
                 if snapshot.scenario_run is None or self._scenario_progressor is None:
                     raise ResolutionInputError("Open action requires a scenario")
                 try:
+                    if work.confirmed_proposal_id is None:
+                        self._scenario_progressor.validate_transition_request(
+                            work.player_text, raw_intent
+                        )
                     self._scenario_progressor.progress_open(snapshot.scenario_run, raw_intent,
                                                            "success")
                     if raw_intent.check is not None:

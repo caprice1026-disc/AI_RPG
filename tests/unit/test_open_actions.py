@@ -17,7 +17,11 @@ from ai_rpg.application.ports import (
 from ai_rpg.application.ports.llm import ResolutionLLM
 from ai_rpg.application.ports.repositories import ScenarioFact
 from ai_rpg.application.scenarios import ScenarioActionUnavailableError, ScenarioProgressor
-from ai_rpg.application.workers import SkillCheckResolutionWorker, WorkerPhasePolicy
+from ai_rpg.application.workers import (
+    ResolutionInputError,
+    SkillCheckResolutionWorker,
+    WorkerPhasePolicy,
+)
 from ai_rpg.contracts.llm_decisions import (
     ActionPlan,
     AttackIntent,
@@ -117,6 +121,15 @@ def test_minor_failure_at_max_alert_still_allows_the_action() -> None:
     )
     assert progressor.progress_open(run, intent, "success").alert_delta == 0
     assert progressor.progress_open(run, intent, "failure").alert_delta == 0
+    assert progressor.progress_open(replace(run, alert_level=4), intent,
+                                    "failure").alert_delta == 1
+    calm = OpenActionIntent(
+        kind="open_action", approach="周囲を落ち着かせる", check=None,
+        success={"alert_delta": -1}, failure=None,
+    )
+    assert progressor.progress_open(replace(run, alert_level=0), calm,
+                                    "success").alert_delta == 0
+    assert progressor.progress_open(run, calm, "success").alert_delta == -1
 
 
 def test_minor_local_place_can_be_saved_without_a_major_scene_transition() -> None:
@@ -149,6 +162,40 @@ def test_free_bench_search_can_propose_a_new_route_on_either_outcome() -> None:
     assert progressor.progress_open(_run(2), intent, "failure").facts[0].fact_ref == (
         "bench_heavy"
     )
+
+
+def test_search_does_not_move_to_the_passage_without_player_travel_intent() -> None:
+    run = _run(2)
+    actor = UUID(int=10)
+    work = ResolutionWorkItem(
+        turn_id=UUID(int=11), campaign_id=run.campaign_id,
+        scene_id=run.scenes[1].id, principal_id=UUID(int=12), actor_id=actor,
+        actor_authorized=True, worker_epoch=1, max_actions=1,
+        expected_state_version=0, player_text="礼拝堂の長椅子を全てどけて隠し扉を探す",
+        recent_messages=(), route="mechanical",
+    )
+    snapshot = CanonicalSnapshot(
+        campaign_id=run.campaign_id, state_version=0,
+        characters=({"entity_id": actor, "current_hp": 10, "max_hp": 10,
+                     "defense": 12, "attack_bonus": 1},),
+        skills=(), equipment=(), inventory=(), skill_checks=(), entities=(),
+        scenario_run=run,
+    )
+    worker = SkillCheckResolutionWorker(
+        Mock(), Mock(spec=ResolutionLLM), MvpV1Ruleset(DiceEngine(SeededRandomSource(0))),
+        WorkerPhasePolicy(60, 3, 120, "unused"),
+        scenario_progressor=ScenarioProgressor(BUILTIN_SCENARIOS),
+    )
+    proposed_travel = OpenActionIntent(
+        kind="open_action", approach="隠し扉から通路へ進む", check=None,
+        success={"next_scene_ref": "passage"}, failure=None,
+    )
+    with pytest.raises(ResolutionInputError, match="移動"):
+        worker._preflight_actions(work, snapshot, [proposed_travel])
+    progressor = ScenarioProgressor(BUILTIN_SCENARIOS)
+    with pytest.raises(ScenarioActionUnavailableError, match="移動"):
+        progressor.validate_transition_request("長椅子を調べて移動しない", proposed_travel)
+    progressor.validate_transition_request("隠し扉から通路へ進む", proposed_travel)
 
 
 def test_impossible_space_trip_is_rejected_before_model_or_world_update() -> None:
@@ -253,6 +300,39 @@ def test_generated_fact_cannot_shadow_or_relocate_protected_lore() -> None:
         )
         with pytest.raises(ScenarioActionUnavailableError):
             progressor.progress_open(_run(), proposal, "success")
+
+
+def test_protected_lore_paraphrase_and_benign_context_are_separate() -> None:
+    progressor = ScenarioProgressor(BUILTIN_SCENARIOS)
+    forbidden = (
+        "最奥の間は空っぽで、誰もおらず、品物も存在しない。",
+        "銀の聖印は見つからず、祭壇には何もない。",
+        "広間に聖印が隠されている。",
+        "ゴブリンは聖印の見張りをやめ、理由を聞かずに立ち去った。",
+    )
+    allowed = (
+        "ゴブリンの足元に倒れた長椅子がある。",
+        "祭壇の脇に古い燭台がある。",
+        "聖印の紋様が描かれた木片が落ちている。",
+        "見張りの周囲に足跡が増えている。",
+    )
+    for index, public_text in enumerate(forbidden):
+        intent = OpenActionIntent(
+            kind="open_action", approach="周囲を調べる", check=None,
+            success={"facts": [{"fact_ref": f"forbidden_{index}", "kind": "clue",
+                                "public_text": public_text}]}, failure=None,
+        )
+        with pytest.raises(ScenarioActionUnavailableError):
+            progressor.progress_open(_run(5), intent, "success")
+    for index, public_text in enumerate(allowed):
+        intent = OpenActionIntent(
+            kind="open_action", approach="周囲を調べる", check=None,
+            success={"facts": [{"fact_ref": f"allowed_{index}", "kind": "clue",
+                                "public_text": public_text}]}, failure=None,
+        )
+        assert progressor.progress_open(_run(5), intent, "success").facts[0].public_text == (
+            public_text
+        )
 
 
 def test_v3_allows_early_goal_and_alternative_ending_at_core_location() -> None:
@@ -420,7 +500,7 @@ def test_worker_resolves_bench_shortcut_with_saved_ability() -> None:
         turn_id=UUID(int=11), campaign_id=run.campaign_id,
         scene_id=run.scenes[1].id, principal_id=UUID(int=12), actor_id=actor,
         actor_authorized=True, worker_epoch=1, max_actions=3,
-        expected_state_version=0, player_text="長椅子を足場にする",
+        expected_state_version=0, player_text="長椅子を足場にして高窓から通路へ進む",
         recent_messages=(), route="mechanical",
     )
     snapshot = CanonicalSnapshot(

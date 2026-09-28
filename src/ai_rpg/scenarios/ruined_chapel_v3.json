@@ -11,7 +11,7 @@
     "goal_flag_ref": "relic_recovered",
     "outside_ending_ref": "retreated",
     "impossible_destinations": ["宇宙", "月面", "火星", "異世界"],
-    "protected_terms": ["聖印", "依頼品", "ゴブリン", "守衛", "見張り", "村", "祭壇", "奥の部屋"],
+    "protected_terms": ["聖印", "依頼品", "ゴブリン", "守衛", "見張り", "村", "祭壇", "奥の部屋", "最奥の間"],
     "protected_facts": [
       {"fact_ref": "relic_location", "kind": "location", "statement": "銀の聖印は祭壇の部屋にある。", "scene_ref": "sanctum"},
       {"fact_ref": "guard_motive", "kind": "motive", "statement": "ゴブリンは聖印の持ち出し理由を知りたくて祭壇を見張っている。", "scene_ref": "sanctum"},

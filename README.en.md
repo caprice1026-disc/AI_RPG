@@ -164,6 +164,36 @@ uv run --frozen ai-rpg narration-worker
 Unset tiers inherit the common model. Existing tier overrides take precedence, so check them when switching models.
 Environment variables take precedence over `.env`; restart the workers after changing settings.
 The [provider settings guide (Japanese)](docs/development.md#provider-settings) covers OpenAI Responses, key precedence, and call budgets.
+## Play locally with Docker Compose
+
+On Windows, you need PowerShell, Docker Desktop, and Git. Python and Node.js are not required just to play. Compose runs PostgreSQL, the API, the resolution worker, and the narration worker.
+
+```powershell
+git clone https://github.com/caprice1026-disc/AI_RPG.git
+Set-Location AI_RPG
+if (-not (Test-Path -LiteralPath .env)) { Copy-Item .env.example .env }
+```
+
+Put your key in `GEMINI_API_KEY` in `.env`; the command above preserves an existing file. The default model is `google:gemini-3.5-flash`. Never put the key in the browser or Git. To switch providers, set `AIRPG_LLM_MODEL` and the matching provider key in `.env`. `AIRPG_FAST_MODEL` (intent) and `AIRPG_QUALITY_MODEL` (narration) can override the shared model.
+
+```powershell
+docker compose up --build -d
+docker compose ps
+```
+
+Open [http://127.0.0.1:8000/](http://127.0.0.1:8000/), choose a name, preset, ability points, and specialty, then start. No UUID or database entry is needed. Suggested actions are guidance; you can also type plausible actions within the adventure region. Leaving the region concludes the adventure, while physically impossible trips such as flying into space from a ruined wall are rejected. Searching under a bench does not move you to another room unless you explicitly ask to travel.
+
+A waiting dice animation appears while an action is processed, but no uncommitted roll is shown. HP, items, and discoveries come from saved state. Use a potion from its inventory row. Choosing “not this time” for a major risk does not execute the action; the saved proposal can reappear until the situation changes.
+
+To stop, resume, or rebuild, use:
+
+```powershell
+docker compose down
+docker compose up --build -d
+docker compose logs --tail=80 api resolution-worker narration-worker
+```
+
+`down` preserves the named database volume. Do not run `down -v` unless you intend to delete saved adventures. This development configuration uses HTTP and a fixed principal, with the API port bound to this PC's `127.0.0.1:8000` only. Never publish it to the internet. If the API does not become healthy, inspect `docker compose ps` and the logs above. Real model calls incur charges. See the [development guide](docs/development.md) for Fake LLM and manual development workflows.
 
 ## OIDC login for playtest participants
 

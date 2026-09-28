@@ -20,150 +20,36 @@ LLMが入力の意図を読み取り、確定した結果を描写します。�
 現在は短編のMVPで、20〜30分の所要時間、会話品質、楽しさは人による試遊の評価対象です。
 自動テストとエージェントによる動作確認は、[直近の検証記録](docs/verification-20260926.md)で区別しています。
 
-## 最短でローカルのFakeを遊ぶ
+## Docker Composeでローカルプレイ
 
-以下はWindows PowerShellの手順です。Git、Python 3.11以上、インストール済みの[uv](https://docs.astral.sh/uv/)、起動中のDocker Desktopを用意します。
-既存のPostgreSQLを使う場合は、専用の空の開発DBを用意し、接続URLを読み替えてください。
-
-Vueのビルド済み画面を同梱しているため、遊ぶだけならNode.jsは不要です。
-この手順は自分のPC内だけで使います。固定の開発principal（プレイヤーID）を使うAPIや、HTTPの開発環境を外部公開しないでください。
-
-### 1. 取得と依存関係の準備
-
-既存のチェックアウトがある場合は、そのルートへ移動して `uv sync --frozen` から進めます。
+Windows PowerShellとDocker Desktop、Gitがあれば起動できます。Python・Node.jsのインストールはプレイだけなら不要です。ComposeはPostgreSQL、API、解決worker、描写workerを起動します。
 
 ```powershell
-uv --version
 git clone https://github.com/caprice1026-disc/AI_RPG.git
 Set-Location AI_RPG
-uv sync --frozen
-if (-not (Test-Path -LiteralPath .env)) {
-  Copy-Item -LiteralPath .env.example -Destination .env
-}
+if (-not (Test-Path -LiteralPath .env)) { Copy-Item .env.example .env }
 ```
 
-`uv sync --frozen` がローカルの `.venv` を作成します。事前の仮想環境作成やactivateは不要です。
-上のコピーは既存の `.env` を上書きしません。FakeではAPIキーを設定する必要はありません。
-
-### 2. 開発DBを用意する
-
-新しい開発環境で一度だけ実行します。冒険は名前付きvolume `ai-rpg-dev-data` に保存します。
-同名のコンテナやvolumeをすでに使っている場合は、既存の用途を確認してから再利用するか、別名を指定してください。
+`.env` の `GEMINI_API_KEY` に自分のキーを設定します。既存の `.env` は上書きしません。モデルは既定で `google:gemini-3.5-flash` です。キーをブラウザやGitへ入れないでください。別のproviderへ切り替えるときは、同じファイルの `AIRPG_LLM_MODEL` と必要なproviderキーを設定します。用途別モデルは `AIRPG_FAST_MODEL`（入力の解釈）と `AIRPG_QUALITY_MODEL`（描写）で上書きできます。
 
 ```powershell
-docker run --name ai-rpg-dev-postgres `
-  -e POSTGRES_USER=airpg `
-  -e POSTGRES_PASSWORD=airpg `
-  -e POSTGRES_DB=airpg `
-  -v ai-rpg-dev-data:/var/lib/postgresql/data `
-  -p 127.0.0.1:5432:5432 -d postgres:16
-docker exec ai-rpg-dev-postgres pg_isready -U airpg -d airpg
+docker compose up --build -d
+docker compose ps
 ```
 
-`pg_isready` が `accepting connections` を返してから、リポジトリのルートでmigrationを適用します。
-DB起動直後に失敗した場合は、少し待って `pg_isready` を再実行してください。
+[http://127.0.0.1:8000/](http://127.0.0.1:8000/) を開き、冒険者名・プリセット・能力配分・得意技能を選んで開始します。UUIDやDBの手入力は不要です。行動候補は道案内で、自由文でも地域内の探索や工夫を試せます。礼拝堂の外へ出る選択は結末になりますが、宇宙など物理的に不可能な移動は確定しません。長椅子を調べても勝手に次の部屋へ移動せず、移動は明示したときに確定します。
+
+処理中はダイスの待機演出が出ますが、確定前の出目は見せません。HP・持ち物・発見済み情報は保存状態から表示します。ポーションは所持品の行から使用できます。重大なリスクの確認を「今回は見送る」にしても行動は実行されず、保存済みの提案は状況が変わるまで再表示できます。
+
+停止・再開・更新は次のとおりです。`down` はDBの名前付きvolumeを残します。`down -v` は保存済み冒険を消すため、実行しないでください。
 
 ```powershell
-$env:AIRPG_DATABASE_URL = "postgresql+psycopg://airpg:airpg@localhost:5432/airpg"
-uv run --frozen alembic upgrade head
+docker compose down
+docker compose up --build -d
+docker compose logs --tail=80 api resolution-worker narration-worker
 ```
 
-5432番ポートが使用中ならDockerのホスト側ポートと、以降すべての接続URLを同じ値へ変更します。
-Alembicは `.env` を直接読まないため、migrationでも `AIRPG_DATABASE_URL` を明示します。
-この開発DBをテスト用の `AIRPG_TEST_DATABASE_URL` に指定しないでください。
-
-### 3. APIと2つのworkerを起動する
-
-PowerShellを3つ開き、**それぞれ同じリポジトリのルートへ移動**して実行します。
-各ターミナルの環境変数は共有されないため、同じDB URLを3つとも設定します。
-
-ターミナル1 — API:
-
-```powershell
-$env:AIRPG_DATABASE_URL = "postgresql+psycopg://airpg:airpg@localhost:5432/airpg"
-uv run --frozen ai-rpg api --dev-principal
-```
-
-ターミナル2 — 行動の解決:
-
-```powershell
-$env:AIRPG_DATABASE_URL = "postgresql+psycopg://airpg:airpg@localhost:5432/airpg"
-uv run --frozen ai-rpg resolution-worker --fake
-```
-
-ターミナル3 — 結果の描写:
-
-```powershell
-$env:AIRPG_DATABASE_URL = "postgresql+psycopg://airpg:airpg@localhost:5432/airpg"
-uv run --frozen ai-rpg narration-worker --fake
-```
-
-`--dev-principal` は接続者を同じ開発プレイヤーとして扱う、loopback限定の認証モードです。
-通常のAPI起動には自動適用されません。別プレイヤーの開発確認には `--dev-principal <UUID>` を使えます。
-
-### 4. 遊ぶ・停止する・再開する
-
-[http://127.0.0.1:8000/](http://127.0.0.1:8000/) を開き、シナリオ、冒険者、名前、能力配分、得意技能を選んで「冒険を始める」を押します。
-CampaignやActorのUUID入力、`seed-dev` の実行は不要です。行動候補は確実な手段として使えますが、自由文で別の方法も入力できます。重大リスクの確認画面では、確定せずに取り消すこともできます。
-Fakeの自由入力は「長椅子を足場にする」など限られた表現だけに対応します。多様な言い回しには実モデルを使ってください。戦闘中の回復には「回復ポーションを飲む」を使えます。
-
-APIとworkerは各ターミナルの `Ctrl+C` で停止します。DBの停止・再開は次のコマンドを使います。
-
-```powershell
-docker stop ai-rpg-dev-postgres
-# 再開するとき
-docker start ai-rpg-dev-postgres
-```
-
-再開時はDBの準備完了を確認し、手順3の3プロセスを同じDB・同じprincipalで起動します。
-ブラウザで保存済みの冒険を選ぶと続きを遊べます。完了した冒険の履歴も残ります。
-コードを更新した場合は、APIとworkerを起動する前に手順2のmigrationを再実行してください。
-
-送信結果が不明な場合は画面の「同じ要求を再送」を使います。
-受付済みのTurnは結果の取得を再開します。詳しい挙動は[復旧手順](docs/development.md#failure-recovery)を参照してください。
-
-## Geminiへ切り替える
-
-Pydantic AIを経由し、既定モデルは `google:gemini-3.5-flash` です。実モデルの呼び出しには利用料金が発生します。
-Fakeの2つのworkerを `Ctrl+C` で停止してから、リポジトリ直下の既存の `.env` で次の項目を編集します。
-例をファイル全体へ上書きせず、APIキーの値は手元で設定してください。
-
-```dotenv
-AIRPG_LLM_MODEL=google:gemini-3.5-flash
-GEMINI_API_KEY=YOUR_API_KEY
-```
-
-キーはサーバーの `.env` またはsecret設定だけに置き、Gitへcommitしません。
-ブラウザへ入力したり、フロントエンドの `VITE_` 変数へコピーしたりしないでください。
-
-同じルート・同じDB設定のターミナル2と3で、両方の `--fake` を外して再起動します。
-APIはローカル用のまま利用できます。
-
-ターミナル2:
-
-```powershell
-$env:AIRPG_DATABASE_URL = "postgresql+psycopg://airpg:airpg@localhost:5432/airpg"
-uv run --frozen ai-rpg resolution-worker
-```
-
-ターミナル3:
-
-```powershell
-$env:AIRPG_DATABASE_URL = "postgresql+psycopg://airpg:airpg@localhost:5432/airpg"
-uv run --frozen ai-rpg narration-worker
-```
-
-モデルは `AIRPG_LLM_MODEL` で共通設定し、用途別に切り替える場合だけ次を指定します。
-
-| 設定 | 用途 |
-| --- | --- |
-| `AIRPG_FAST_MODEL` | 意図抽出・通常会話 |
-| `AIRPG_QUALITY_MODEL` | 確定結果の描写 |
-| `AIRPG_BACKGROUND_MODEL` | 将来のbackground用途（設定したproviderのキーは起動時に必要） |
-
-未指定のtierは共通モデルを引き継ぎます。既存のtier設定は共通モデルより優先するため、切替時に確認してください。
-環境変数は `.env` より優先し、設定変更はworker再起動後に反映されます。
-OpenAI Responsesへの切替、キーの優先順位、呼出予算は[provider設定](docs/development.md#provider-settings)にまとめています。
+HTTPと固定の開発principalを使う構成なので、このComposeをインターネットへ公開しないでください。APIの公開ポートはこのPCの `127.0.0.1:8000` に限定しています。起動後に `api` がhealthyにならない場合は `docker compose ps` と上記ログを確認します。実モデルの呼び出しには利用料金が発生します。Fake LLMや手動の開発手順は[開発ガイド](docs/development.md)を参照してください。
 
 ## 参加者向けのOIDCログイン
 

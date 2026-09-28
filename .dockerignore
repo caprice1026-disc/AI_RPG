@@ -1,0 +1,10 @@
+.env
+.git
+.venv
+.worktrees
+frontend/node_modules
+frontend/dist
+tests
+docs
+*.pyc
+__pycache__

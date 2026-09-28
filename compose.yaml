@@ -1,0 +1,70 @@
+name: ai-rpg-local
+
+x-app: &app
+  build: .
+  image: ai-rpg-local:dev
+  init: true
+  environment: &app-environment
+    AIRPG_DATABASE_URL: postgresql+psycopg://airpg:airpg@db:5432/airpg
+  depends_on:
+    migrate:
+      condition: service_completed_successfully
+
+services:
+  db:
+    image: postgres:16
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: airpg
+      POSTGRES_PASSWORD: airpg
+      POSTGRES_DB: airpg
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: [CMD-SHELL, "pg_isready -U airpg -d airpg"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+
+  migrate:
+    <<: *app
+    restart: "no"
+    command: [python, -m, alembic, upgrade, head]
+    depends_on:
+      db:
+        condition: service_healthy
+
+  api:
+    <<: *app
+    restart: unless-stopped
+    command:
+      - sh
+      - -c
+      - >-
+        socat TCP-LISTEN:8000,bind=0.0.0.0,reuseaddr,fork TCP:127.0.0.1:8001 &
+        exec ai-rpg api --host 127.0.0.1 --port 8001 --dev-principal
+    ports:
+      - "127.0.0.1:8000:8000"
+    healthcheck:
+      test: [CMD, python, -c, "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=3).read()"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 20s
+
+  resolution-worker:
+    <<: *app
+    restart: unless-stopped
+    env_file: .env
+    environment: *app-environment
+    command: [ai-rpg, resolution-worker]
+
+  narration-worker:
+    <<: *app
+    restart: unless-stopped
+    env_file: .env
+    environment: *app-environment
+    command: [ai-rpg, narration-worker]
+
+volumes:
+  postgres-data:
