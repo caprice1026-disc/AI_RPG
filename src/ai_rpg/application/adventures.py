@@ -53,7 +53,10 @@ class AdventureService:
         self._store = store
 
     def catalog(self) -> AdventureCatalogResponse:
-        scenario = BUILTIN_SCENARIOS.get("ruined_chapel", 3)
+        scenarios = (
+            BUILTIN_SCENARIOS.get("ruined_chapel", 3),
+            BUILTIN_SCENARIOS.get("mist_lighthouse", 1),
+        )
         return AdventureCatalogResponse(
             scenarios=[
                 ScenarioSummary(
@@ -68,7 +71,7 @@ class AdventureService:
                             "athletics", "acrobatics", "perception", "stealth", "persuasion"
                         ],
                     ),
-                )
+                ) for scenario in scenarios
             ],
             presets=[preset.summary for preset in PRESETS],
         )

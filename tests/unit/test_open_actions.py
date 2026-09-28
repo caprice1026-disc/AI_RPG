@@ -33,7 +33,7 @@ from ai_rpg.contracts.llm_decisions import (
 from ai_rpg.domain.commands import OpenActionCommand
 from ai_rpg.engine import DiceEngine, MvpV1Ruleset, SeededRandomSource
 from ai_rpg.engine.ruleset import MvpV2Ruleset
-from ai_rpg.scenarios import BUILTIN_SCENARIOS
+from ai_rpg.scenarios import BUILTIN_SCENARIOS, ScenarioCatalog
 
 
 def test_open_action_requires_both_outcomes_before_a_check() -> None:
@@ -90,6 +90,37 @@ def _run(scene_sequence: int = 2, flags: frozenset[str] = frozenset()) -> Scenar
                                    else "closed" if n < scene_sequence else "planned")
                      for n in range(1, 7)), flags=flags,
     )
+
+
+def test_open_actions_are_selected_by_ruleset_not_scenario_version() -> None:
+    definition = BUILTIN_SCENARIOS.get("ruined_chapel", 3).model_copy(
+        update={"scenario_ref": "another_adventure", "version": 1}
+    )
+    run = replace(_run(1), scenario_ref="another_adventure", scenario_version=1)
+    worker = SkillCheckResolutionWorker(
+        Mock(), Mock(spec=ResolutionLLM), MvpV1Ruleset(DiceEngine(SeededRandomSource(0))),
+        WorkerPhasePolicy(60, 3, 120, "unused"),
+        scenario_progressor=ScenarioProgressor(ScenarioCatalog((definition,))),
+    )
+    actor = UUID(int=10)
+    work = ResolutionWorkItem(
+        turn_id=UUID(int=11), campaign_id=run.campaign_id, scene_id=run.scenes[0].id,
+        principal_id=UUID(int=12), actor_id=actor, actor_authorized=True,
+        worker_epoch=1, max_actions=1, expected_state_version=0,
+        player_text="入口の周りを調べる", recent_messages=(), route="mechanical",
+    )
+    snapshot = CanonicalSnapshot(
+        campaign_id=run.campaign_id, state_version=0,
+        characters=({"entity_id": actor, "current_hp": 10, "max_hp": 10,
+                     "defense": 12, "attack_bonus": 1},),
+        skills=(), equipment=(), inventory=(), skill_checks=(), entities=(),
+        scenario_run=run,
+    )
+
+    model_input = worker._mechanical_input(work, snapshot)
+    assert "open_action" in model_input.supported_action_types
+    assert model_input.open_action_options is not None
+    assert model_input.open_action_options.current_scene_ref == "entrance"
 
 
 def test_open_success_can_take_a_shortcut_and_failure_can_raise_alert() -> None:
@@ -236,6 +267,19 @@ def test_looking_for_an_intrusion_route_does_not_move_the_player() -> None:
     for text in ("高窓からの侵入経路を探す", "高窓に忍び込み口があるか調べる"):
         with pytest.raises(ScenarioActionUnavailableError, match="移動"):
             ScenarioProgressor.validate_transition_request(text, intent)
+
+
+@pytest.mark.parametrize("player_text", [
+    "灯室の扉を蹴破って踏み込む",
+    "踊り場の窓から灯室に飛び込む",
+    "灯台守に名乗り、嵐のため灯火を直したいと伝えて扉を開けてもらう",
+])
+def test_explicit_entry_into_lantern_room_is_a_transition_request(player_text: str) -> None:
+    intent = OpenActionIntent(
+        kind="open_action", approach="灯室へ踏み込む", check=None,
+        success={"next_scene_ref": "lantern_room"}, failure=None,
+    )
+    ScenarioProgressor.validate_transition_request(player_text, intent)
 
 
 def test_impossible_space_trip_is_rejected_before_model_or_world_update() -> None:

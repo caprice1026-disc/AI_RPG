@@ -72,13 +72,14 @@ class TurnQueryService:
                 combat = None
                 if scenario.status == "active":
                     combat = self._scenario_progressor.scene_for(scenario).combat
-                if combat is not None or scenario.scenario_version >= 3:
+                is_open = self._scenario_progressor.supports_open_actions(scenario)
+                if combat is not None or is_open:
                     scene = next(
                         (s for s in scenario.scenes if s.status == "active"),
                         scenario.scenes[-1],
                     )
                     canonical = await unit_of_work.canonical.snapshot(campaign_id, scene.id)
-                    if scenario.scenario_version >= 3 and response.player is not None:
+                    if is_open and response.player is not None:
                         ability = next(
                             (row for row in canonical.abilities
                              if row["character_id"] == response.player.actor_id), None
@@ -134,6 +135,7 @@ class TurnQueryService:
 
     def _adventure_state(self, snapshot: ScenarioRunSnapshot) -> AdventureState:
         definition = self._scenario_progressor.definition_for(snapshot)
+        is_open = self._scenario_progressor.supports_open_actions(snapshot)
         scene_ref_by_id = {
             runtime.id: defined.scene_ref
             for runtime in snapshot.scenes
@@ -201,6 +203,6 @@ class TurnQueryService:
             ],
             available_actions=available_actions,
             ending=ending,
-            elapsed_actions=snapshot.elapsed_actions if snapshot.scenario_version >= 3 else None,
-            alert_level=snapshot.alert_level if snapshot.scenario_version >= 3 else None,
+            elapsed_actions=snapshot.elapsed_actions if is_open else None,
+            alert_level=snapshot.alert_level if is_open else None,
         )

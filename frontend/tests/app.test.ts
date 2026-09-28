@@ -27,6 +27,13 @@ it('signed-out landing shows art and provider link, no credential inputs', async
   expect(w.find('img').attributes('src')).toBe('/static/vue/art/ruined-chapel.png')
   expect(w.findAll('input')).toHaveLength(0)
 })
+it('does not depict the ruined chapel during a different adventure', async () => {
+  const lighthouse = { ...campaign().adventure!, scenario_ref: 'mist_lighthouse', title: '霧灯台の航海日誌' }
+  const api = server(path => path.endsWith('/state') ? response(campaign({ adventure: lighthouse })) : undefined)
+  const w = await render(api)
+  await w.get('[data-adventure="campaign-a"]').trigger('click'); await flushPromises()
+  expect(w.find('.scene-art').exists()).toBe(false)
+})
 it('503 offers retry and does not mislabel service failure as signed-out', async () => {
   const w = await render(server(() => response({}, 503)))
   expect(w.text()).toContain('認証サービス'); expect(button(w, '接続を再確認')).toBeDefined()

@@ -145,7 +145,7 @@ function sendText() { if (s.draft.trim()) void game.submit({ kind: 'text', text:
     </aside>
 
     <section v-if="!s.selected" class="start-page">
-      <img :src="art" class="start-art" alt="霧の中にたたずむ廃礼拝堂">
+      <img v-if="scenario?.scenario_ref === 'ruined_chapel'" :src="art" class="start-art" alt="霧の中にたたずむ廃礼拝堂">
       <div class="start-content">
         <h1>新しい物語を、ここから。</h1>
         <p class="hint">舞台と冒険者を選んで、最初の一歩を。</p>
@@ -193,7 +193,7 @@ function sendText() { if (s.draft.trim()) void game.submit({ kind: 'text', text:
           <h1>{{ adventure?.current_scene?.title || (s.loading ? '冒険を読み込んでいます…' : '物語') }}</h1>
           <p v-if="adventure?.objective" class="objective">{{ adventure.objective }}</p>
         </header>
-        <img v-if="adventure" :src="art" class="scene-art" alt="月明かりに浮かぶ廃礼拝堂の情景">
+        <img v-if="adventure?.scenario_ref === 'ruined_chapel'" :src="art" class="scene-art" alt="月明かりに浮かぶ廃礼拝堂の情景">
         <div class="story-body">
           <p v-if="adventure?.current_scene" class="scene-description">{{ adventure.current_scene.description }}</p>
           <p v-if="s.historyError" class="error" role="alert">{{ s.historyError }}</p>

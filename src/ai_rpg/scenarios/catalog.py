@@ -31,5 +31,6 @@ BUILTIN_SCENARIOS = ScenarioCatalog(
         _load_builtin("ruined_chapel.json"),
         _load_builtin("ruined_chapel_v2.json"),
         _load_builtin("ruined_chapel_v3.json"),
+        _load_builtin("mist_lighthouse.json"),
     ]
 )

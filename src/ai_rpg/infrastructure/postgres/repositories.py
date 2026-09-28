@@ -1195,11 +1195,12 @@ class PostgresTurnRepository:
             raise RuntimeError("worker leaseが無効です")
         scenario_update = bundle.scenario_update
         if scenario_update is not None:
+            open_scenario = campaign["ruleset_version"] == "mvp_v2"
             run = (
                 (
                     await self._session.execute(
                         text(
-                            "SELECT status,scenario_version,alert_level FROM mvp_scenario_runs "
+                            "SELECT status,alert_level FROM mvp_scenario_runs "
                             "WHERE campaign_id=:c FOR UPDATE"
                         ),
                         {"c": bundle.campaign_id},
@@ -1233,12 +1234,12 @@ class PostgresTurnRepository:
                         text(
                             "SELECT id FROM scenes "
                             "WHERE campaign_id=:c AND id=:s AND "
-                            "(status='planned' OR (:v >= 3 AND status='closed'))"
+                            "(status='planned' OR (:open_scenario AND status='closed'))"
                         ),
                         {
                             "c": bundle.campaign_id,
                             "s": scenario_update.to_scene_id,
-                            "v": int(run["scenario_version"]),
+                            "open_scenario": open_scenario,
                         },
                     )
                 ).scalar_one_or_none()
@@ -1252,7 +1253,7 @@ class PostgresTurnRepository:
             if (
                 scenario_update.elapsed_actions < 0
                 or not 0 <= int(run["alert_level"]) + scenario_update.alert_delta <= 5
-                or (int(run["scenario_version"]) < 3 and (
+                or (not open_scenario and (
                     scenario_update.elapsed_actions or scenario_update.alert_delta
                     or scenario_update.facts
                 ))
@@ -1395,13 +1396,13 @@ class PostgresTurnRepository:
                         text(
                             "UPDATE scenes SET status='active' "
                             "WHERE campaign_id=:c AND id=:s AND "
-                            "(status='planned' OR (:v >= 3 AND status='closed')) "
+                            "(status='planned' OR (:open_scenario AND status='closed')) "
                             "RETURNING id"
                         ),
                         {
                             "c": bundle.campaign_id,
                             "s": scenario_update.to_scene_id,
-                            "v": int(run["scenario_version"]),
+                            "open_scenario": open_scenario,
                         },
                     )
                 ).scalar_one_or_none()

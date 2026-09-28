@@ -100,6 +100,10 @@ class ScenarioProgressor:
         except KeyError as error:
             raise ScenarioStateError("Scenario定義と保存versionが一致しません") from error
 
+    def supports_open_actions(self, snapshot: ScenarioRunSnapshot) -> bool:
+        definition = self.definition_for(snapshot)
+        return definition.ruleset_ref == "mvp_v2" and definition.world is not None
+
     def validate_player_request(self, snapshot: ScenarioRunSnapshot, text: str) -> None:
         definition = self.definition_for(snapshot)
         if definition.world is not None and _impossible_trip(
@@ -117,9 +121,12 @@ class ScenarioProgressor:
             r"(?:へ|に|から|を).{0,12}(?:向か(?:う|った|いたい)|行(?:く|った|きたい)"
             r"|入(?:る|った|りたい|り込(?:む|んで|みたい))|進(?:む|んだ|んで|みたい)|戻(?:る|った|りたい)"
             r"|抜け(?:る|たい)|侵入(?:す|し|を試み)|忍び込(?:む|んで|みたい)"
+            r"|(?:踏み|飛び)込(?:む|んで|みたい)"
             r"|移動(?:する|したい)|渡(?:る|った|りたい)"
             r"|登(?:る|った|りたい)|通(?:る|った|りたい))",
             player_text,
+        ) is None and re.search(
+            r"(?:扉|ドア|門)を開け(?:てもらう|てほしい|てもらいたい)", player_text
         ) is None:
             raise ScenarioActionUnavailableError(
                 "主要地点の移動はプレイヤーが明示した場合だけ確定できます"

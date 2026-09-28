@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import logging
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import asdict, dataclass
 from typing import Literal
@@ -202,6 +203,13 @@ class SkillCheckResolutionWorker:
         self._rng_source = rng_source
         self._rng_implementation_version = rng_implementation_version
 
+    def _is_open_scenario(self, snapshot: CanonicalSnapshot) -> bool:
+        return (
+            snapshot.scenario_run is not None
+            and self._scenario_progressor is not None
+            and self._scenario_progressor.supports_open_actions(snapshot.scenario_run)
+        )
+
     async def run_once(self, turn_id: UUID | None = None) -> bool:
         async with self._unit_of_work_factory() as unit_of_work:
             lease = await unit_of_work.turns.acquire_lease(
@@ -247,8 +255,7 @@ class SkillCheckResolutionWorker:
                 else self._router.decide(work.player_text)
             )
             if (
-                snapshot.scenario_run is not None
-                and snapshot.scenario_run.scenario_version >= 3
+                self._is_open_scenario(snapshot)
                 and route_decision.route == "narrative"
                 and route_decision.reason_codes == ("narrative_or_fallback",)
             ):
@@ -289,8 +296,9 @@ class SkillCheckResolutionWorker:
             elif work.selected_action_ref is not None:
                 intents = [self._registered_intent(work, snapshot)]
             else:
-                if (snapshot.scenario_run is not None and self._scenario_progressor is not None
-                        and snapshot.scenario_run.scenario_version >= 3):
+                if self._is_open_scenario(snapshot):
+                    assert snapshot.scenario_run is not None
+                    assert self._scenario_progressor is not None
                     try:
                         self._scenario_progressor.validate_player_request(
                             snapshot.scenario_run, work.player_text
@@ -298,7 +306,7 @@ class SkillCheckResolutionWorker:
                     except ScenarioActionUnavailableError:
                         return await self._finalize_not_applied(
                             work, "この冒険の探索領域の外へは移動できません。"
-                            "礼拝堂と周辺で行動するか、撤退を選んでください。",
+                            "この冒険の領域内で行動するか、撤退を選んでください。",
                         )
                 context = self._mechanical_input(work, snapshot)
                 for attempt in range(2):
@@ -319,8 +327,7 @@ class SkillCheckResolutionWorker:
                     try:
                         preflight = self._preflight_actions(work, snapshot, intents)
                     except ResolutionInputError as error:
-                        if (attempt == 0 and snapshot.scenario_run is not None
-                                and snapshot.scenario_run.scenario_version >= 3):
+                        if attempt == 0 and self._is_open_scenario(snapshot):
                             context = context.model_copy(update={
                                 "proposal_feedback": str(error)[:200],
                             })
@@ -349,7 +356,8 @@ class SkillCheckResolutionWorker:
             return await self._handle_failure(work, "UNKNOWN")
         except ProviderHTTPError:
             return await self._handle_failure(work, "UNKNOWN")
-        except ResolutionInputError:
+        except ResolutionInputError as error:
+            logging.warning("Action proposal rejected for turn %s: %s", work.turn_id, error)
             return await self._finalize_not_applied(
                 work,
                 "その方法は今の状況では確定できません。場所や目的を確認して言い換えてください。",
@@ -481,10 +489,12 @@ class SkillCheckResolutionWorker:
         self, intents: Sequence[object], snapshot: CanonicalSnapshot,
     ) -> tuple[ActionIntent, str] | None:
         run = snapshot.scenario_run
-        if run is None or run.scenario_version < 3 or self._scenario_progressor is None:
+        if not self._is_open_scenario(snapshot):
             return None
+        assert run is not None
+        assert self._scenario_progressor is not None
         if len(intents) != 1:
-            return None  # _preflight_actions rejects multi-action v3 plans.
+            return None  # _preflight_actions rejects multi-action open-scenario plans.
         intent = intents[0]
         if not isinstance(intent, (
             OpenActionIntent, ScenarioActionIntent, AttackIntent, SkillCheckIntent, UseItemIntent,
@@ -757,7 +767,7 @@ class SkillCheckResolutionWorker:
         ):
             supported_actions.append("use_item")
         if snapshot.scenario_run is not None:
-            if snapshot.scenario_run.scenario_version >= 3:
+            if self._is_open_scenario(snapshot):
                 supported_actions.append("open_action")
             scenario_context = self._scenario_context(snapshot)
             if any(
@@ -770,8 +780,9 @@ class SkillCheckResolutionWorker:
             ):
                 supported_actions.append("scenario_action")
         open_options = None
-        if (snapshot.scenario_run is not None and self._scenario_progressor is not None
-                and snapshot.scenario_run.scenario_version >= 3):
+        if self._is_open_scenario(snapshot):
+            assert snapshot.scenario_run is not None
+            assert self._scenario_progressor is not None
             definition = self._scenario_progressor.definition_for(snapshot.scenario_run)
             scene = self._scenario_progressor.scene_for(snapshot.scenario_run)
             open_options = OpenActionOptions(
@@ -917,7 +928,8 @@ class SkillCheckResolutionWorker:
                 ],
                 "npc_notes": scenario_context.npc_notes,
             }
-            if snapshot.scenario_run is not None and snapshot.scenario_run.scenario_version >= 3:
+            if self._is_open_scenario(snapshot):
+                assert snapshot.scenario_run is not None
                 scene_payload.update({
                     "generated_facts": [
                         asdict(fact) for fact in scenario_context.generated_facts
@@ -932,7 +944,7 @@ class SkillCheckResolutionWorker:
             "skills": modifiers,
             "inventory": inventory,
         }
-        if snapshot.scenario_run is not None and snapshot.scenario_run.scenario_version >= 3:
+        if self._is_open_scenario(snapshot):
             pc_payload["abilities"] = [
                 dict(row) for row in snapshot.abilities if row["character_id"] == work.actor_id
             ]
@@ -1476,7 +1488,7 @@ class SkillCheckResolutionWorker:
                     )
         if (
             scenario_update is None and snapshot.scenario_run is not None
-            and snapshot.scenario_run.scenario_version >= 3
+            and self._is_open_scenario(snapshot)
             and any(isinstance(record.result, AppliedResult) for record in records)
         ):
             scenario_update = ScenarioProgressUpdate(
@@ -1491,8 +1503,8 @@ class SkillCheckResolutionWorker:
         intents: Sequence[object],
     ) -> list[ScenarioActionBinding | None]:
         run = snapshot.scenario_run
-        if run is not None and run.scenario_version >= 3 and len(intents) != 1:
-            raise ResolutionInputError("A v3 Turn must contain one action")
+        if self._is_open_scenario(snapshot) and len(intents) != 1:
+            raise ResolutionInputError("An open-scenario Turn must contain one action")
         if any(isinstance(intent, OpenActionIntent) for intent in intents) and len(intents) != 1:
             raise ResolutionInputError("Open action must be the only action in this Turn")
         if run is None:

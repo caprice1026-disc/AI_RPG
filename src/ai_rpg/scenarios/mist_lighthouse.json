@@ -1,0 +1,92 @@
+{
+  "scenario_ref": "mist_lighthouse",
+  "version": 1,
+  "ruleset_ref": "mvp_v2",
+  "title": "霧灯台の航海日誌",
+  "objective": "灯台の航海日誌を港へ届ける。灯火の復旧、別の解決、撤退も選べる。",
+  "world": {
+    "region_name": "霧灯台と岩礁",
+    "boundary": "船着き場、舟小屋、外階段、灯室と周辺の岩礁まで。港へ戻ると冒険は終わる。",
+    "goal_scene_ref": "lantern_room",
+    "goal_flag_ref": "journal_recovered",
+    "outside_ending_ref": "retreated",
+    "impossible_destinations": ["宇宙", "月面", "火星", "異世界"],
+    "protected_terms": ["航海日誌", "日誌", "灯台守", "灯室", "灯火", "港"],
+    "protected_facts": [
+      {"fact_ref": "journal_location", "kind": "location", "statement": "航海日誌は灯室の真鍮の灯具の下にある。", "scene_ref": "lantern_room"},
+      {"fact_ref": "keeper_motive", "kind": "motive", "statement": "灯台守は日誌にある救助者の名前を守りたいので、無断の持ち出しを警戒している。", "scene_ref": "lantern_room"},
+      {"fact_ref": "region_limit", "kind": "rule", "statement": "港と遠方はこの短編の探索領域外である。"}
+    ]
+  },
+  "scenes": [
+    {
+      "scene_ref": "shore", "sequence": 1, "title": "岩礁の船着き場",
+      "description": "濃霧の中、灯台の灯火は消えている。波をかぶる船着き場から、舟小屋と灯台へ続く外階段が見える。港への帰路も残っている。",
+      "open_flags": ["route_found", "costly", "keeper_wary"],
+      "open_destinations": ["boathouse", "stairwell"],
+      "actions": [
+        {"kind": "scenario_action", "action_ref": "walk_to_boathouse", "label": "舟小屋へ向かう", "public_fact": "舟小屋へ進んだ。", "success": {"next_scene_ref": "boathouse"}},
+        {"kind": "scenario_action", "action_ref": "climb_outer_stairs", "label": "外階段から灯台へ向かう", "public_fact": "外階段を登った。", "success": {"next_scene_ref": "stairwell"}},
+        {"kind": "scenario_action", "action_ref": "leave_shore", "label": "港へ引き返す", "public_fact": "港へ引き返した。", "success": {"ending_ref": "retreated"}}
+      ]
+    },
+    {
+      "scene_ref": "boathouse", "sequence": 2, "title": "舟小屋",
+      "description": "舟小屋には古い巻き上げ機、綱、濡れた木箱がある。窓の先に灯台の外階段が見え、船着き場へも戻れる。",
+      "open_flags": ["route_found", "log_clue", "costly", "keeper_wary"],
+      "open_destinations": ["shore", "stairwell"],
+      "actions": [
+        {"kind": "scenario_action", "action_ref": "boathouse_to_stairs", "label": "外階段へ進む", "public_fact": "舟小屋から外階段へ出た。", "success": {"next_scene_ref": "stairwell"}},
+        {"kind": "scenario_action", "action_ref": "boathouse_to_shore", "label": "船着き場へ戻る", "public_fact": "船着き場へ戻った。", "success": {"next_scene_ref": "shore"}}
+      ]
+    },
+    {
+      "scene_ref": "stairwell", "sequence": 3, "title": "灯台の外階段",
+      "description": "錆びた外階段が灯室へ続く。踊り場の窓は少し開き、内側には灯台守の足音がする。舟小屋と船着き場へ引き返せる。",
+      "open_flags": ["route_found", "log_clue", "keeper_trust", "keeper_wary", "costly"],
+      "open_destinations": ["shore", "boathouse", "lantern_room"],
+      "npc_notes": ["灯台守は上階にいる。声を掛けることも、別の入口を探すこともできる。"],
+      "actions": [
+        {"kind": "scenario_action", "action_ref": "enter_lantern_room", "label": "灯室へ入る", "public_fact": "灯室に入った。", "success": {"next_scene_ref": "lantern_room"}},
+        {"kind": "scenario_action", "action_ref": "stairs_to_boathouse", "label": "舟小屋へ戻る", "public_fact": "舟小屋へ戻った。", "success": {"next_scene_ref": "boathouse"}}
+      ]
+    },
+    {
+      "scene_ref": "lantern_room", "sequence": 4, "title": "消えた灯室",
+      "description": "消えた灯具の下に航海日誌がある。灯台守は日誌を見ながら、そこに記された救助者の名前を守りたいと話す。外階段と帰路への扉がある。",
+      "open_flags": ["journal_recovered", "alternative_resolved", "lamp_lit", "keeper_trust", "keeper_wary", "costly"],
+      "open_destinations": ["stairwell", "return_path"],
+      "npc_notes": ["灯台守は日誌の無断持ち出しに反対しているが、救助者の名前を守れる案なら耳を傾ける。"],
+      "actions": [
+        {"kind": "scenario_action", "action_ref": "carry_journal_home", "label": "日誌を持って帰路へ進む", "public_fact": "航海日誌を携えて帰路へ進んだ。", "required_flags": ["journal_recovered"], "success": {"next_scene_ref": "return_path"}},
+        {"kind": "scenario_action", "action_ref": "room_to_stairs", "label": "外階段へ戻る", "public_fact": "外階段へ戻った。", "success": {"next_scene_ref": "stairwell"}}
+      ]
+    },
+    {
+      "scene_ref": "return_path", "sequence": 5, "title": "港への帰路",
+      "description": "岩礁の道の先に港の灯が見える。日誌を届けるか、灯台に戻って別の方法を考えられる。",
+      "open_flags": ["costly"],
+      "open_destinations": ["lantern_room", "shore"],
+      "actions": [
+        {"kind": "scenario_action", "action_ref": "deliver_journal", "label": "航海日誌を港へ届ける", "public_fact": "航海日誌を港へ届けた。", "required_flags": ["journal_recovered"], "success": {"ending_ref": "recovered", "overrides": [{"requires_flags": ["costly"], "ending_ref": "costly_success"}]}},
+        {"kind": "scenario_action", "action_ref": "return_to_lantern_room", "label": "灯室へ戻る", "public_fact": "灯室へ引き返した。", "success": {"next_scene_ref": "lantern_room"}}
+      ]
+    }
+  ],
+  "flags": [
+    {"flag_ref": "route_found", "public_fact": "灯台を進む別の道を見つけた。"},
+    {"flag_ref": "log_clue", "public_fact": "舟小屋で日誌に関する手掛かりを見つけた。"},
+    {"flag_ref": "keeper_trust", "public_fact": "灯台守は冒険者の話を聞く気になった。"},
+    {"flag_ref": "keeper_wary", "public_fact": "灯台守は物音を警戒している。"},
+    {"flag_ref": "lamp_lit", "public_fact": "灯台の灯火を再びともした。"},
+    {"flag_ref": "costly", "public_fact": "嵐の中で時間と手間を費やした。"},
+    {"flag_ref": "journal_recovered", "public_fact": "灯室から航海日誌を手に入れた。"},
+    {"flag_ref": "alternative_resolved", "public_fact": "日誌を持ち帰らずに港と灯台守が納得できる方法を見つけた。"}
+  ],
+  "endings": [
+    {"ending_ref": "recovered", "title": "日誌の帰還", "summary": "航海日誌を港へ届けた。", "required_flags": ["journal_recovered"], "reward": {"tier": "full", "description": "港から依頼達成の謝礼を受ける。"}},
+    {"ending_ref": "costly_success", "title": "嵐を越えた帰還", "summary": "代償を払いながら航海日誌を港へ届けた。", "required_flags": ["journal_recovered", "costly"], "reward": {"tier": "reduced", "description": "依頼達成を認められるが、代償の分だけ謝礼は少ない。"}},
+    {"ending_ref": "alternative_resolution", "title": "灯りと約束", "summary": "日誌を持ち帰らずに港への伝達方法を整えた。", "required_flags": ["alternative_resolved"], "reward": {"tier": "reduced", "description": "港から灯火と情報の回復への謝意を受ける。"}},
+    {"ending_ref": "retreated", "title": "霧の撤退", "summary": "日誌を持ち帰らずに灯台を離れた。", "reward": {"tier": "none", "description": "依頼の謝礼はない。"}}
+  ]
+}

@@ -7,9 +7,9 @@ The LLM interprets player intent and narrates confirmed outcomes. The Game Engin
 
 ## What you can do
 
-- Choose “The Holy Seal of the Ruined Chapel,” allocate two ability points to a preset adventurer, and select one specialty skill.
+- Choose “The Holy Seal of the Ruined Chapel” or “The Lighthouse Logbook,” allocate two ability points to a preset adventurer, and select one specialty skill. The lighthouse offers routes through a boathouse or an outside stairway.
 - Try your own approaches between major locations. Discover small places, people, and clues; failed checks can raise alert and consume an action, leaving room to retry or change tactics.
-- Explore, negotiate, sneak, fight, heal, and face enemy counterattacks. The story can end in success, success at a cost, an alternative resolution, retreat, or defeat; early success and abandoning the goal are valid.
+- Explore, negotiate, and sneak toward success, success at a cost, an alternative resolution, or retreat. The chapel also includes combat, healing, counterattacks, and defeat. Early success and abandoning the goal are valid.
 - View HP, inventory, abilities, objectives, discoveries, alert, elapsed actions, and enemy HP from saved game state. Major irreversible risks require confirmation.
 - Resume a saved adventure as the same player, or revisit previous inputs, narration, and endings.
 - Run playtests for users whose OIDC accounts are registered in the application in advance, and optionally save feedback to a text file.
@@ -18,9 +18,13 @@ The game UI and scenarios are in Japanese; this English README does not add an E
 Fake LLM mode lets you try the suggested actions without an API key. Use a real model such as Gemini for open-ended conversation and varied wording.
 
 This is a short-adventure MVP. The target duration of 20–30 minutes, conversation quality, and enjoyment still require human playtesting.
-[Latest verification record (Japanese)](docs/verification-20260928.md) distinguishes automated tests from agent-operated browser checks.
+[Latest verification record (Japanese)](docs/verification-20260929.md) distinguishes automated tests from agent-operated browser checks.
 
-## Quickstart: play locally with Fake LLM
+## Local play: Docker Compose first
+
+Follow the [Docker Compose setup](#play-locally-with-docker-compose) to run PostgreSQL, the API, and both workers together. It requires Docker Desktop, PowerShell, and Git; Python and Node.js are not needed just to play. The manual setup below is for development or trying the limited Fake LLM.
+
+## Optional manual setup with Fake LLM
 
 These instructions use Windows PowerShell. Install Git, Python 3.11 or later, and [uv](https://docs.astral.sh/uv/), and start Docker Desktop first.
 To use an existing PostgreSQL server, create a separate, empty development database and substitute its connection URL below.

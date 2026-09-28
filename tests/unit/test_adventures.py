@@ -61,7 +61,20 @@ async def test_catalog_exposes_only_public_scenario_and_preset_fields() -> None:
                     "athletics", "acrobatics", "perception", "stealth", "persuasion"
                 ],
             },
-        }
+        },
+        {
+            "scenario_ref": "mist_lighthouse",
+            "scenario_version": 1,
+            "title": "霧灯台の航海日誌",
+            "objective": "灯台の航海日誌を港へ届ける。灯火の復旧、別の解決、撤退も選べる。",
+            "character_creation": {
+                "abilities": ["strength", "agility", "insight", "presence"],
+                "points": 2,
+                "specialties": [
+                    "athletics", "acrobatics", "perception", "stealth", "persuasion"
+                ],
+            },
+        },
     ]
     assert {p["preset_ref"] for p in data["presets"]} == {"scout", "guardian"}
     assert all(

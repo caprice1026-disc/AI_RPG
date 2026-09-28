@@ -209,6 +209,56 @@ def test_v3_open_action_persists_shortcut_pressure_and_fact(database: Engine) ->
         runner.run(run())
 
 
+def test_new_open_scenario_v1_persists_action_and_can_revisit_closed_scene(
+    database: Engine,
+) -> None:
+    async def run() -> None:
+        async with _postgres_sessions(URL) as factory, client_for(factory) as client:
+            created = (await client.post("/adventures", json=payload(
+                scenario_ref="mist_lighthouse", scenario_version=1,
+                ability_points={"strength": 0, "agility": 1, "insight": 1, "presence": 0},
+                specialty_skill="perception",
+            ))).json()
+            base = f"/campaigns/{created['campaign_id']}"
+            uow = lambda: PostgresUnitOfWork(factory)  # noqa: E731
+            worker = SkillCheckResolutionWorker(
+                uow, ScriptedFakeLLM([{"kind": "action_plan", "actions": [{
+                    "kind": "open_action", "approach": "舟小屋の窓から入る", "check": None,
+                    "success": {"next_scene_ref": "boathouse"}, "failure": None,
+                }]}]), MvpV1Ruleset(DiceEngine(_SequenceRandom([10]))),
+                WorkerPhasePolicy(60, 3, 120, "fake"),
+                scenario_progressor=ScenarioProgressor(BUILTIN_SCENARIOS),
+            )
+            first = await client.post(base + "/turns", json={
+                "request_id": str(uuid4()), "expected_state_version": 0,
+                "actor_id": created["actor_id"],
+                "content": {"kind": "text", "text": "舟小屋の窓から入る"},
+            })
+            assert first.status_code == 202, first.text
+            assert await worker.run_once(UUID(first.json()["turn_id"]))
+            after = (await client.get(base + "/state")).json()
+            assert after["adventure"]["current_scene"]["scene_ref"] == "boathouse"
+            assert after["adventure"]["elapsed_actions"] == 1
+            narrator = NarrationWorker(
+                uow, ScriptedFakeLLM([{"narration": "舟小屋に入った。", "choices": []}]),
+                WorkerPhasePolicy(60, 3, 120, "fake"),
+            )
+            assert await narrator.run_once(UUID(first.json()["turn_id"]))
+            second = await client.post(base + "/turns", json={
+                "request_id": str(uuid4()), "expected_state_version": 1,
+                "actor_id": created["actor_id"],
+                "content": {"kind": "scenario_action", "action_ref": "boathouse_to_shore"},
+            })
+            assert second.status_code == 202, second.text
+            assert await worker.run_once(UUID(second.json()["turn_id"]))
+            back = (await client.get(base + "/state")).json()
+            assert back["adventure"]["current_scene"]["scene_ref"] == "shore"
+            assert back["adventure"]["elapsed_actions"] == 2
+
+    with asyncio.Runner(loop_factory=asyncio.SelectorEventLoop) as runner:
+        runner.run(run())
+
+
 def test_v3_search_repairs_unrequested_travel_and_stays_in_hall(database: Engine) -> None:
     async def run() -> None:
         async with _postgres_sessions(URL) as factory, client_for(factory) as client:

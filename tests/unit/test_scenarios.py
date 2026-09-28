@@ -150,6 +150,22 @@ def test_open_chapel_keeps_core_facts_inside_an_authored_region() -> None:
     }
 
 
+def test_mist_lighthouse_has_multiple_routes_and_bounded_endings() -> None:
+    scenario = BUILTIN_SCENARIOS.get("mist_lighthouse", 1)
+    assert scenario.ruleset_ref == "mvp_v2"
+    assert scenario.world is not None
+    assert scenario.world.goal_scene_ref == "lantern_room"
+    assert scenario.world.goal_flag_ref == "journal_recovered"
+    assert scenario.world.outside_ending_ref == "retreated"
+    scenes = {scene.scene_ref: scene for scene in scenario.scenes}
+    assert {"boathouse", "stairwell"} <= set(scenes["shore"].open_destinations)
+    assert "lantern_room" in scenes["stairwell"].open_destinations
+    assert "journal_recovered" not in scenes["shore"].open_flags
+    assert {ending.ending_ref for ending in scenario.endings} >= {
+        "recovered", "costly_success", "alternative_resolution", "retreated"
+    }
+
+
 def test_open_world_rejects_a_protected_fact_outside_its_landmarks() -> None:
     scenario = BUILTIN_SCENARIOS.get("ruined_chapel", 3)
     payload = scenario.model_dump()
