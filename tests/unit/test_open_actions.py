@@ -386,6 +386,48 @@ def test_generated_fact_cannot_shadow_or_relocate_protected_lore() -> None:
             progressor.progress_open(_run(), proposal, "success")
 
 
+def test_lighthouse_journal_cannot_be_moved_to_the_boathouse_by_generated_fact() -> None:
+    run = ScenarioRunSnapshot(
+        campaign_id=UUID(int=1), scenario_ref="mist_lighthouse", scenario_version=1,
+        status="active", ending_ref=None,
+        scenes=tuple(ScenarioSceneSnapshot(UUID(int=n + 1), n,
+                                           "active" if n == 1 else "planned")
+                     for n in range(1, 6)),
+        flags=frozenset(),
+    )
+    progressor = ScenarioProgressor(BUILTIN_SCENARIOS)
+    for public_text in (
+        "航海日誌は舟小屋の木箱の下にある。",
+        "舟小屋の木箱の下に航海日誌が隠されている。",
+    ):
+        intent = OpenActionIntent(
+            kind="open_action", approach="船着き場を調べる", check=None,
+            success={"facts": [{"fact_ref": "journal_box", "kind": "clue",
+                                "public_text": public_text}]}, failure=None,
+        )
+        with pytest.raises(ScenarioActionUnavailableError, match="protected lore"):
+            progressor.progress_open(run, intent, "success")
+
+    clue = "舟小屋には航海日誌の手掛かりになる古い航路図がある。"
+    intent = OpenActionIntent(
+        kind="open_action", approach="船着き場を調べる", check=None,
+        success={"facts": [{"fact_ref": "journal_clue", "kind": "clue",
+                            "public_text": clue}]}, failure=None,
+    )
+    assert progressor.progress_open(run, intent, "success").facts[0].public_text == clue
+
+    recovered = replace(run, flags=frozenset({"journal_recovered"}))
+    moved = OpenActionIntent(
+        kind="open_action", approach="回収した日誌を舟小屋に置く", check=None,
+        success={"facts": [{"fact_ref": "journal_set_down", "kind": "clue",
+                            "public_text": "航海日誌は舟小屋の木箱の下に置かれた。"}]},
+        failure=None,
+    )
+    assert progressor.progress_open(recovered, moved, "success").facts[0].fact_ref == (
+        "journal_set_down"
+    )
+
+
 def test_protected_lore_paraphrase_and_benign_context_are_separate() -> None:
     progressor = ScenarioProgressor(BUILTIN_SCENARIOS)
     forbidden = (

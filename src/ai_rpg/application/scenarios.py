@@ -90,6 +90,16 @@ def _contradicts_chapel_lore(text: str, protected_terms: tuple[str, ...]) -> boo
     return any(re.search(pattern, text) for pattern in patterns)
 
 
+def _contradicts_lighthouse_lore(text: str) -> bool:
+    # ponytail: only explicit journal relocation; add evaluated patterns if playtests find more.
+    journal = r"(?:航海日誌|日誌)"
+    other_place = r"(?:船着き場|舟小屋|外階段|岩礁)"
+    return any(re.search(pattern, text) for pattern in (
+        rf"{journal}(?:は|が).{{0,25}}{other_place}.{{0,12}}(?:ある|置かれ|隠され|見つか)",
+        rf"{other_place}.{{0,25}}{journal}(?:は|が).{{0,12}}(?:ある|置かれ|隠され|見つか)",
+    ))
+
+
 class ScenarioProgressor:
     def __init__(self, catalog: ScenarioCatalog) -> None:
         self._catalog = catalog
@@ -349,10 +359,15 @@ class ScenarioProgressor:
             self.validate_player_request(snapshot, fact.public_text)
             if fact.fact_ref in {item.fact_ref for item in definition.world.protected_facts}:
                 raise ScenarioActionUnavailableError("Generated fact reference is protected")
-            if (definition.scenario_ref == "ruined_chapel" and definition.version == 3
-                    and _contradicts_chapel_lore(
-                        fact.public_text, definition.world.protected_terms
-                    )):
+            if (
+                (definition.scenario_ref == "ruined_chapel" and definition.version == 3
+                 and _contradicts_chapel_lore(
+                     fact.public_text, definition.world.protected_terms
+                 ))
+                or (definition.scenario_ref == "mist_lighthouse" and definition.version == 1
+                    and definition.world.goal_flag_ref not in resulting_flags
+                    and _contradicts_lighthouse_lore(fact.public_text))
+            ):
                 raise ScenarioActionUnavailableError("A proposed fact contradicts protected lore")
             previous = next((value for value in snapshot.facts
                              if value.fact_ref == fact.fact_ref), None)
