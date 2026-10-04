@@ -93,7 +93,7 @@ Issue #29と[詳細設計](../docs/story-authoring-design.md)、[実装方針](.
 - 対象実装は `ba744c3d7414580e3f7af6326b0d59e7f8a72223`。remote mainとの一致と作業ツリーに変更がないことを確認した。
 - 専用PostgreSQLを設定して `pytest tests -q -p no:cacheprovider` を全件実行し、1046成功・実Geminiの明示実行用2件skip・警告1件（依存ライブラリの非推奨API）を確認した。実行時間は923.20秒。成功分は単体・契約718件、PostgreSQL312件、その他API・配布資産16件で、DB未設定によるskipはない。
 - 上記でskipした実Geminiの2ケースも別の専用DBで実行した。テンプレートからの生成は成功。空原稿の構成案生成は初回に `job_timeout` となり、テスト全体で61.92秒かかった。本番とテストが同じ60秒timeout・90秒lease・`google:gemini-3.5-flash`を使うことを確認し、設定を変えず失敗ケースだけを1回再実行すると17.09秒で成功した。単発のタイムアウトが起きた事実は残し、遅延が解消されたとは断定しない。
-- 再実行では構成案の編集・承認、具体化、原稿への採用、共通検証、生成作品の完走・再開を確認した。通常suite、実モデル初回、実モデル再実行のJUnit XMLを作業workspaceの `AI_RPG-local-docker/verification-20261005.xml`、`verification-gemini-20261005.xml`、`verification-gemini-retry-20261005.xml` に保存した。初回の失敗記録は上書きしていない。
+- 再実行では構成案の編集・承認、具体化、原稿への採用、共通検証、生成作品の完走と保存状態の取得を確認した。このテストは生成に実Gemini、試遊の描写にFakeを使い、前節の実ブラウザ試遊とは別である。通常suite、実モデル初回、実モデル再実行のJUnit XMLを作業workspaceの `AI_RPG-local-docker/verification-20261005.xml`、`verification-gemini-20261005.xml`、`verification-gemini-retry-20261005.xml` に保存した。初回の失敗記録は上書きしていない。
 - 稼働中Dockerの作者サービス、原稿保存、AI生成、履歴保守の4ファイルをSHA256で照合し、対象実装と一致した。18769番のAPIはhealthyで、解決・描写・作者補助workerは稼働している。
 - Issue #29と#39の完了条件を読み直し、公開環境の受入はIssue #19の独立した条件であることを確認した。現在の設定には公開origin、OIDC issuer、browser clientがなく、GitHubのhomepage・deployments・environmentsにも接続先はない。
 - 公開受入を続けるには、公開URL、OIDCのテスト用ログイン手順、reverse proxyの設定・ログの確認手段が必要。ローカル開発プレイヤーやHTTPで成功しても、公開originの認証・Secure Cookie・SSE・ログの検証には代えられない。接続先がないまま新規公開や認証の緩和は行わない。
