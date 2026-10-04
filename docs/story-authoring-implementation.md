@@ -288,3 +288,20 @@ PRはschema一般化、DB追加/import、読取切替などレビュー可能な
 具体的なquota、token、地点数/文字数の上限、保存履歴保持、provider/modelは設定値として分離し、実測と予算により決定する。未定値を無制限として実装しない。基本方針の再承認を待つ必要はない。
 
 公開条件は同一compiled hashで作者が少なくとも1結末に到達し、ブロッキングエラーがなく警告を確認したこと。これは会話の「作者試遊・公開前検証」を実行可能な初期基準へ具体化したもの。完全な経路検証や面白さの保証ではない。将来緩和・強化する場合は理由と受入変更を記録する。
+
+## 10. 起票済みIssue
+
+親Issue: [#29](https://github.com/caprice1026-disc/AI_RPG/issues/29)
+
+| 作業 | Issue | 依存 |
+| --- | --- | --- |
+| S1 | [#30: [P0] 任意作品を実行できるScenario定義・初期化・整合性検証へ一般化する](https://github.com/caprice1026-disc/AI_RPG/issues/30) | なし |
+| S2 | [#31: [P0] 作品・下書き・不変版・プレイ参照のDB保存と旧作品移行を実装する](https://github.com/caprice1026-disc/AI_RPG/issues/31) | #30 |
+| S3 | [#32: [P0] API・worker・冒険一覧を不変Scenario版の共通取得経路へ切り替える](https://github.com/caprice1026-disc/AI_RPG/issues/32) | #31 |
+| S4 | [#33: [P1] 下書き編集API・自動保存・履歴復元・所有者認可を実装する](https://github.com/caprice1026-disc/AI_RPG/issues/33) | #31 |
+| S5 | [#34: [P1] 拡張可能なテンプレートregistryとフォーム式作品エディタを実装する](https://github.com/caprice1026-disc/AI_RPG/issues/34) | #30, #33 |
+| S6 | [#35: [P1] 共通コンパイル・公開前検証・版固定の作者試遊を実装する](https://github.com/caprice1026-disc/AI_RPG/issues/35) | #32, #33, #34 |
+| S7 | [#36: [P1] 不変版の公開・限定共有・作品詳細・別ユーザーのプレイを実装する](https://github.com/caprice1026-disc/AI_RPG/issues/36) | #35 |
+| S8 | [#37: [P2] フォーム原稿のAI整合性確認・補完と非同期提案採用を実装する](https://github.com/caprice1026-disc/AI_RPG/issues/37) | #33, #35 |
+| S9 | [#38: [P2] 自然文の条件から構成案・実行定義候補を生成する](https://github.com/caprice1026-disc/AI_RPG/issues/38) | #34, #37 |
+| S10 | [#39: [P1: 一般公開前] 作品発見・参加登録・利用制限・通報と運営停止を実装する](https://github.com/caprice1026-disc/AI_RPG/issues/39) | #36 |
