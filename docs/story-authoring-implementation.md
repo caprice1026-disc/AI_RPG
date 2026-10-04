@@ -267,7 +267,7 @@ PRはschema一般化、DB追加/import、読取切替などレビュー可能な
 | UI | 作成→自動保存→検証修正→試遊→公開→別アカウントで開始 |
 | 運営 | blockedと実行確定の競合、quota並行消費、検索への非公開混入防止 |
 
-有限状態検証の成功と自由入力全体の保証を混同しない。Fake・エージェント・実モデルの技術確認と人の楽しさ評価も分ける。必要な回帰テストは実装時に追加し、文書変更だけの今回にはゲームテストの実施を主張しない。
+有限状態検証の成功と自由入力全体の保証を混同しない。Fake・エージェント・実モデルの技術確認と人の楽しさ評価も分ける。追加した回帰テスト、実モデルでの試遊、残る環境条件は[実行記録](../.agent/story-authoring-execplan.md)に記録する。
 
 現在の開発用コマンドはREADME/developmentに従う。初期候補は `uv run --frozen pytest tests/unit tests/contract -q -p no:cacheprovider`、`uv run --frozen ruff check .`、`uv run --frozen mypy src`。DB変更時は専用PostgreSQL環境でmigrationと該当統合テストを実行し、最終統合時に必要な全DB suiteを最終コードで確認する。DB未設定skipを成功としない。UI変更時はfrontendのtest/typecheck/buildと同一originでの確認を行い、リポジトリ方針に従い生成物も更新する。
 
@@ -277,11 +277,11 @@ PRはschema一般化、DB追加/import、読取切替などレビュー可能な
 - #19: 公開HTTPS/OIDC/SSEの受入。M3の環境ゲートとして参照し、重複起票しない。
 - #24〜#28: 人の初回操作・意図一致・代償・楽しさ・プレイ時間の評価。技術的な完走で代替しない。新作者UIの評価観点を必要に応じ追加する。
 
-既存Issueは今回の設計追加だけでcloseしない。現行open一覧を確認した範囲では本書のauthoring基盤と同等の実装Issueはなく、専用の親IssueとS1〜S10を起票する。
+既存Issueは設計追加や一部の技術検証だけでcloseしない。authoring基盤の親IssueとS1〜S10は第10節にまとめた。外部環境や人の評価が必要な条件を、実装済みの条件と区別して扱う。
 
-## 8. 将来の実装作業での計画管理
+## 8. 実装作業の計画管理
 
-.AGENTS.mdは大規模実装時に日本語ExecPlanを.agent/へ作成・更新するよう求めている。今回の文書作成では必須ではない。基点treeにはPLANS.mdは確認できなかったため、実装着手時に所在・最新ルールを再確認し、既存ExecPlanの様式を参考にする。
+.AGENTS.mdに従い、[日本語ExecPlan](../.agent/story-authoring-execplan.md)を作成・更新する。PLANS.mdは実装着手時にも確認できなかったため、既存計画の様式に従う。
 
 実装時のExecPlanは本書・詳細設計書とIssueを参照し、実行状況、調査結果、検証証拠、変更した判断だけを記録する。同じ仕様を別形式で複製しない。
 

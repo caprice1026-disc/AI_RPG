@@ -3,7 +3,7 @@ import { flushPromises, mount, type VueWrapper } from '@vue/test-utils'
 import App from '../src/App.vue'
 import { catalog, response } from './fixtures'
 import { story, storyServer, templates } from './story-fixtures'
-import { node, rows } from '../src/story-contracts'
+import { node, rows, type StoryTemplate } from '../src/story-contracts'
 
 const wrappers: VueWrapper[] = []
 const button = (w: VueWrapper, label: string) => w.findAll('button').find(b => b.text() === label)!
@@ -36,6 +36,44 @@ it('offers both registry templates, escapes authored text, and hides all author 
   await button(w, 'ログアウト').trigger('click'); await flushPromises()
   expect(w.find('.author-page').exists()).toBe(false)
   expect(w.html()).not.toContain('作者の秘密'); expect(w.html()).not.toContain('鍵は塔にある')
+})
+
+it('renders template guidance from API metadata for an unfamiliar template without HTML or payload changes', async () => {
+  const provided = { ...templates()[0]!, template_id: 'moon_archive', version: 7, sections: ['world', 'scenes'],
+    questions: [
+      { prompt: '月の書庫で何を探しますか？', hint: '<img src=x onerror=alert(1)>も文字として扱う', target_section: 'world', field_path: '/scenario/objective' },
+      { prompt: '帰還までに何が起きますか？', hint: '', target_section: 'scenes', field_path: null },
+    ], recommended_structure: ['書庫への導入', '<script>見つけた秘密</script>', '帰還の選択'] } satisfies StoryTemplate
+  const original = JSON.stringify(provided)
+  const { w, api } = await render(storyServer(path => path === '/stories/templates' ? response({ templates: [provided] }) : undefined))
+  await button(w, 'マイ作品').trigger('click'); await flushPromises()
+  const card = w.get('.template-list article')
+  expect(card.text()).toContain('テンプレート 第7版')
+  expect(card.text()).toContain('編集項目: 世界・目的、場所・行動・分岐')
+  expect(card.get('summary').text()).toBe('作成のヒント')
+  await card.get('summary').trigger('click')
+  expect(card.text()).toContain('月の書庫で何を探しますか？')
+  expect(card.text()).toContain('<img src=x onerror=alert(1)>も文字として扱う')
+  expect(card.text()).toContain('入力先: 世界・目的')
+  expect(card.text()).toContain('入力先: 場所・行動・分岐')
+  expect(card.findAll('ol li').map(item => item.text())).toEqual(['書庫への導入', '<script>見つけた秘密</script>', '帰還の選択'])
+  expect(card.find('img, script').exists()).toBe(false)
+  expect(card.text()).not.toContain('/scenario/objective')
+  expect(card.text()).not.toContain('作者の秘密')
+  await card.get('[data-template="moon_archive"]').trigger('click'); await flushPromises()
+  expect(JSON.parse(String(api.posts()[0]!.init.body))).toEqual({ request_id: expect.any(String), template_id: 'moon_archive' })
+  expect(JSON.stringify(provided)).toBe(original)
+})
+
+it.each(['omitted', 'empty'])('keeps template cards usable when additive guidance is %s', async guidance => {
+  const basic = { ...templates()[0]!, questions: [], recommended_structure: [] } satisfies StoryTemplate
+  const provided = guidance === 'empty' ? basic : templates()[0]!
+  const { w } = await render(storyServer(path => path === '/stories/templates' ? response({ templates: [provided] }) : undefined))
+  await button(w, 'マイ作品').trigger('click'); await flushPromises()
+  const card = w.get('.template-list article')
+  expect(card.text()).toContain('編集項目:')
+  expect(card.find('details').exists()).toBe(false)
+  expect(card.get('[data-template="garden"]').attributes('disabled')).toBeUndefined()
 })
 
 it('forms edit all core fields using labels and selectors, with no raw ref or JSON input', async () => {

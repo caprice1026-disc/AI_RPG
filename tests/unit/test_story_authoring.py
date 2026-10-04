@@ -1,13 +1,24 @@
 """Loose drafts, deterministic compilation and finite flag traversal."""
 
 from copy import deepcopy
+from dataclasses import replace
+from datetime import UTC, datetime
+from importlib.resources import files
+from unittest.mock import MagicMock
 from uuid import uuid4
 
 import pytest
+from fastapi import FastAPI
+from fastapi.testclient import TestClient
 from pydantic import ValidationError
 
+import ai_rpg.application.stories as story_module
+import ai_rpg.contracts.stories as story_contracts
+from ai_rpg.api.stories import create_stories_router
+from ai_rpg.application.auth import AuthenticatedPrincipal
 from ai_rpg.application.stories import assign_missing_refs, compile_draft, templates
-from ai_rpg.contracts.stories import AuthoringDraft, StoryMetadata
+from ai_rpg.contracts.stories import AuthoringDraft, StoryMetadata, TemplateDefinition
+from ai_rpg.scenarios import ScenarioCatalog, ScenarioDefinition
 
 
 def small_draft() -> AuthoringDraft:
@@ -123,6 +134,146 @@ def test_template_registry_copies_and_explicit_initialization_compile() -> None:
         assert "freeform_unverified" in {warning.code for warning in report.warnings}
     registered[0].initial_draft.scenario["title"] = "Changed"
     assert templates().templates[0].initial_draft.scenario["title"] != "Changed"
+
+
+def test_template_alias_uses_source_object_labels(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setitem(
+        story_module.TEMPLATE_REGISTRY, "third_template",
+        story_module.TEMPLATE_REGISTRY["mist_lighthouse"],
+    )
+    registered = {template.template_id: template for template in templates().templates}
+    alias = registered["third_template"]
+    assert alias.initial_draft == registered["mist_lighthouse"].initial_draft
+    definition, report = compile_draft(alias.initial_draft, uuid4(), 1)
+    assert report.errors == []
+    assert definition is not None
+    assert any(item.label == "航海日誌" for item in definition.initialization.items)
+
+
+def test_native_schema2_template_preserves_objects_without_legacy_labels(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = ScenarioDefinition.model_validate_json(
+        files("ai_rpg.scenarios").joinpath("clockwork_garden.json").read_text(encoding="utf-8"),
+    )
+    assert source.schema_version == 2
+    assert source.scenario_ref not in story_module.TEMPLATE_OBJECT_LABELS
+    monkeypatch.setattr(story_module, "BUILTIN_SCENARIOS", ScenarioCatalog([
+        *(story_module.BUILTIN_SCENARIOS.get(*key) for key in story_module.BUILTIN_KEYS),
+        source,
+    ]))
+    monkeypatch.setitem(story_module.TEMPLATE_REGISTRY, "native_garden", (
+        story_module.TemplateRegistryEntry(
+            source_ref=source.scenario_ref, source_version=source.version, version=1,
+            description="Native schema-2 objects need no legacy label mapping.",
+        )
+    ))
+
+    template = next(t for t in templates().templates if t.template_id == "native_garden")
+    definition, report = compile_draft(template.initial_draft, uuid4(), 1)
+    assert report.errors == []
+    assert definition is not None
+    assert definition.initialization == source.initialization
+    assert definition.world == source.world
+    assert definition.scenes == source.scenes
+    assert {item.ref: item.label for item in definition.initialization.items} == {
+        "pruning_hook": "Pruning hook", "leaf_tonic": "Leaf tonic", "seed_pod": "Last seed pod",
+    }
+
+
+def test_old_template_payload_defaults_to_empty_guidance() -> None:
+    template = TemplateDefinition.model_validate({
+        "template_id": "old_template", "version": 1, "title": "Old template",
+        "description": "Existing payload", "required_capabilities": [],
+        "sections": ["world"], "initial_draft": {},
+    })
+    assert template.questions == []
+    assert template.recommended_structure == []
+
+
+def test_template_questions_are_typed_optional_display_guidance() -> None:
+    template = TemplateDefinition.model_validate({
+        "template_id": "guided", "version": 2, "title": "Guided template",
+        "description": "Plain text only", "required_capabilities": [],
+        "sections": ["world"], "initial_draft": {},
+        "questions": [{"prompt": "What is the goal?", "target_section": "world"}],
+        "recommended_structure": ["Introduce the goal", "Offer a way to leave"],
+    })
+    assert template.questions[0].model_dump() == {
+        "prompt": "What is the goal?", "hint": "", "target_section": "world",
+        "field_path": None,
+    }
+    assert template.initial_draft == AuthoringDraft()
+    assert template.recommended_structure == ["Introduce the goal", "Offer a way to leave"]
+
+
+@pytest.mark.parametrize("change", [
+    {"prompt": ""}, {"hint": 123}, {"field_path": "scenario/objective"},
+    {"target_section": "missing"}, {"html": "<script>alert(1)</script>"},
+])
+def test_template_guidance_rejects_invalid_questions(change: dict[str, object]) -> None:
+    with pytest.raises(ValidationError):
+        TemplateDefinition.model_validate({
+            "template_id": "guided", "version": 1, "title": "Guide",
+            "description": "Guide", "required_capabilities": [],
+            "sections": ["world"], "initial_draft": {},
+            "questions": [{"prompt": "What is the goal?", "target_section": "world", **change}],
+        })
+
+
+def test_template_api_exposes_independent_registry_guidance_and_version(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    original = next(t for t in templates().templates if t.template_id == "mist_lighthouse")
+    question = story_contracts.TemplateQuestion(
+        prompt="What should the visitor recover?", hint="Choose one object.",
+        target_section="world", field_path="/scenario/objective",
+    )
+    monkeypatch.setitem(story_module.TEMPLATE_REGISTRY, "third_template", replace(
+        story_module.TEMPLATE_REGISTRY["mist_lighthouse"], version=7,
+        title="An independent template", description="A different authoring guide",
+        sections=("world", "scenes"), questions=(question,),
+        recommended_structure=("Arrival", "Investigation", "Return"),
+    ))
+
+    async def authenticated() -> AuthenticatedPrincipal:
+        return AuthenticatedPrincipal(uuid4(), "test", "test", datetime.now(UTC), frozenset())
+
+    app = FastAPI()
+    app.include_router(create_stories_router(
+        principal_provider=authenticated, service=story_module.StoryService(MagicMock()),
+    ))
+    with TestClient(app) as client:
+        response = client.get("/stories/templates")
+    assert response.status_code == 200
+    payloads = {t["template_id"]: t for t in response.json()["templates"]}
+    alias = payloads["third_template"]
+    assert alias["version"] == 7
+    assert alias["title"] == "An independent template"
+    assert alias["description"] == "A different authoring guide"
+    assert alias["sections"] == ["world", "scenes"]
+    assert alias["questions"] == [{
+        "prompt": "What should the visitor recover?", "hint": "Choose one object.",
+        "target_section": "world", "field_path": "/scenario/objective",
+    }]
+    assert alias["recommended_structure"] == ["Arrival", "Investigation", "Return"]
+    assert alias["initial_draft"] == original.initial_draft.model_dump(mode="json")
+    assert alias["initial_draft"]["scenario"]["version"] == 1
+    assert payloads["mist_lighthouse"] == original.model_dump(mode="json")
+
+    returned = next(t for t in templates().templates if t.template_id == "third_template")
+    returned.initial_draft.scenario["title"] = "Edited draft"
+    returned.questions.clear()
+    returned.recommended_structure.append("Unwanted change")
+    fresh = next(t for t in templates().templates if t.template_id == "third_template")
+    assert fresh.model_dump(mode="json") == alias
+
+
+def test_builtin_templates_offer_questions_and_recommended_structure() -> None:
+    for template in templates().templates:
+        assert template.questions
+        assert template.recommended_structure
+        assert all(question.target_section in template.sections for question in template.questions)
 
 
 def test_metadata_only_changes_reuse_compiled_hash_but_not_validation_report() -> None:

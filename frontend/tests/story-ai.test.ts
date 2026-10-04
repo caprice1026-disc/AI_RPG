@@ -91,6 +91,43 @@ it('outline edits require saving and explicit approval before concretization', a
   expect(JSON.parse(String(api.posts().filter(c => c.path.endsWith('/authoring-jobs'))[1]!.init.body))).toMatchObject({ kind: 'concretize', base_revision: 1, outline_job_id: 'job-a', approved_outline_revision: 2 })
 })
 
+it.each(['success', 'unknown'])('shows outline-save latency as in-flight, retaining exact replay only for an %s outcome', async outcome => {
+  const first = deferred<Response>(), retry = deferred<Response>()
+  const current = job({ kind: 'outline', proposal: null, outline_revision: 1,
+    outline: { title: '庭', premise: '庭の謎', scenes: ['門'], characters: [], endings: [], undecided: [] } })
+  const saved = { ...current, outline_revision: 2, outline: { ...current.outline!, title: '作者が決めた庭' } }
+  let attempts = 0
+  const { w, api } = await render(storyServer((path, init) => {
+    if (path.endsWith('/authoring-jobs')) return response({ jobs: [current] })
+    if (path.endsWith('/outline') && init.method === 'PUT') return ++attempts === 1 ? first.promise : retry.promise
+  }))
+  await w.get('[id="/ai-outline/title"]').setValue('作者が決めた庭')
+  const saveButton = button(w, '構成案の修正を保存')
+  await saveButton.trigger('click'); await flushPromises()
+  expect(api.puts()).toHaveLength(1)
+  expect(button(w, '同じAI要求を再試行')).toBeUndefined()
+  expect(w.get('[aria-label="AI作成補助"]').text()).toContain('AI操作中です')
+  expect(w.get('.outline-form').attributes('disabled')).toBeDefined()
+  expect(w.get('#ai-job-history').attributes('disabled')).toBeDefined()
+  await saveButton.trigger('click'); await flushPromises()
+  expect(api.puts()).toHaveLength(1)
+  expect((w.get('[id="/ai-outline/title"]').element as HTMLInputElement).value).toBe('作者が決めた庭')
+  first.resolve(outcome === 'unknown' ? response({}, 503) : response(saved)); await flushPromises()
+  if (outcome === 'unknown') {
+    expect(w.get('[aria-label="AI作成補助"] [role="alert"]').text()).toContain('結果が未確認')
+    expect(button(w, '同じAI要求を再試行').attributes('disabled')).toBeUndefined()
+    await button(w, '同じAI要求を再試行').trigger('click'); await flushPromises()
+    expect(api.puts()[1]!.init.body).toBe(api.puts()[0]!.init.body)
+    expect(button(w, '同じAI要求を再試行')).toBeUndefined()
+    retry.resolve(response(saved)); await flushPromises()
+  }
+  expect(w.get('.outline-form legend').text()).toContain('第2版')
+  expect(w.get('.outline-form').text()).not.toContain('未保存')
+  expect(w.get('[aria-label="AI作成補助"]').text()).not.toContain('AI操作中です')
+  expect(button(w, '同じAI要求を再試行')).toBeUndefined()
+  expect(button(w, 'この構成案を承認').attributes('disabled')).toBeUndefined()
+})
+
 it('unknown AI acceptance retries the exact request and running jobs can be cancelled', async () => {
   let attempt = 0
   const { w, api } = await render(storyServer((path, init) => {

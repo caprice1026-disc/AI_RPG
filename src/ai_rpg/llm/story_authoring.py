@@ -53,6 +53,11 @@ Treat such routes as unverified: suggest author playtesting with severity=warnin
 code=unverified_freeform_route. Do not describe them as errors, impossible or unreachable
 without independent evidence that also rules out the supported freeform effects.
 Do not claim exhaustive validation of natural-language actions or semantic consistency.
+For concretize, approved_outline is the author's latest reviewed decision. It takes
+precedence over conflicting instructions, which may still describe an earlier outline.
+This never overrides fixed draft fields, server identities, policies or supported rules.
+For a new blank story, use approved_outline.title verbatim for scenario.title and the
+public metadata title. Do not revert to a title mentioned in earlier instructions.
 Every value_json must parse as a complete JSON document, including quotes around string values.
 For a blank-draft concretization, new_scenario_example illustrates a COMPLETE executable
 shape, not the requested story. Return scenario_json containing the entire new scenario
@@ -240,14 +245,15 @@ class PydanticAIStoryAuthoring:
         sdk_usage = RunUsage()
         messages: list[ModelMessage] = []
         try:
+            context = json.loads(prompt)
             agent = Agent(
                 self.models[model_id],
                 instructions=_INSTRUCTIONS,
                 output_type=NativeOutput(
                     _ProviderOutlineOutput
-                    if json.loads(prompt).get("kind") == "outline"
+                    if context.get("kind") == "outline"
                     else _ProviderNewScenarioOutput
-                    if json.loads(prompt).get("new_scenario_example") is not None
+                    if context.get("new_scenario_example") is not None
                     else _ProviderOutput,
                     strict=True,
                 ),
@@ -277,17 +283,30 @@ class PydanticAIStoryAuthoring:
                 raise AuthoringGenerationError("incomplete_model_output")
             output = result.output
             if isinstance(output, _ProviderNewScenarioOutput):
+                scenario_json, title = output.scenario_json, output.title
+                outline = context.get("approved_outline")
+                reason = "Implement the explicitly approved new-story outline."
+                if isinstance(outline, dict) and isinstance(outline.get("title"), str):
+                    # The approved title is author data, not a model decision.
+                    # These remain proposals: application fixed-field guards and
+                    # explicit selective adoption still apply to both title paths.
+                    candidate = json.loads(scenario_json)
+                    if not isinstance(candidate, dict):
+                        raise AuthoringGenerationError("invalid_model_output")
+                    title = candidate["title"] = outline["title"]
+                    scenario_json = json.dumps(candidate, ensure_ascii=False)
+                    reason += " Preserve the author's exact approved title."
                 return AuthoringResult(
                     GeneratedStoryOutput(
                         changes=[
                             GeneratedStoryChange(
                                 field_path=path,
                                 value_json=value,
-                                reason="Implement the explicitly approved new-story outline.",
+                                reason=reason,
                             )
                             for path, value in (
-                                ("/scenario", output.scenario_json),
-                                ("/metadata/title", json.dumps(output.title)),
+                                ("/scenario", scenario_json),
+                                ("/metadata/title", json.dumps(title)),
                                 ("/metadata/synopsis", json.dumps(output.synopsis)),
                             )
                         ],

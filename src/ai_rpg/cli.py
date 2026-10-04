@@ -36,6 +36,21 @@ def _parser() -> argparse.ArgumentParser:
     commands = parser.add_subparsers(dest="command", required=True)
     commands.add_parser("seed-dev")
 
+    prune = commands.add_parser(
+        "prune-draft-history", help="Preview expired, unreferenced draft revisions; no migrations",
+    )
+    prune.add_argument(
+        "--apply", action="store_true", help="Delete the previewable batch (default: dry-run)",
+    )
+    prune.add_argument(
+        "--retention-days", type=int,
+        help="Retention days, 1..3650 (default: configured or 30)",
+    )
+    prune.add_argument(
+        "--batch-size", type=int,
+        help="Maximum revisions, 1..1000 (default: configured or 100)",
+    )
+
     api = commands.add_parser("api")
     api.add_argument("--host", default="127.0.0.1")
     api.add_argument("--port", type=int, default=8000)
@@ -119,11 +134,38 @@ async def _run_worker_command(args: argparse.Namespace, settings: Settings) -> b
         return await run_worker(worker, once=args.once, poll_seconds=1.0)
 
 
+async def _run_prune_command(args: argparse.Namespace, settings: Settings) -> dict[str, object]:
+    from ai_rpg.infrastructure.postgres.maintenance import prune_draft_history
+
+    sessions = create_session_factory(settings.database_url)
+    try:
+        return await prune_draft_history(
+            sessions,
+            retention_days=settings.draft_history_retention_days
+            if args.retention_days is None else args.retention_days,
+            batch_size=settings.draft_history_prune_batch_size
+            if args.batch_size is None else args.batch_size,
+            apply=args.apply,
+        )
+    finally:
+        await sessions.kw["bind"].dispose()
+
+
 def main(argv: Sequence[str] | None = None) -> None:
     parser = _parser()
     args = parser.parse_args(argv)
     settings = get_settings()
     _configure_event_loop()
+
+    if args.command == "prune-draft-history":
+        try:
+            result = asyncio.run(_run_prune_command(args, settings))
+        except SQLAlchemyError:
+            parser.error("draft history database operation failed")
+        except ValueError as error:
+            parser.error(str(error))
+        print(json.dumps(result, ensure_ascii=False))
+        return
 
     if args.command == "seed-dev":
         migrate_database(settings.database_url)

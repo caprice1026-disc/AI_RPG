@@ -119,9 +119,27 @@ API起動時に組込みの全保存対象versionを冪等にDBへ取り込み�
 
 自動保存と構造検証はAIを呼びません。作者が明示した `check`（整合性チェック）、`fill`（不足部分の補完）、`outline`（構成案）、`concretize`（承認済み構成案の具体化）だけを独立したauthoring-workerで処理します。構成案を編集すると承認は無効になり、具体化の前にそのrevisionを承認し直します。
 
+空原稿の具体化では、構成案で編集・承認したタイトルを古い依頼文より優先して提案します。既存原稿の固定項目は引き続き保護し、公開版や進行中の冒険は変更しません。
+
 ジョブは依頼時の下書きrevisionとsnapshotに固定し、API応答後もDBで追跡できます。画面を再読み込みした後も、AI作成補助の履歴から実行中のジョブに戻り、過去の結果を選択できます。結果は変更前後・理由を持つ提案で、選んだchange IDだけを明示的に採用すると新しい下書きになります。元の下書きが変わっていれば409で拒否し、自動でマージしません。`fixed` の項目を守り、`fillable`・`undecided` の項目も採用前に確認します。AIに原稿の直接更新、公開、ゲーム状態の更新を許可しません。
 
 `POST /stories/{id}/authoring-jobs` で依頼し、`GET /authoring-jobs/{job_id}` で状態・提案・利用量を取得します。キャンセルは `/authoring-jobs/{job_id}/cancel`、提案の採用は `/stories/{id}/proposals/{proposal_id}/apply` です。ジョブと結果は作者だけが取得できます。キャンセルしても既に送ったprovider要求の料金を取り消せるとは限りません。
+
+### テンプレートの拡張と通常履歴の保守
+
+同梱テンプレートは `application/stories.py` のregistryで管理します。テンプレート自体のversionと元シナリオのversionは別です。質問、推奨構成、フォームセクションはAPIで返す案内で、共通フォームの許可済み入力部品を利用します。テンプレートの追加・更新は作成済み原稿へ自動反映しません。
+
+通常の下書き履歴は、運用者が保守CLIで整理できます。既定は30日より古い未参照のrevision、1回100件までです。現在の原稿、公開・試遊版の元原稿、検証レポート、AIジョブ・提案が参照するrevisionは保持します。不変版と冒険データ、要求再送用のレスポンス記録は削除しません。したがって、すべての過去データを消去する機能ではありません。
+
+```powershell
+# 対象候補の確認だけ。削除やmigrationは行いません。
+docker compose exec api ai-rpg prune-draft-history
+
+# バックアップと候補を確認した運用者が、明示的に適用する場合のみ。
+docker compose exec api ai-rpg prune-draft-history --retention-days 90 --batch-size 100 --apply
+```
+
+`AIRPG_DRAFT_HISTORY_RETENTION_DAYS` は1〜3650日、`AIRPG_DRAFT_HISTORY_PRUNE_BATCH_SIZE` は1〜1000件を設定できます。CLI引数はその実行だけ設定を上書きします。更新中の作品は処理を待たずにスキップし、ロック取得後に参照を再確認します。定期実行する場合も、運用者がバックアップと必要な保持期間を決めてから設定してください。自動の削除スケジュールは登録しません。
 
 <a id="authoring-limits"></a>
 ### 利用上限とauthoring-workerの設定

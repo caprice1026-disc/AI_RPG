@@ -4,6 +4,7 @@ import hashlib
 import json
 from collections import deque
 from copy import deepcopy
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 from uuid import UUID, uuid4
@@ -30,6 +31,7 @@ from ai_rpg.contracts.stories import (
     StoryTemplatesResponse,
     StoryValidationReport,
     TemplateDefinition,
+    TemplateQuestion,
     ValidateStoryRequest,
     ValidationFinding,
 )
@@ -52,9 +54,59 @@ BUILTIN_KEYS = (
     ("ruined_chapel", 3),
     ("mist_lighthouse", 1),
 )
+
+
+@dataclass(frozen=True)
+class TemplateRegistryEntry:
+    source_ref: str
+    source_version: int
+    version: int
+    description: str
+    title: str | None = None
+    sections: tuple[str, ...] = (
+        "metadata", "world", "scenes", "initialization", "flags", "endings", "field_policies",
+    )
+    questions: tuple[TemplateQuestion, ...] = ()
+    recommended_structure: tuple[str, ...] = ()
+
+
 TEMPLATE_REGISTRY = {
-    "ruined_chapel": ("ruined_chapel", 3, "探索と対決を含む短編"),
-    "mist_lighthouse": ("mist_lighthouse", 1, "探索と交渉で目的を達成する短編"),
+    "ruined_chapel": TemplateRegistryEntry(
+        source_ref="ruined_chapel", source_version=3, version=1,
+        description="探索と対決を含む短編",
+        questions=(
+            TemplateQuestion(
+                prompt="冒険者は何を達成したいですか?",
+                hint="目的と、達成せずに撤退する選択肢を考えます。",
+                target_section="world", field_path="/scenario/objective",
+            ),
+            TemplateQuestion(
+                prompt="目的の達成を阻む相手は誰ですか?",
+                hint="相手の動機と、対話・隠密・戦闘で取れる方法を考えます。",
+                target_section="initialization", field_path="/scenario/initialization/characters",
+            ),
+        ),
+        recommended_structure=("依頼と探索への導入", "手掛かりの探索と対決", "帰還または撤退"),
+    ),
+    "mist_lighthouse": TemplateRegistryEntry(
+        source_ref="mist_lighthouse", source_version=1, version=1,
+        description="探索と交渉で目的を達成する短編",
+        questions=(
+            TemplateQuestion(
+                prompt="冒険者に何を持ち帰ってほしいですか?",
+                hint="依頼品の所在と、持ち帰らずに解決する方法を考えます。",
+                target_section="world", field_path="/scenario/objective",
+            ),
+            TemplateQuestion(
+                prompt="目的地までにどのような経路を選べますか?",
+                hint="複数の進み方と、引き返せる経路を用意します。",
+                target_section="scenes", field_path="/scenario/scenes",
+            ),
+        ),
+        recommended_structure=(
+            "依頼と経路の選択", "探索と関係者との交渉", "持ち帰り・別の解決・撤退",
+        ),
+    ),
 }
 TEMPLATE_OBJECT_LABELS = {
     "ruined_chapel": {"relic_location": "銀の聖印"},
@@ -83,8 +135,8 @@ def content_hash(payload: object) -> str:
 
 def templates() -> StoryTemplatesResponse:
     values = []
-    for template_id, (ref, version, description) in TEMPLATE_REGISTRY.items():
-        definition = BUILTIN_SCENARIOS.get(ref, version)
+    for template_id, entry in TEMPLATE_REGISTRY.items():
+        definition = BUILTIN_SCENARIOS.get(entry.source_ref, entry.source_version)
         payload = deepcopy(definition.model_dump(mode="json"))
         payload["schema_version"] = 2
         # Historical JSON kept location facts as prose. Managed templates explicitly
@@ -98,7 +150,7 @@ def templates() -> StoryTemplatesResponse:
                     payload["initialization"]["items"].append(
                         {
                             "ref": entity_ref,
-                            "label": TEMPLATE_OBJECT_LABELS[template_id][fact["fact_ref"]],
+                            "label": TEMPLATE_OBJECT_LABELS[entry.source_ref][fact["fact_ref"]],
                         }
                     )
                     payload["initialization"]["placements"].append(
@@ -136,19 +188,13 @@ def templates() -> StoryTemplatesResponse:
         values.append(
             TemplateDefinition(
                 template_id=template_id,
-                version=1,
-                title=definition.title,
-                description=description,
+                version=entry.version,
+                title=entry.title if entry.title is not None else definition.title,
+                description=entry.description,
                 required_capabilities=sorted(capabilities),
-                sections=[
-                    "metadata",
-                    "world",
-                    "scenes",
-                    "initialization",
-                    "flags",
-                    "endings",
-                    "field_policies",
-                ],
+                sections=list(entry.sections),
+                questions=list(entry.questions),
+                recommended_structure=list(entry.recommended_structure),
                 initial_draft=draft,
             )
         )
@@ -414,6 +460,7 @@ class StoryService:
         self, principal: AuthenticatedPrincipal, request: CreateStoryRequest
     ) -> StoryDraftResponse:
         draft = request.draft or AuthoringDraft()
+        template_version = None
         if request.template_id is not None:
             template = next(
                 (item for item in templates().templates if item.template_id == request.template_id),
@@ -422,7 +469,10 @@ class StoryService:
             if template is None:
                 raise StoryError("template_not_found", 404)
             draft = template.initial_draft
-        return await self.store.create(principal.principal_id, request, draft)
+            template_version = template.version
+        return await self.store.create(
+            principal.principal_id, request, draft, template_version=template_version,
+        )
 
     async def get_draft(
         self, principal: AuthenticatedPrincipal, story_id: UUID

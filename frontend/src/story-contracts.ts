@@ -9,9 +9,11 @@ export interface AuthoringDraft {
   authoring_schema_version: 1; scenario: DraftNode; metadata: StoryMetadata
   field_policies: Record<string, FieldPolicy>; notes: string
 }
+export interface TemplateQuestion { prompt: string; hint: string; target_section: string; field_path: string | null }
 export interface StoryTemplate {
   template_id: string; version: number; title: string; description: string
   required_capabilities: string[]; sections: string[]; initial_draft: AuthoringDraft
+  questions?: TemplateQuestion[]; recommended_structure?: string[]
 }
 export interface StoryDraft { story_id: string; revision: number; draft: AuthoringDraft; updated_at: string }
 export interface StoryRevision extends StoryDraft { actor_id: string; source: string }

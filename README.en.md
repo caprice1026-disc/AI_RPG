@@ -38,7 +38,7 @@ The UI and built-in stories are in Japanese. Fake LLM recognizes only a few free
 
 ## Create your own story
 
-1. Open 「マイ作品」 (My stories), choose a template or 「空の原稿から作る」 (Start from a blank draft), and edit the world, places, characters, items, actions, conditions, and endings.
+1. Open 「マイ作品」 (My stories), choose a template or 「空の原稿から作る」 (Start from a blank draft), and edit the world, places, characters, items, actions, conditions, and endings. Open a template's 「作成のヒント」 (Authoring hints) for guiding questions and a suggested structure.
 2. Changes autosave after two seconds. Check the saved status. Incomplete drafts are allowed; conflicts preserve your input for comparison with the saved revision. Revision restore and duplication are available.
 3. Select 「原稿を検証」 (Validate draft) to check structure, references, and registered-action paths. Read errors, warnings, and coverage. This step does not call an LLM.
 4. Start a playtest from the saved draft. Later edits do not change the definition used by that adventure.

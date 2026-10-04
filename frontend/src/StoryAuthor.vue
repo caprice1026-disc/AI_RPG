@@ -14,6 +14,9 @@ const visibility = ref<Visibility>('private'), lifecycle = ref<Exclude<Lifecycle
 watch(current, value => { if (value) { visibility.value = value.visibility; lifecycle.value = value.lifecycle === 'blocked' ? 'withdrawn' : value.lifecycle } }, { immediate: true })
 const visibilityLabels = { private: '自分のみ', unlisted: 'URLで限定共有', public: '一般公開' }
 const lifecycleLabels = { active: '有効', withdrawn: '公開停止', blocked: '運営による停止', archived: 'アーカイブ' }
+const sectionNames: Record<string, string> = { metadata: '基本情報・公開紹介', world: '世界・目的', scenes: '場所・行動・分岐',
+  initialization: '人物・アイテム・配置', flags: '進行条件', endings: '結末', field_policies: 'AI裁量' }
+const sectionLabel = (section: string) => Object.hasOwn(sectionNames, section) ? sectionNames[section] : section
 const status = computed(() => ({ saved: '保存済み', waiting: '未保存・入力から2秒後に保存', saving: '保存中…', failed: '保存失敗・入力を保持しています', conflict: '競合・入力を保持しています' })[s.saveStatus])
 const locked = computed(() => s.busy || !!s.pendingOperation || s.externalPending)
 const shareLink = computed(() => s.published ? `${location.origin}/?story=${encodeURIComponent(s.published.story_id)}` : '')
@@ -66,6 +69,20 @@ onActivated(() => { void props.editor.load() })
         <article v-for="template in s.templates" :key="template.template_id" class="author-row">
           <h3>{{ template.title }}</h3><p>{{ template.description }}</p>
           <p class="hint">テンプレート 第{{ template.version }}版 · {{ template.required_capabilities.map(c => capabilityNames[c] ?? `未対応: ${c}`).join('、') }}</p>
+          <p v-if="template.sections.length" class="hint">編集項目: {{ template.sections.map(sectionLabel).join('、') }}</p>
+          <details v-if="template.questions?.length || template.recommended_structure?.length">
+            <summary>作成のヒント</summary>
+            <template v-if="template.questions?.length">
+              <h4>考えておきたいこと</h4>
+              <ul><li v-for="(question, i) in template.questions" :key="i">
+                <p>{{ question.prompt }}</p><p v-if="question.hint" class="hint">{{ question.hint }}</p>
+                <small>入力先: {{ sectionLabel(question.target_section) }}</small>
+              </li></ul>
+            </template>
+            <template v-if="template.recommended_structure?.length">
+              <h4>推奨構成</h4><ol><li v-for="(part, i) in template.recommended_structure" :key="i">{{ part }}</li></ol>
+            </template>
+          </details>
           <p v-if="template.required_capabilities.some(c => !capabilityNames[c])" class="error">この画面では未対応の機能を含むため作成できません。</p>
           <button :data-template="template.template_id" :disabled="locked || template.required_capabilities.some(c => !capabilityNames[c])"
             @click="editor.create(template.template_id)">このテンプレートで作成</button>

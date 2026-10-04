@@ -179,26 +179,32 @@ AIがrevision 10を処理中に作者が11を保存したら、結果は10への
 
 既存のDB workerの運用知識を再利用し、authoring jobはゲームTurnのtransactionと分離する。大量の生成がプレイを止めないよう別の同時実行枠・queue処理を設ける。作者原稿はデータとして扱い、system指示・任意ツール実行権限として扱わない。
 
-## 11. API案
+## 11. API
 
-既存/adventures APIを活用し、新旧契約は移行期に明示的に共存させる。以下は予定の境界であり既存endpointではない。
+既存の `/adventures` APIを活用し、組み込み作品とユーザー作品を共通の版参照で扱う。以下は実装済みの境界。リクエスト型は `contracts/stories.py`、`contracts/story_jobs.py`、`contracts/community.py` を参照する。
 
-| 操作 | API案 | 重要な契約 |
+| 操作 | API | 重要な契約 |
 | --- | --- | --- |
-| 自作品一覧・作成 | GET/POST /stories/mine またはPOST /stories | 所有者は認証principalから取得 |
-| 原稿取得・保存 | GET/PATCH /stories/{id}/draft | expected_revision、request_id、変更内容 |
+| 自作品一覧・作成 | GET /stories/mine、POST /stories | 所有者は認証principalから取得 |
+| 原稿取得・保存 | GET/PUT /stories/{id}/draft | expected_revision、request_id、原稿全体 |
 | 履歴・復元 | GET /stories/{id}/revisions、POST /stories/{id}/restore | 復元先も新revision |
-| テンプレート一覧 | GET /story-templates | supported capabilities、version |
+| テンプレート一覧 | GET /stories/templates | supported capabilities、version |
 | 検証 | POST /stories/{id}/validate | 保存済みrevision対象 |
 | 試遊開始 | POST /stories/{id}/playtests | snapshot固定、request_id |
 | 公開 | POST /stories/{id}/publish | revision、検証report、公開範囲、request_id |
-| 公開停止 | POST /stories/{id}/withdraw | 作者権限、監査 |
+| 公開設定・停止 | PUT /stories/{id}/settings | 作者権限、visibility、lifecycle=withdrawn、監査 |
 | 複製 | POST /stories/{id}/duplicate | 自作品のみ、新しい作品ID |
-| 公開一覧・詳細 | GET /stories、GET /stories/{id} | 公開projectionのみ、cursor pagination |
+| 公開一覧・詳細 | GET /public/stories、GET /public/stories/{id} | 匿名閲覧、公開projectionのみ、cursor pagination |
+| 認証済み詳細 | GET /stories/{id} | 所有権・公開範囲に応じた表示 |
 | 通常プレイ開始 | POST /adventures | story_version_id追加、開始権限検査 |
-| AIジョブ | POST /stories/{id}/authoring-jobs、GET /authoring-jobs/{id} | 種別・base_revision・request_id |
+| AIジョブ・履歴 | GET/POST /stories/{id}/authoring-jobs、GET /authoring-jobs/{id} | 種別・base_revision・request_id |
+| 構成案の編集・承認 | PUT /authoring-jobs/{id}/outline、POST /authoring-jobs/{id}/outline/approve | outline revisionを照合し、承認済み内容を具体化 |
+| ジョブ取消 | POST /authoring-jobs/{id}/cancel | 作者権限、取消後の結果確定を防止 |
 | 提案採用 | POST /stories/{id}/proposals/{proposal_id}/apply | expected_revision、選択した変更 |
-| 通報・運営停止 | POST /stories/{id}/reports、管理者用moderation API | 別権限、監査記録 |
+| 試遊デバッグ | GET /stories/{id}/playtests/{campaign_id}/debug | 作者本人の試遊のみ。他人のプレイログは返さない |
+| 作品の利用集計 | GET /stories/{id}/stats | 作者・管理者のみ。開始数・完了数の集計で、会話ログは返さない |
+| 通報・運営停止 | POST /stories/{id}/reports、GET /admin/reports、POST /admin/stories/{id}/moderation | 管理者は別権限、監査記録 |
+| プロフィール・利用量 | GET/PUT /profile、GET /usage、POST /admin/usage | 自分の情報と利用量。全体停止は管理者のみ |
 
 認証不備401、編集権限不足403、存在を隠す必要のあるprivate作品404、revision/公開版競合409、入力・検証不正422、quota超過429を基準とする。値の推測やIDの指定だけでは権限を得られない。
 

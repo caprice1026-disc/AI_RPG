@@ -7,7 +7,7 @@ from uuid import uuid4
 
 import pytest
 from pydantic_ai.exceptions import ContentFilterError, ModelHTTPError
-from pydantic_ai.messages import ModelResponse, TextPart
+from pydantic_ai.messages import ModelResponse, TextPart, UserPromptPart
 from pydantic_ai.models.function import FunctionModel
 from pydantic_ai.usage import RequestUsage
 
@@ -18,7 +18,7 @@ from ai_rpg.application.ports.story_authoring import (
 )
 from ai_rpg.application.stories import templates
 from ai_rpg.application.story_jobs import adopt_changes, prepare_proposal
-from ai_rpg.contracts.stories import AuthoringDraft
+from ai_rpg.contracts.stories import AuthoringDraft, StoryMetadata
 from ai_rpg.llm.story_authoring import (
     _INSTRUCTIONS,
     DevelopmentFakeStoryAuthoring,
@@ -81,6 +81,122 @@ def test_single_request_errors_are_sanitized_with_partial_usage(mode: str, code:
         assert len(calls) == 1
         if mode not in {"refused", "http"}:
             assert usage.complete and usage.input_tokens == 100
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("fixed_path", [None, "/metadata/title", "/metadata", "/scenario/title"])
+def test_blank_concretization_approved_title_beats_stale_instructions_but_not_fixed_draft(
+    fixed_path: str | None,
+) -> None:
+    old_title = "雨上がりの郵便小屋"
+    approved_title = "雨上がりの郵便小屋・実機確認1004"
+    fixed_title = "作者が固定したタイトル"
+    base = AuthoringDraft(
+        scenario={"scenario_ref": "my_new_story", "version": 1, "title": fixed_title},
+        metadata=StoryMetadata(title=fixed_title),
+        field_policies={fixed_path: "fixed"} if fixed_path else {},
+    )
+    before = base.model_dump_json()
+    calls = []
+
+    async def provider(messages: Any, info: Any) -> ModelResponse:
+        context = json.loads(
+            next(
+                part.content
+                for message in reversed(messages)
+                for part in message.parts
+                if isinstance(part, UserPromptPart)
+            )
+        )
+        assert old_title in context["instructions"]
+        assert context["approved_outline"]["title"] == approved_title
+        calls.append(1)
+        candidate = context["new_scenario_example"]
+        candidate["title"] = old_title
+        # Model repeats the stale instruction even if prompted otherwise. The
+        # adapter must preserve the explicit author decision, not trust this value.
+        return ModelResponse(
+            parts=[
+                TextPart(
+                    json.dumps(
+                        {
+                            "scenario_json": json.dumps(candidate),
+                            "title": old_title,
+                            "synopsis": "A new story",
+                            "findings": [],
+                        }
+                    )
+                )
+            ],
+            finish_reason="stop",
+        )
+
+    async def run() -> None:
+        adapter = PydanticAIStoryAuthoring({"test": FunctionModel(provider)})
+        prompt = adapter.prepare(
+            AuthoringInput(
+                "concretize",
+                base,
+                f"タイトルは必ず『{old_title}』にしてください。",
+                {"title": approved_title},
+            ),
+            model_id="test",
+            max_bytes=128000,
+        )
+        result = await adapter.generate(
+            prompt,
+            model_id="test",
+            max_output_tokens=8192,
+            max_total_tokens=24000,
+            usage=AuthoringUsage(),
+        )
+        proposal = prepare_proposal(uuid4(), uuid4(), 1, base, result.output, concretize=True)
+        assert not proposal.validation.errors
+        adopted = adopt_changes(base, proposal, [change.id for change in proposal.changes])
+        assert adopted.scenario["title"] == (
+            fixed_title if fixed_path == "/scenario/title" else approved_title
+        )
+        assert adopted.metadata.title == (
+            fixed_title if fixed_path in {"/metadata/title", "/metadata"} else approved_title
+        )
+        if fixed_path:
+            assert any(f.code == "fixed_field_change" for f in proposal.findings)
+        assert len(calls) == 1
+        assert base.model_dump_json() == before
+
+    asyncio.run(run())
+
+
+def test_existing_scenario_concretization_does_not_automatically_retitle_it() -> None:
+    base = templates().templates[1].initial_draft
+    before = base.model_dump_json()
+
+    async def provider(messages: Any, info: Any) -> ModelResponse:
+        return ModelResponse(parts=[TextPart('{"changes":[],"findings":[]}')], finish_reason="stop")
+
+    async def run() -> None:
+        adapter = PydanticAIStoryAuthoring({"test": FunctionModel(provider)})
+        prompt = adapter.prepare(
+            AuthoringInput(
+                "concretize",
+                base,
+                "Keep existing mechanics",
+                {"title": "A different outline title"},
+            ),
+            model_id="test",
+            max_bytes=128000,
+        )
+        result = await adapter.generate(
+            prompt,
+            model_id="test",
+            max_output_tokens=8192,
+            max_total_tokens=24000,
+            usage=AuthoringUsage(),
+        )
+        proposal = prepare_proposal(uuid4(), uuid4(), 1, base, result.output, concretize=True)
+        assert not proposal.changes
+        assert base.model_dump_json() == before
 
     asyncio.run(run())
 

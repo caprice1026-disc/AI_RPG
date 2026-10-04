@@ -98,6 +98,8 @@ class Settings(BaseSettings):
     authoring_max_output_tokens: int = Field(default=8192, ge=100, le=32768)
     authoring_max_total_tokens: int = Field(default=24000, ge=1000, le=100000)
     authoring_max_running: int = Field(default=4, ge=1, le=20)
+    draft_history_retention_days: int = Field(default=30, ge=1, le=3650)
+    draft_history_prune_batch_size: int = Field(default=100, ge=1, le=1000)
 
     @field_validator("admin_principal_ids")
     @classmethod

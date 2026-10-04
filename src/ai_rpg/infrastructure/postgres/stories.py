@@ -285,7 +285,8 @@ class PostgresStoryStore:
             return await _replay(session, owner, story_id, request, operation)
 
     async def create(
-        self, owner: UUID, request: CreateStoryRequest, draft: AuthoringDraft
+        self, owner: UUID, request: CreateStoryRequest, draft: AuthoringDraft,
+        *, template_version: int | None = None,
     ) -> StoryDraftResponse:
         story_id = uuid5(NAMESPACE_URL, f"ai-rpg:story:{owner}:{request.request_id}")
         async with self.sessions() as session, session.begin():
@@ -301,6 +302,7 @@ class PostgresStoryStore:
                 story_id,
                 draft,
                 request.template_id,
+                template_version,
             )
             _remember(session, owner, story_id, request, "create", response)
             return response
@@ -312,6 +314,7 @@ class PostgresStoryStore:
         story_id: UUID,
         draft: AuthoringDraft,
         template_id: str | None,
+        template_version: int | None,
     ) -> StoryDraftResponse:
         from ai_rpg.infrastructure.postgres.community import reserve_usage
 
@@ -338,7 +341,7 @@ class PostgresStoryStore:
             authoring_schema_version=1,
             payload=normalized.model_dump(mode="json"),
             template_id=template_id,
-            template_version=1 if template_id else None,
+            template_version=template_version,
             updated_at=now,
         )
         session.add(model)
@@ -492,6 +495,7 @@ class PostgresStoryStore:
                 uuid4(),
                 AuthoringDraft.model_validate(draft.payload),
                 draft.template_id,
+                draft.template_version,
             )
             _remember(session, owner, story_id, request, "duplicate", response)
             return response

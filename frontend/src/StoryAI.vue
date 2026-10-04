@@ -180,7 +180,8 @@ onUnmounted(() => { disposed = true; ++generation; clearTimeout(timer); s.extern
       <button :disabled="locked || running" @click="start('fill')">不足部分の補完を提案</button>
       <button :disabled="locked || running" @click="start('outline')">条件から構成案を作る</button></div>
     <p v-if="error" class="error" role="alert">{{ error }}</p><p v-if="notice" role="status">{{ notice }}</p>
-    <button v-if="pending" :disabled="s.busy" @click="send()">同じAI要求を再試行</button>
+    <p v-if="pending && s.busy" role="status">AI操作中です。応答を待っています…</p>
+    <button v-else-if="pending" @click="send()">同じAI要求を再試行</button>
     <template v-if="job">
       <p role="status">{{ kinds[job.kind] }}: {{ statuses[job.state] }} · 元の下書き {{ job.base_revision }}</p>
       <p v-if="job.state === 'failed'" class="error">AI処理に失敗しました。{{ job.error_code || '時間をおいて、新しい依頼として再試行してください。' }}</p>

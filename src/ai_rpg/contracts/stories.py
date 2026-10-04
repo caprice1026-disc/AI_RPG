@@ -41,6 +41,15 @@ class AuthoringDraft(Contract):
         return self
 
 
+class TemplateQuestion(Contract):
+    """Plain-text author guidance, not a form schema or executable instruction."""
+
+    prompt: str = Field(min_length=1, max_length=500)
+    hint: str = Field(default="", max_length=2000)
+    target_section: Ref
+    field_path: str | None = Field(default=None, pattern=r"^/", max_length=1000)
+
+
 class TemplateDefinition(Contract):
     template_id: Ref
     version: PositiveInt
@@ -49,6 +58,14 @@ class TemplateDefinition(Contract):
     required_capabilities: list[str]
     sections: list[str]
     initial_draft: AuthoringDraft
+    questions: list[TemplateQuestion] = Field(default_factory=list, max_length=50)
+    recommended_structure: list[str] = Field(default_factory=list, max_length=20)
+
+    @model_validator(mode="after")
+    def question_sections_exist(self) -> Self:
+        if any(question.target_section not in self.sections for question in self.questions):
+            raise ValueError("Template question targets an unknown section")
+        return self
 
 
 class StoryTemplatesResponse(Contract):

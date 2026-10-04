@@ -3,6 +3,7 @@
 import asyncio
 import os
 from collections.abc import Iterator
+from dataclasses import replace
 from datetime import UTC, datetime
 from uuid import UUID, uuid4
 
@@ -13,6 +14,7 @@ from sqlalchemy import Engine, create_engine, select, text
 from sqlalchemy.exc import IntegrityError
 from test_migrations import _guard_empty_database, _postgres_sessions, _run_alembic
 
+import ai_rpg.application.stories as story_module
 from ai_rpg.api.stories import create_stories_router
 from ai_rpg.application.adventures import AdventureService
 from ai_rpg.application.auth import AuthenticatedPrincipal
@@ -38,7 +40,7 @@ from ai_rpg.infrastructure.postgres.stories import (
     import_builtin_stories,
     record_story_playtest,
 )
-from ai_rpg.infrastructure.postgres.story_models import StoryVersionModel
+from ai_rpg.infrastructure.postgres.story_models import StoryDraftModel, StoryVersionModel
 
 URL = os.getenv("AIRPG_TEST_DATABASE_URL")
 pytestmark = [pytest.mark.integration, pytest.mark.skipif(not URL, reason="Test DB required")]
@@ -141,6 +143,77 @@ def test_cas_parallel_retry_restore_duplicate_and_owner_denial(database: Engine)
                         draft=AuthoringDraft(scenario={"scenario_ref": "ruined_chapel"}),
                     ),
                 )
+
+    with asyncio.Runner(loop_factory=asyncio.SelectorEventLoop) as runner:
+        runner.run(run())
+
+
+def test_template_version_and_copy_survive_registry_changes_and_create_replay(
+    database: Engine, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    entry = replace(story_module.TEMPLATE_REGISTRY["mist_lighthouse"], version=7)
+    monkeypatch.setitem(story_module.TEMPLATE_REGISTRY, "third_template", entry)
+
+    async def run() -> None:
+        async with _postgres_sessions(URL) as sessions:
+            service = StoryService(PostgresStoryStore(sessions))
+
+            async def principal() -> AuthenticatedPrincipal:
+                return OWNER
+
+            app = FastAPI()
+            app.include_router(create_stories_router(principal_provider=principal, service=service))
+            request = {"request_id": str(uuid4()), "template_id": "third_template"}
+            async with AsyncClient(
+                transport=ASGITransport(app=app), base_url="http://test",
+            ) as client:
+                response = await client.post("/stories", json=request)
+                assert response.status_code == 201
+                first = response.json()
+                story_id = UUID(first["story_id"])
+                async with sessions() as session:
+                    stored = await session.get(StoryDraftModel, story_id)
+                    assert stored is not None
+                    assert (stored.template_id, stored.template_version) == ("third_template", 7)
+                    assert stored.payload == first["draft"]
+
+                monkeypatch.setitem(story_module.TEMPLATE_REGISTRY, "third_template", replace(
+                    entry, version=8, source_ref="ruined_chapel", source_version=3,
+                ))
+                assert (await client.get(f"/stories/{story_id}/draft")).json() == first
+                replay = await client.post("/stories", json=request)
+                assert replay.status_code == 201 and replay.json() == first
+                conflict = await client.post("/stories", json={
+                    **request, "template_id": "ruined_chapel",
+                })
+                assert conflict.status_code == 409
+
+                next_response = await client.post("/stories", json={
+                    **request, "request_id": str(uuid4()),
+                })
+                assert next_response.status_code == 201
+                next_story = next_response.json()
+                assert next_story["draft"]["scenario"]["title"] != first["draft"]["scenario"]["title"]
+                clone = await service.duplicate(
+                    OWNER, story_id, DuplicateStoryRequest(request_id=uuid4()),
+                )
+                assert clone.draft.scenario["title"] == first["draft"]["scenario"]["title"]
+                blank = await service.create(OWNER, CreateStoryRequest(request_id=uuid4()))
+                async with sessions() as session:
+                    stored = await session.get(StoryDraftModel, story_id)
+                    assert stored is not None
+                    assert stored.template_version == 7 and stored.payload == first["draft"]
+                    newer = await session.get(StoryDraftModel, UUID(next_story["story_id"]))
+                    assert newer is not None and newer.template_version == 8
+                    copied = await session.get(StoryDraftModel, clone.story_id)
+                    assert copied is not None
+                    assert (copied.template_id, copied.template_version) == ("third_template", 7)
+                    empty = await session.get(StoryDraftModel, blank.story_id)
+                    assert empty is not None
+                    assert (empty.template_id, empty.template_version) == (None, None)
+                    assert await session.scalar(text(
+                        "SELECT count(*) FROM story_requests WHERE operation='create'"
+                    )) == 3
 
     with asyncio.Runner(loop_factory=asyncio.SelectorEventLoop) as runner:
         runner.run(run())
