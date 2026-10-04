@@ -40,6 +40,8 @@ class ScenarioSummary(Contract):
     title: ShortText
     objective: ShortText
     character_creation: CharacterCreationSummary | None = None
+    story_version_id: UUID | None = None
+    story_id: UUID | None = None
 
 
 class PresetSummary(Contract):
@@ -57,8 +59,9 @@ class AdventureCatalogResponse(Contract):
 
 class CreateAdventureRequest(Contract):
     request_id: UUID
-    scenario_ref: Ref
-    scenario_version: PositiveInt
+    scenario_ref: Ref | None = None
+    scenario_version: PositiveInt | None = None
+    story_version_id: UUID | None = None
     preset_ref: Ref
     player_name: Annotated[str, Field(min_length=1, max_length=40)]
     ability_points: AbilityAllocation | None = None
@@ -68,6 +71,12 @@ class CreateAdventureRequest(Contract):
 
     @model_validator(mode="after")
     def paired_creation_choices(self) -> Self:
+        if self.story_version_id is None and (
+            self.scenario_ref is None or self.scenario_version is None
+        ):
+            raise ValueError("A story version or a complete legacy scenario reference is required")
+        if (self.scenario_ref is None) != (self.scenario_version is None):
+            raise ValueError("Scenario reference and version must be selected together")
         if (self.ability_points is None) != (self.specialty_skill is None):
             raise ValueError("Ability points and specialty must be selected together")
         return self

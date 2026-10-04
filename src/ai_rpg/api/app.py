@@ -9,11 +9,15 @@ from typing import Annotated
 from uuid import UUID
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, Response, status
-from fastapi.responses import FileResponse, StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from starlette.types import Message, Send
 
 from ai_rpg.api.browser_auth import BrowserAuthenticator
+from ai_rpg.api.community import create_community_router
+from ai_rpg.api.request_limits import RequestSizeLimit
+from ai_rpg.api.stories import create_stories_router
+from ai_rpg.api.story_jobs import create_story_jobs_router
 from ai_rpg.application import (
     AdventureCompletedError,
     AuthenticatedPrincipal,
@@ -29,6 +33,7 @@ from ai_rpg.application import (
 )
 from ai_rpg.application.adventures import AdventureService
 from ai_rpg.application.ports.adventures import InvalidAdventureError, InvalidHistoryCursorError
+from ai_rpg.application.stories import StoryError, StoryService
 from ai_rpg.application.turns import RuntimePolicy
 from ai_rpg.config import get_settings
 from ai_rpg.contracts import CampaignStateResponse, PlayerTurnInput, TurnResponse
@@ -39,9 +44,14 @@ from ai_rpg.contracts.adventures import (
     CreateAdventureRequest,
     CreateAdventureResponse,
 )
+from ai_rpg.contracts.stories import CreateStoryPlaytestRequest
 from ai_rpg.infrastructure.database import create_session_factory
 from ai_rpg.infrastructure.postgres import PostgresAuthorizationPolicy, PostgresUnitOfWork
 from ai_rpg.infrastructure.postgres.adventures import PostgresAdventureStore
+from ai_rpg.infrastructure.postgres.community import CommunityStore
+from ai_rpg.infrastructure.postgres.scenario_source import PostgresScenarioSource
+from ai_rpg.infrastructure.postgres.stories import PostgresStoryStore, import_builtin_stories
+from ai_rpg.infrastructure.postgres.story_jobs import PostgresStoryJobStore
 from ai_rpg.scenarios import BUILTIN_SCENARIOS
 
 PrincipalProvider = Callable[..., Awaitable[AuthenticatedPrincipal]]
@@ -121,6 +131,9 @@ def create_app(
     turn_query_service: TurnQueryService | None = None,
     event_stream_service: EventStreamService | None = None,
     adventure_service: AdventureService | None = None,
+    story_service: StoryService | None = None,
+    community_store: CommunityStore | None = None,
+    story_job_store: PostgresStoryJobStore | None = None,
     principal_provider: PrincipalProvider = _unconfigured_principal,
     browser_auth: BrowserAuthenticator | None = None,
     development_mode: bool = False,
@@ -131,6 +144,7 @@ def create_app(
 ) -> FastAPI:
     """DB接続をrequest時まで遅延したHTTP applicationを構築する。"""
 
+    story_sessions = None
     if (
         event_poll_seconds < 0
         or event_heartbeat_seconds <= 0
@@ -142,12 +156,26 @@ def create_app(
         or turn_query_service is None
         or event_stream_service is None
         or adventure_service is None
+        or story_service is None
+        or community_store is None
+        or story_job_store is None
     ):
         settings = get_settings()
         sessions = create_session_factory(settings.database_url)
+        story_sessions = sessions
         authorization = PostgresAuthorizationPolicy(sessions)
         if adventure_service is None:
-            adventure_service = AdventureService(PostgresAdventureStore(sessions))
+            adventure_service = AdventureService(
+                PostgresAdventureStore(sessions), PostgresScenarioSource(sessions),
+            )
+        if story_service is None:
+            story_service = StoryService(PostgresStoryStore(sessions))
+        if community_store is None:
+            community_store = CommunityStore(sessions, settings)
+        if story_job_store is None:
+            story_job_store = PostgresStoryJobStore(
+                sessions, model_id=settings.background_model, settings=settings,
+            )
 
         def unit_of_work_factory() -> PostgresUnitOfWork:
             return PostgresUnitOfWork(sessions)
@@ -174,12 +202,40 @@ def create_app(
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         try:
+            if story_sessions is not None:
+                await import_builtin_stories(story_sessions)
             yield
         finally:
             if browser_auth is not None:
                 await browser_auth.close()
 
     app = FastAPI(title="AI RPG API", version="0.1.0", lifespan=lifespan)
+    app.add_middleware(RequestSizeLimit)
+    @app.exception_handler(StoryError)
+    async def story_error_handler(request: Request, error: StoryError) -> JSONResponse:
+        return JSONResponse(status_code=error.status_code, content={"detail": {"code": error.code}})
+
+    async def start_playtest(
+        principal: AuthenticatedPrincipal, version_id: UUID, request: CreateStoryPlaytestRequest,
+    ) -> CreateAdventureResponse:
+        assert adventure_service is not None
+        try:
+            return await adventure_service.create(principal, CreateAdventureRequest(
+                request_id=request.request_id, story_version_id=version_id,
+                preset_ref=request.preset_ref, player_name=request.player_name,
+                ability_points=request.ability_points, specialty_skill=request.specialty_skill,
+            ))
+        except (InvalidAdventureError, AuthorizationError, IdempotencyConflictError) as error:
+            raise _application_error(error) from error
+
+    app.include_router(create_stories_router(
+        principal_provider=principal_provider, service=story_service,
+        playtest_creator=start_playtest,
+    ))
+    app.include_router(create_community_router(community_store, principal_provider))
+    app.include_router(create_story_jobs_router(
+        principal_provider=principal_provider, store=story_job_store,
+    ))
     app.mount("/static/vue", StaticFiles(directory=_PLAY_ASSETS), name="vue")
     if browser_auth is not None:
         browser_auth.mount(app)
@@ -209,6 +265,10 @@ def create_app(
             "csrf_token": session.csrf_token if session is not None else None,
             "expires_at": principal.credential_expires_at,
         }
+
+    @app.get("/auth/options", tags=["認証"])
+    async def auth_options() -> dict[str, bool]:
+        return {"registration_enabled": get_settings().registration_enabled}
 
     @app.get("/", include_in_schema=False, response_class=FileResponse)
     async def play_screen() -> FileResponse:
@@ -241,7 +301,7 @@ def create_app(
         principal: Annotated[AuthenticatedPrincipal, Depends(principal_provider)],
     ) -> AdventureCatalogResponse:
         assert adventure_service is not None
-        return adventure_service.catalog()
+        return await adventure_service.catalog_for(principal)
 
     @app.get("/adventures", tags=["adventures"], response_model=AdventureListResponse)
     async def list_adventures(

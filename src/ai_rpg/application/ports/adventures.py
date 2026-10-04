@@ -39,6 +39,8 @@ class AdventureStore(Protocol):
         request: CreateAdventureRequest,
         scenario: ScenarioDefinition,
         preset: CharacterPreset,
+        *,
+        story_version_id: UUID | None = None,
     ) -> CreateAdventureResponse: ...
 
     async def list_owned(self, principal_id: UUID) -> AdventureListResponse: ...

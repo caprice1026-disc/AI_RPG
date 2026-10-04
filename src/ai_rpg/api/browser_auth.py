@@ -181,6 +181,9 @@ class BrowserAuthenticator:
                 issuer=identity.issuer, subject=identity.subject, token=session_token,
                 csrf_token=csrf_token, created_at=now,
                 expires_at=now + timedelta(seconds=_SESSION_SECONDS),
+                **({"allow_registration": True} if (
+                    self._settings.registration_enabled and attempt.registration_requested
+                ) else {}),
             )
             if principal_id is None:
                 error_code = "IDENTITY_NOT_REGISTERED"
@@ -199,7 +202,9 @@ class BrowserAuthenticator:
 
     def mount(self, app: FastAPI) -> None:
         @app.get("/auth/login", include_in_schema=False)
-        async def login() -> RedirectResponse:
+        async def login(join: bool = False) -> RedirectResponse:
+            if join and not self._settings.registration_enabled:
+                raise HTTPException(status_code=403, detail={"code": "registration_disabled"})
             state, binding, nonce = (secrets.token_urlsafe(32) for _ in range(3))
             verifier = secrets.token_urlsafe(48)
             challenge = base64.urlsafe_b64encode(hashlib.sha256(verifier.encode()).digest())
@@ -207,6 +212,7 @@ class BrowserAuthenticator:
                 await self._store.create_login(
                     state=state, binding=binding, nonce=nonce, code_verifier=verifier,
                     expires_at=datetime.now(UTC) + timedelta(minutes=5),
+                    **({"registration_requested": True} if join else {}),
                 )
             except SQLAlchemyError as error:
                 raise _authentication_unavailable() from error

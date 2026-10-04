@@ -44,9 +44,12 @@ class MemorySessions:
         return SimpleNamespace(
             nonce_digest=hashlib.sha256(row["nonce"].encode()).hexdigest(),
             code_verifier=row["code_verifier"],
+            registration_requested=row.get("registration_requested", False),
         )
 
     async def create_session(self, **values):
+        if values.get("allow_registration"):
+            self.registered = True
         if not self.registered or self.disabled:
             return None
         self.sessions[values["token"]] = SimpleNamespace(
@@ -112,6 +115,34 @@ async def begin(client, setup):
     setup.provider["nonce"] = query["nonce"][0]
     setup.provider["verifier"] = setup.store.logins[state]["code_verifier"]
     return state
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("enabled", [False, True])
+async def test_join_requires_explicit_operator_and_browser_opt_in(setup_auth, enabled):
+    setup = setup_auth
+    setup.auth._settings = setup.auth._settings.model_copy(update={"registration_enabled": enabled})
+    setup.store.registered = False
+    async with setup.client, httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=setup.app), base_url=ORIGIN,
+    ) as client:
+        normal, _ = await login(client, setup)
+        assert "IDENTITY_NOT_REGISTERED" in normal.headers["location"]
+        assert not setup.store.registered
+        response = await client.get("/auth/login?join=true")
+        if not enabled:
+            assert response.status_code == 403
+            assert not setup.store.registered
+            return
+        query = parse_qs(urlsplit(response.headers["location"]).query)
+        state = query["state"][0]
+        setup.provider["nonce"] = query["nonce"][0]
+        setup.provider["verifier"] = setup.store.logins[state]["code_verifier"]
+        assert setup.store.logins[state]["registration_requested"] is True
+        result = await client.get("/auth/callback", params={"state": state, "code": "private-code"})
+        assert result.headers["location"] == "/"
+        assert setup.store.registered
+        assert (await client.get("/auth/session")).status_code == 200
 
 
 async def login(client, setup):

@@ -282,6 +282,55 @@ def test_explicit_entry_into_lantern_room_is_a_transition_request(player_text: s
     ScenarioProgressor.validate_transition_request(player_text, intent)
 
 
+def test_boathouse_travel_followed_by_inspection_allows_transition() -> None:
+    player_text = (
+        "舟小屋へ行き、窓越しに中を確かめてから古い道具棚の裏を調べ、"
+        "灯台へ安全に近づく手掛かりを探す。"
+    )
+    intent = OpenActionIntent(
+        kind="open_action", approach="舟小屋へ行ってから道具棚を調べる", check=None,
+        success={"next_scene_ref": "boathouse"}, failure=None,
+    )
+    ScenarioProgressor.validate_transition_request(player_text, intent)
+
+
+@pytest.mark.parametrize("player_text", [
+    "舟小屋へ行って窓を調べる", "舟小屋へ向かって窓を調べる",
+    "舟小屋に入って道具棚を調べる", "橋を渡って周囲を調べる",
+    "舟小屋へ戻って窓を調べる", "外階段を登って窓を調べる",
+    "通路を通って壁を調べる", "通路を抜けて壁を調べる",
+    "舟小屋へ移動して窓を調べる",
+    "舟小屋へ向かい、窓を調べる", "舟小屋に入り、道具棚を調べる",
+    "通路へ進み、壁を調べる", "舟小屋へ戻り、窓を調べる",
+    "橋を渡り、周囲を調べる", "外階段を登り、窓を調べる",
+    "通路を通り、壁を調べる", "舟小屋へ移動し、窓を調べる",
+])
+def test_connected_movement_forms_allow_transition(player_text: str) -> None:
+    intent = OpenActionIntent(
+        kind="open_action", approach="舟小屋へ進む", check=None,
+        success={"next_scene_ref": "boathouse"}, failure=None,
+    )
+    ScenarioProgressor.validate_transition_request(player_text, intent)
+
+
+@pytest.mark.parametrize("player_text", [
+    "舟小屋を窓越しに調べ、道具棚の裏を確認する",
+    "舟小屋への行き方を調べる", "舟小屋への行き先表示を調べる",
+    "舟小屋の向かい側を調べる", "舟小屋の入り口を調べる",
+    "橋の渡り方を調べる", "通路の通り道を調べる",
+    "舟小屋に入っている道具を窓から調べる",
+    "舟小屋に入っていた道具を調べる",
+    "灯台に向かっている矢印を調べる",
+])
+def test_inspection_of_routes_or_contents_does_not_allow_transition(player_text: str) -> None:
+    intent = OpenActionIntent(
+        kind="open_action", approach="舟小屋へ進む", check=None,
+        success={"next_scene_ref": "boathouse"}, failure=None,
+    )
+    with pytest.raises(ScenarioActionUnavailableError, match="移動"):
+        ScenarioProgressor.validate_transition_request(player_text, intent)
+
+
 def test_impossible_space_trip_is_rejected_before_model_or_world_update() -> None:
     progressor = ScenarioProgressor(BUILTIN_SCENARIOS)
     with pytest.raises(ScenarioActionUnavailableError, match="探索領域"):

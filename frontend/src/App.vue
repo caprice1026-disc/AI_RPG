@@ -3,23 +3,72 @@ import { computed, nextTick, onMounted, onUnmounted, reactive, ref, watch } from
 import { createGame } from './game'
 import TurnRecord from './TurnRecord.vue'
 import Feedback from './Feedback.vue'
+import StoryAuthor from './StoryAuthor.vue'
+import Community from './Community.vue'
+import { createStories } from './stories'
+import type { AdventureId, Catalog } from './contracts'
+import type { StoryPublicDetail } from './story-contracts'
 
 const game = createGame(), s = game.state
-const { canStart, canAct } = game
+const authoring = ref(false)
+const communityOpen = ref(false), registrationEnabled = ref(false)
+const sharedStart = ref(false)
+let publicGeneration = 0
+const optionsController = new AbortController()
+const editor = createStories(game, () => { authoring.value = false })
+const sharedStory = ref<StoryPublicDetail | null>(null)
+const sharedError = ref('')
+function goHome() { if (!authoring.value || editor.confirmLeave()) { ++publicGeneration; authoring.value = false; communityOpen.value = false; sharedStart.value = false; game.goHome(); navOpen.value = false } }
+function showCommunity() { if (!authoring.value || editor.confirmLeave()) { ++publicGeneration; authoring.value = false; communityOpen.value = true; navOpen.value = false } }
+function showAuthor() { ++publicGeneration; communityOpen.value = false; authoring.value = true; navOpen.value = false }
+function selectAdventure(id: AdventureId) {
+  if (authoring.value && !editor.confirmLeave()) return
+  ++publicGeneration; authoring.value = false; communityOpen.value = false; dismissedRiskId.value = null; navOpen.value = false; void game.selectAdventure(id)
+}
+function logout() { if (!authoring.value || editor.confirmLeave()) void game.logout() }
+async function loadSharedStory(id: string) {
+  const principal = s.session?.principal_id, generation = ++publicGeneration
+  sharedError.value = ''
+  try {
+    const detail = await game.request<StoryPublicDetail>(`/stories/${encodeURIComponent(id)}`, {}, false)
+    if (s.auth !== 'ready' || s.session?.principal_id !== principal || generation !== publicGeneration) return
+    sharedStory.value = detail
+    game.goHome(); authoring.value = false; communityOpen.value = false; sharedStart.value = true
+    if (!['mvp_v1', 'mvp_v2'].includes(detail.ruleset_ref)) sharedError.value = 'この作品のルールには対応していません。'
+  } catch { if (s.auth === 'ready' && s.session?.principal_id === principal && generation === publicGeneration) { game.goHome(); sharedError.value = '作品を表示できませんでした。共有範囲や公開状態を確認してください。' } }
+}
+function rememberSharedStory(id: string) { try { sessionStorage.setItem('ai-rpg:shared-story', id) } catch { /* The link remains usable when storage is unavailable. */ } }
+function loginToStory(id: string) { rememberSharedStory(id); location.assign('/auth/login') }
+const { canAct } = game
+const canStart = computed(() => sharedStart.value ? game.canStartVersion.value && !!sharedStory.value && !sharedError.value : game.canStart.value)
 const art = '/static/vue/art/ruined-chapel.png'
 const navOpen = ref(false), stateOpen = ref(false)
 const timeline = ref<HTMLOListElement>()
+const waitingVisual = ref<HTMLElement>()
 const start = reactive({ scenario_ref: '', preset_ref: '', player_name: '',
   ability_points: { strength: 0, agility: 0, insight: 0, presence: 0 }, specialty_skill: '' })
-const scenario = computed(() => s.catalog.scenarios.find(x => x.scenario_ref === start.scenario_ref))
+const scenario = ref<Catalog['scenarios'][number]>()
+const catalogUpdated = computed(() => {
+  const latest = s.catalog.scenarios.find(item => item.scenario_ref === scenario.value?.scenario_ref)
+  return !sharedStart.value && latest && scenario.value && (latest.story_version_id !== scenario.value.story_version_id || latest.scenario_version !== scenario.value.scenario_version)
+})
+function useLatestCatalog() { scenario.value = s.catalog.scenarios.find(item => item.scenario_ref === start.scenario_ref) }
+watch(() => start.scenario_ref, value => { scenario.value = s.catalog.scenarios.find(x => x.scenario_ref === value) }, { flush: 'sync' })
 const preset = computed(() => s.catalog.presets.find(x => x.preset_ref === start.preset_ref))
 const abilityNames = { strength: '筋力', agility: '器用さ', insight: '洞察', presence: '対話力' }
 const skillNames: Record<string, string> = {
   athletics: '運動', acrobatics: '身のこなし', perception: '観察',
   stealth: '隠密', persuasion: '説得',
 }
+const characterCreation = computed(() => sharedStart.value ? sharedStory.value?.ruleset_ref === 'mvp_v2'
+  ? { abilities: ['strength', 'agility', 'insight', 'presence'] as const, points: 2, specialties: Object.keys(skillNames) } : null
+  : scenario.value?.character_creation)
+function startSelected() {
+  if (sharedStart.value && sharedStory.value && !sharedError.value) return game.startPublishedAdventure({ ...start, story_version_id: sharedStory.value.story_version_id }, sharedStory.value.ruleset_ref)
+  return game.startAdventure(start, scenario.value)
+}
 const pointsSpent = computed(() => Object.values(start.ability_points).reduce((a, b) => a + b, 0))
-const buildReady = computed(() => !scenario.value?.character_creation || (pointsSpent.value === scenario.value.character_creation.points
+const buildReady = computed(() => !characterCreation.value || (pointsSpent.value === characterCreation.value.points
   && !!start.specialty_skill && Object.entries(start.ability_points).every(([key, value]) =>
     value >= 0 && value <= 2 && (preset.value?.base_abilities?.[key as keyof typeof start.ability_points] ?? 0) + value <= 3)))
 const adventure = computed(() => s.campaign?.adventure), player = computed(() => s.campaign?.player)
@@ -32,7 +81,8 @@ const actions = computed(() => (adventure.value?.available_actions ?? []).map(ac
   run: game.bindAction({ kind: 'scenario_action', action_ref: action.action_ref }, action.label),
 })))
 const inventory = computed(() => (player.value?.inventory ?? []).map(item => {
-  if (item.item_ref !== 'healing_potion') return { ...item, use: null }
+  const effect = item.effect_ref === undefined ? item.item_ref : item.effect_ref
+  if (effect !== 'healing_potion') return { ...item, use: null }
   const reason = adventure.value?.status === 'completed' ? 'この冒険は完了しました。'
     : s.busy || s.tracking ? '行動を処理中です。'
     : !s.stateReady || s.loading ? '冒険の状態を確認してください。'
@@ -40,15 +90,20 @@ const inventory = computed(() => (player.value?.inventory ?? []).map(item => {
     : !canAct.value ? (s.error || '現在は使用できません。')
     : item.quantity <= 0 ? '残りがありません。'
     : player.value!.current_hp >= player.value!.max_hp ? 'HPは満タンです。' : ''
-  const text = '回復ポーションを使って、自分の傷を回復する。'
+  const text = `${item.name}を使って、自分の傷を回復する。`
   return { ...item, use: { reason, run: game.bindAction({ kind: 'text', text }, text) } }
 }))
+const waitingDice = computed(() => {
+  const turn = s.campaign?.latest_turn
+  return turn ? [...turn.action_results, ...turn.enemy_reactions]
+    .flatMap(action => action.result.kind === 'applied' ? action.result.dice : []) : []
+})
 const waitingPhase = computed(() => {
   const turn = s.campaign?.latest_turn
   if (!s.tracking || !turn) return null
-  if (turn.resolution_status === 'pending' || turn.resolution_status === 'resolving') return 'roll'
+  if (turn.resolution_status === 'pending' || turn.resolution_status === 'resolving') return 'thinking'
   if (turn.resolution_status === 'committed' && turn.narration_status !== 'completed'
-    && turn.narration_status !== 'fallback') return 'narration'
+    && turn.narration_status !== 'fallback') return waitingDice.value.length ? 'roll' : 'narration'
   return null
 })
 const names = computed(() => s.names)
@@ -60,43 +115,54 @@ const loginMessages: Record<string, string> = {
 }
 watch(() => s.catalog, () => {
   if (!s.catalog.scenarios.some(x => x.scenario_ref === start.scenario_ref)) start.scenario_ref = s.catalog.scenarios[0]?.scenario_ref ?? ''
+  if (!scenario.value) scenario.value = s.catalog.scenarios.find(x => x.scenario_ref === start.scenario_ref)
   if (!s.catalog.presets.some(x => x.preset_ref === start.preset_ref)) start.preset_ref = s.catalog.presets[0]?.preset_ref ?? ''
 })
-watch(() => s.auth, auth => { if (auth !== 'ready') { start.player_name = ''; navOpen.value = false; stateOpen.value = false } })
+watch(() => s.auth, auth => { if (auth !== 'ready') { ++publicGeneration; start.player_name = ''; start.scenario_ref = ''; scenario.value = undefined; navOpen.value = false; stateOpen.value = false; authoring.value = false; communityOpen.value = false; sharedStory.value = null; sharedStart.value = false; sharedError.value = '' } })
 function revealLatest() {
   const turnId = s.campaign?.latest_turn?.turn_id
   const record = Array.from(timeline.value?.children ?? []).find(node => (node as HTMLElement).dataset.turnId === turnId)
   record?.scrollIntoView({ block: 'start', behavior: 'auto' })
 }
 watch([() => s.selected?.campaign_id, () => s.historyLoaded, () => s.campaign?.latest_turn?.turn_id,
-  () => s.campaign?.latest_turn?.narration_status, () => s.campaign?.latest_turn?.narration], async () => {
+  () => s.campaign?.latest_turn?.resolution_status, () => s.campaign?.latest_turn?.narration_status,
+  () => s.campaign?.latest_turn?.narration], async () => {
   await nextTick()
-  revealLatest()
+  if (waitingPhase.value) waitingVisual.value?.scrollIntoView({ block: 'nearest', behavior: 'auto' })
+  else revealLatest()
 })
 onMounted(() => {
   const query = new URLSearchParams(location.search)
+  if (query.get('story')) rememberSharedStory(query.get('story')!)
+  void fetch('/auth/options', { credentials: 'same-origin', signal: optionsController.signal })
+    .then(async result => { if (result.ok && !optionsController.signal.aborted) registrationEnabled.value = (await result.json()).registration_enabled === true }).catch(() => {})
   if (query.has('login_error')) {
     loginError.value = loginMessages[query.get('login_error')!] ?? loginMessages.LOGIN_REJECTED!
     history.replaceState(history.state, '', location.pathname)
   }
-  void game.boot()
+  void game.boot().then(() => {
+    let id = query.get('story')
+    try { id ??= sessionStorage.getItem('ai-rpg:shared-story'); if (s.auth === 'ready') sessionStorage.removeItem('ai-rpg:shared-story') } catch { /* Login still works without storage. */ }
+    if (s.auth === 'ready' && id) return loadSharedStory(id)
+  })
 })
-onUnmounted(game.dispose)
+onUnmounted(() => { optionsController.abort(); editor.dispose(); game.dispose() })
 function sendText() { if (s.draft.trim()) void game.submit({ kind: 'text', text: s.draft }, s.draft) }
 </script>
 
 <template>
   <a class="skip-link" href="#main">本文へ移動</a>
   <header class="topbar">
-    <button class="brand" aria-label="AI RPG ホーム" @click="game.goHome()">AI RPG</button>
+    <button class="brand" aria-label="AI RPG ホーム" @click="goHome()">AI RPG</button>
     <span class="tagline">冒険の記録</span>
     <div class="account">
       <span v-if="s.session?.mode === 'development'" class="hint">開発モード</span>
-      <button v-if="s.auth === 'ready' && s.session?.mode === 'session'" class="quiet" @click="game.logout()">ログアウト</button>
+      <button v-if="s.auth === 'ready' && s.session?.mode === 'session'" class="quiet" @click="logout()">ログアウト</button>
     </div>
   </header>
 
-  <main v-if="s.auth !== 'ready'" id="main" class="landing">
+  <main v-if="s.auth !== 'ready' && communityOpen" id="main"><Community :game="game" @login="loginToStory" /></main>
+  <main v-else-if="s.auth !== 'ready'" id="main" class="landing">
     <img :src="art" class="landing-art" alt="月明かりと灯火に照らされた、霧の中の廃礼拝堂">
     <div class="landing-copy">
       <h1>あなたの言葉で、物語が動く。</h1>
@@ -110,13 +176,15 @@ function sendText() { if (s.draft.trim()) void game.submit({ kind: 'text', text:
       </template>
       <template v-else>
         <a class="primary button" href="/auth/login">ログインして冒険を始める</a>
+        <a v-if="registrationEnabled" class="button" href="/auth/login?join=true">参加登録して始める</a>
         <p class="hint">登録済みのアカウントでログインしてください。</p>
+        <button class="quiet" @click="showCommunity()">公開作品を探す</button>
         <button class="quiet" @click="game.boot()">ログイン状態を再確認</button>
       </template>
     </div>
   </main>
 
-  <main v-else id="main" class="shell" :class="{ playing: s.selected }">
+  <main v-else id="main" class="shell" :class="{ playing: s.selected && !authoring && !communityOpen }">
     <aside class="adventure-rail" :class="{ expanded: navOpen }" aria-label="冒険の記録">
       <button class="mobile-toggle" :aria-expanded="navOpen" aria-controls="adventure-nav" @click="navOpen = !navOpen">☰ 冒険の記録</button>
       <nav id="adventure-nav" aria-label="続きから">
@@ -126,12 +194,14 @@ function sendText() { if (s.draft.trim()) void game.submit({ kind: 'text', text:
         <ul class="adventure-list">
           <li v-for="item in s.adventures" :key="item.campaign_id">
             <button :data-adventure="item.campaign_id" :aria-current="s.selected?.campaign_id === item.campaign_id ? 'page' : undefined"
-              @click="dismissedRiskId = null; game.selectAdventure(item); navOpen = false">
+              @click="selectAdventure(item)">
               {{ item.title }}<small>{{ item.player_name }} · {{ item.status === 'completed' ? '完了' : '冒険中' }}</small>
             </button>
           </li>
         </ul>
-        <button class="new-adventure" @click="game.goHome(); navOpen = false">＋ 新しい冒険</button>
+        <button class="new-adventure" @click="goHome()">＋ 新しい冒険</button>
+        <button :aria-current="authoring ? 'page' : undefined" @click="showAuthor()">マイ作品</button>
+        <button :aria-current="communityOpen ? 'page' : undefined" @click="showCommunity()">公開作品を探す</button>
         <p v-if="s.homeError" class="error" role="alert">{{ s.homeError }}</p>
         <button class="quiet" :disabled="s.homeLoading" @click="game.refreshHome()">一覧を更新</button>
         <div class="nav-support">
@@ -144,25 +214,36 @@ function sendText() { if (s.draft.trim()) void game.submit({ kind: 'text', text:
       </nav>
     </aside>
 
-    <section v-if="!s.selected" class="start-page">
-      <img v-if="scenario?.scenario_ref === 'ruined_chapel'" :src="art" class="start-art" alt="霧の中にたたずむ廃礼拝堂">
+    <KeepAlive><StoryAuthor v-if="authoring" :editor="editor" :game="game" /></KeepAlive>
+    <Community v-if="!authoring && communityOpen" :game="game" @select="story => loadSharedStory(story.story_id)" @login="loginToStory" />
+    <section v-else-if="!authoring && !s.selected" class="start-page">
+      <img v-if="!sharedStart && scenario?.scenario_ref === 'ruined_chapel'" :src="art" class="start-art" alt="霧の中にたたずむ廃礼拝堂">
       <div class="start-content">
         <h1>新しい物語を、ここから。</h1>
         <p class="hint">舞台と冒険者を選んで、最初の一歩を。</p>
-        <form id="start-form" @submit.prevent="game.startAdventure(start)">
-          <label for="scenario">シナリオ</label>
+        <article v-if="sharedStart && sharedStory" class="notice" aria-label="共有された作品">
+          <h2>{{ sharedStory.metadata.title }}</h2><p>{{ sharedStory.metadata.synopsis }}</p>
+          <p>第{{ sharedStory.release_number }}版</p>
+          <p v-for="warning in sharedStory.metadata.content_warnings" :key="warning">注意: {{ warning }}</p>
+          <button type="button" class="quiet" @click="loadSharedStory(sharedStory.story_id)">公開状態を再取得</button>
+          <button type="button" class="quiet" @click="sharedStart = false">他の作品を選ぶ</button>
+        </article>
+        <p v-if="sharedError" class="error" role="alert">{{ sharedError }}</p>
+        <form id="start-form" @submit.prevent="startSelected()">
+          <template v-if="!sharedStart"><label for="scenario">シナリオ</label>
           <select id="scenario" v-model="start.scenario_ref" :disabled="!canStart" required aria-describedby="scenario-description">
-            <option v-for="item in s.catalog.scenarios" :key="item.scenario_ref" :value="item.scenario_ref">{{ item.title }}</option>
+            <option v-for="item in s.catalog.scenarios" :key="item.scenario_ref" :value="item.scenario_ref">{{ item.scenario_ref === scenario?.scenario_ref ? scenario.title : item.title }}</option>
           </select>
-          <p id="scenario-description" class="hint">{{ scenario?.objective }}</p>
+          <p id="scenario-description" class="hint">{{ scenario?.objective }}</p></template>
+          <div v-if="catalogUpdated" class="notice" role="status"><p>選択中の作品の公開版が更新されました。表示中の版は自動で切り替わりません。</p><button type="button" @click="useLatestCatalog()">更新された版を選び直す</button></div>
           <label for="preset">冒険者のタイプ</label>
           <select id="preset" v-model="start.preset_ref" :disabled="!canStart" required aria-describedby="preset-description">
             <option v-for="item in s.catalog.presets" :key="item.preset_ref" :value="item.preset_ref">{{ item.name }}</option>
           </select>
           <p id="preset-description" class="hint">{{ preset?.description }}<template v-if="preset">（HP {{ preset.max_hp }}）</template></p>
-          <fieldset v-if="scenario?.character_creation" class="character-build">
-            <legend>能力ポイントを配分する（残り {{ scenario.character_creation.points - pointsSpent }}）</legend>
-            <label v-for="key in scenario.character_creation.abilities" :key="key" :for="`ability-${key}`">
+          <fieldset v-if="characterCreation" class="character-build">
+            <legend>能力ポイントを配分する（残り {{ characterCreation.points - pointsSpent }}）</legend>
+            <label v-for="key in characterCreation.abilities" :key="key" :for="`ability-${key}`">
               {{ abilityNames[key] }} <small>基礎 {{ preset?.base_abilities?.[key] ?? 0 }} / 合計 {{ (preset?.base_abilities?.[key] ?? 0) + start.ability_points[key] }}</small>
               <select :id="`ability-${key}`" v-model.number="start.ability_points[key]" :disabled="!canStart">
                 <option v-for="value in [0, 1, 2]" :key="value" :value="value">＋{{ value }}</option>
@@ -171,7 +252,7 @@ function sendText() { if (s.draft.trim()) void game.submit({ kind: 'text', text:
             <label for="specialty">得意技能</label>
             <select id="specialty" v-model="start.specialty_skill" :disabled="!canStart" required>
               <option value="" disabled>選択してください</option>
-              <option v-for="skill in scenario.character_creation.specialties" :key="skill" :value="skill">{{ skillNames[skill] ?? skill }}</option>
+              <option v-for="skill in characterCreation.specialties" :key="skill" :value="skill">{{ skillNames[skill] ?? skill }}</option>
             </select>
           </fieldset>
           <label for="player-name">冒険者の名前</label>
@@ -186,7 +267,7 @@ function sendText() { if (s.draft.trim()) void game.submit({ kind: 'text', text:
       </div>
     </section>
 
-    <section v-else class="story" aria-label="冒険の物語">
+    <section v-else-if="!authoring && s.selected" class="story" aria-label="冒険の物語">
       <div class="story-scroll">
         <header class="scene-heading">
           <p class="eyebrow">{{ adventure?.title || '冒険の記録' }}</p>
@@ -204,10 +285,12 @@ function sendText() { if (s.draft.trim()) void game.submit({ kind: 'text', text:
               :hidden-choice-labels="record.turn.turn_id === s.campaign?.latest_turn?.turn_id ? actions.map(action => action.label) : []"
               @choice="(id, label) => game.submit({ kind: 'choice', choice_id: id }, label)" />
           </ol>
-          <div v-if="waitingPhase === 'roll'" class="dice-wait" role="status">
-            <span class="die-spinner" aria-hidden="true">?</span><span>ダイスで判定しています…</span>
+          <p v-if="waitingPhase === 'thinking'" ref="waitingVisual" class="thinking-wait" role="status">GMが行動を確認しています…</p>
+          <div v-else-if="waitingPhase === 'roll'" ref="waitingVisual" class="dice-wait" role="status">
+            <span class="die-spinner" aria-hidden="true">{{ waitingDice[0]?.rolls[0] ?? '?' }}</span>
+            <span>ダイスの結果は確定しました。<br>GMが描写を準備しています…</span>
           </div>
-          <p v-else-if="waitingPhase === 'narration'" class="narration-wait" role="status">判定は保存済みです。GMが描写を準備しています…</p>
+          <p v-else-if="waitingPhase === 'narration'" ref="waitingVisual" class="narration-wait" role="status">行動は保存済みです。GMが描写を準備しています…</p>
           <p v-if="!s.records.length && s.historyLoaded && !s.loading" class="hint">まだ行動の記録はありません。最初の一歩を選んでみましょう。</p>
           <div v-if="s.pending?.kind === 'turn' && s.pending.campaignId === s.selected.campaign_id && !s.pending.turnId" class="player-input">
             <span class="speaker">確認待ち</span>{{ s.pending.displayText }}
@@ -253,7 +336,7 @@ function sendText() { if (s.draft.trim()) void game.submit({ kind: 'text', text:
       </form>
     </section>
 
-    <aside v-if="s.selected" class="character-panel" :class="{ expanded: stateOpen }" aria-label="冒険者の状態">
+    <aside v-if="s.selected && !authoring && !communityOpen" class="character-panel" :class="{ expanded: stateOpen }" aria-label="冒険者の状態">
       <button class="mobile-toggle" :aria-expanded="stateOpen" aria-controls="character-state" @click="stateOpen = !stateOpen">冒険者の状態<template v-if="player"> · HP {{ player.current_hp }} / {{ player.max_hp }}</template></button>
       <div id="character-state">
         <h2>冒険者</h2>

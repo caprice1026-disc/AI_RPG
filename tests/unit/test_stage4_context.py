@@ -51,7 +51,8 @@ def test_context_contains_public_actions_npc_notes_and_own_hp_inventory_only():
     pc = json.loads(context.pc_view.content)
     assert (pc["current_hp"], pc["max_hp"]) == (6, 10)
     assert pc["inventory"] == [
-        {"item_ref": "healing_potion", "name": "回復ポーション", "quantity": 2, "equipped": False}
+        {"item_ref": "healing_potion", "name": "回復ポーション", "quantity": 2,
+         "equipped": False, "effect_ref": "healing_potion"}
     ]
     scene = json.loads(context.scene_view.content)
     assert scene["npc_notes"]

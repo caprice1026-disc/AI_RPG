@@ -1,4 +1,19 @@
 {
+  "initialization": {
+    "characters": [],
+    "items": [
+      {
+        "ref": "iron_sword", "label": "鉄の剣", "owner_ref": "hero",
+        "weapon": {"damage_expression": "1d6", "damage_bonus": 0},
+        "quantity": 1, "equipped": true
+      },
+      {
+        "ref": "healing_potion", "label": "回復ポーション", "owner_ref": "hero",
+        "effect_ref": "healing_potion", "quantity": 2
+      }
+    ],
+    "placements": []
+  },
   "scenario_ref": "mist_lighthouse",
   "version": 1,
   "ruleset_ref": "mvp_v2",
@@ -13,9 +28,9 @@
     "impossible_destinations": ["宇宙", "月面", "火星", "異世界"],
     "protected_terms": ["航海日誌", "日誌", "灯台守", "灯室", "灯火", "港"],
     "protected_facts": [
-      {"fact_ref": "journal_location", "kind": "location", "statement": "航海日誌は灯室の真鍮の灯具の下にある。", "scene_ref": "lantern_room"},
-      {"fact_ref": "keeper_motive", "kind": "motive", "statement": "灯台守は日誌にある救助者の名前を守りたいので、無断の持ち出しを警戒している。", "scene_ref": "lantern_room"},
-      {"fact_ref": "region_limit", "kind": "rule", "statement": "港と遠方はこの短編の探索領域外である。"}
+      {"fact_ref": "journal_location", "kind": "location", "visibility": "public", "statement": "航海日誌は灯室の真鍮の灯具の下にある。", "scene_ref": "lantern_room"},
+      {"fact_ref": "keeper_motive", "kind": "motive", "visibility": "public", "statement": "灯台守は日誌にある救助者の名前を守りたいので、無断の持ち出しを警戒している。", "scene_ref": "lantern_room"},
+      {"fact_ref": "region_limit", "kind": "rule", "visibility": "public", "statement": "港と遠方はこの短編の探索領域外である。"}
     ]
   },
   "scenes": [

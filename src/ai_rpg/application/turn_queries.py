@@ -188,7 +188,7 @@ class TurnQueryService:
 
         return AdventureState(
             scenario_ref=definition.scenario_ref,
-            title=definition.title,
+            title=snapshot.public_title or definition.title,
             objective=definition.objective,
             status=status,
             current_scene=current_scene,

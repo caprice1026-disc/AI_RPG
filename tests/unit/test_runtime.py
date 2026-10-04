@@ -26,6 +26,27 @@ def isolated_settings(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setitem(Settings.model_config, "env_file", None)
 
 
+@pytest.mark.asyncio
+async def test_authoring_fake_runtime_uses_no_provider(monkeypatch: pytest.MonkeyPatch) -> None:
+    from ai_rpg import runtime
+    from ai_rpg.infrastructure.postgres import story_jobs
+    from ai_rpg.llm.story_authoring import DevelopmentFakeStoryAuthoring
+
+    settings = Settings(_env_file=None)
+    sentinel = object()
+    monkeypatch.setattr(runtime, "create_session_factory", lambda _url: sentinel)
+    monkeypatch.setattr(story_jobs, "PostgresStoryJobStore", lambda *a, **kw: sentinel)
+
+    async def run(worker, *, once, poll_seconds):
+        assert worker.store is sentinel
+        assert isinstance(worker.llm, DevelopmentFakeStoryAuthoring)
+        assert once and poll_seconds == 1.0
+        return True
+
+    monkeypatch.setattr(runtime, "run_worker", run)
+    assert await runtime.run_authoring_worker(settings, fake=True, once=True)
+
+
 @pytest.mark.parametrize("command", ["resolution-worker", "narration-worker"])
 @pytest.mark.parametrize("outcome", ["success", "failure", "cancel", "setup_failure"])
 def test_worker_cli_owns_models_in_one_loop_and_always_closes(

@@ -110,19 +110,27 @@ def test_v3_creation_persists_ruleset_and_abilities(database: Engine) -> None:
 
 
 def test_v3_downgrade_refuses_to_drop_saved_character_build(database: Engine) -> None:
+    # Construct the legacy, not-yet-backfilled shape so this specifically exercises
+    # the 0014 guard rather than the new immutable story-version downgrade guard.
     async def create() -> str:
-        async with _postgres_sessions(URL) as factory, client_for(factory) as client:
-            response = await client.post("/adventures", json=payload(
+        from ai_rpg.application.adventures import AdventureService
+        from ai_rpg.contracts.adventures import CreateAdventureRequest
+        from ai_rpg.infrastructure.postgres.adventures import PostgresAdventureStore
+
+        async with _postgres_sessions(URL) as factory:
+            response = await AdventureService(PostgresAdventureStore(factory)).create(
+                PRINCIPAL, CreateAdventureRequest.model_validate(payload(
                 scenario_version=3,
                 ability_points={"strength": 0, "agility": 1, "insight": 1, "presence": 0},
                 specialty_skill="perception",
-            ))
-            assert response.status_code == 201, response.text
-            return response.json()["campaign_id"]
+            )))
+            return str(response.campaign_id)
 
     with asyncio.Runner(loop_factory=asyncio.SelectorEventLoop) as runner:
         campaign_id = runner.run(create())
     assert URL
+    with database.connect() as connection:
+        initial_revision = connection.scalar(text("SELECT version_num FROM alembic_version"))
     downgrade = subprocess.run(
         [sys.executable, "-m", "alembic", "-x", f"url={URL}", "downgrade",
          "0013_browser_sessions"],
@@ -134,9 +142,7 @@ def test_v3_downgrade_refuses_to_drop_saved_character_build(database: Engine) ->
         downgrade.stdout + downgrade.stderr
     )
     with database.connect() as connection:
-        assert connection.scalar(text("SELECT version_num FROM alembic_version")) == (
-            "0014_bounded_open_scenario"
-        )
+        assert connection.scalar(text("SELECT version_num FROM alembic_version")) == initial_revision
         assert connection.scalar(text(
             "SELECT count(*) FROM mvp_character_abilities WHERE campaign_id=:id"
         ), {"id": campaign_id}) == 1
@@ -847,7 +853,12 @@ async def client_for(
     factory: object, principal: AuthenticatedPrincipal = PRINCIPAL
 ) -> AsyncIterator[AsyncClient]:
     from ai_rpg.application.adventures import AdventureService
+    from ai_rpg.application.stories import StoryService
     from ai_rpg.infrastructure.postgres.adventures import PostgresAdventureStore
+    from ai_rpg.infrastructure.postgres.scenario_source import PostgresScenarioSource
+    from ai_rpg.infrastructure.postgres.stories import PostgresStoryStore, import_builtin_stories
+
+    await import_builtin_stories(factory)
 
     authorization = PostgresAuthorizationPolicy(factory)
     uow = lambda: PostgresUnitOfWork(factory)  # noqa: E731
@@ -856,7 +867,10 @@ async def client_for(
         return principal
 
     app = create_app(
-        adventure_service=AdventureService(PostgresAdventureStore(factory)),
+        adventure_service=AdventureService(
+            PostgresAdventureStore(factory), PostgresScenarioSource(factory),
+        ),
+        story_service=StoryService(PostgresStoryStore(factory)),
         turn_service=TurnService(authorization, uow, RuntimePolicy(3, 1, 3)),
         turn_query_service=TurnQueryService(authorization, uow, BUILTIN_SCENARIOS),
         event_stream_service=EventStreamService(authorization, uow),

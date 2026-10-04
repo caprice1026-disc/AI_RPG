@@ -34,8 +34,15 @@ from ai_rpg.infrastructure.postgres.models import (
     TurnModel,
 )
 from ai_rpg.infrastructure.postgres.repositories import PostgresTurnRepository
+from ai_rpg.infrastructure.postgres.scenario_source import (
+    decode_version,
+    published_title,
+    resolve_start,
+)
+from ai_rpg.infrastructure.postgres.story_models import StoryPlaytestRecordModel, StoryVersionModel
 from ai_rpg.scenarios import BUILTIN_SCENARIOS, ScenarioDefinition
-from ai_rpg.scenarios.models import AttackScenarioAction, SkillScenarioAction
+from ai_rpg.scenarios.initialization import initialization_for
+from ai_rpg.scenarios.models import InitialCharacter, InitialItem, SkillScenarioAction
 
 
 async def _authorize(session: AsyncSession, principal_id: UUID, campaign_id: UUID) -> None:
@@ -63,6 +70,8 @@ class PostgresAdventureStore:
         request: CreateAdventureRequest,
         scenario: ScenarioDefinition,
         preset: CharacterPreset,
+        *,
+        story_version_id: UUID | None = None,
     ) -> CreateAdventureResponse:
         campaign_id, actor_id = uuid4(), uuid4()
         payload = request.model_dump(mode="json", exclude_none=True)
@@ -100,10 +109,28 @@ class PostgresAdventureStore:
                     .with_for_update()
                 )
                 await _authorize(session, principal_id, previous.campaign_id)
+                if story_version_id is not None:
+                    previous_version = await session.scalar(
+                        select(MvpScenarioRunModel.story_version_id)
+                        .where(MvpScenarioRunModel.campaign_id == previous.campaign_id)
+                    )
+                    await resolve_start(
+                        session, principal_id, request, lock=True,
+                        replay_version_id=previous_version,
+                    )
                 return CreateAdventureResponse(
                     campaign_id=previous.campaign_id, actor_id=previous.actor_id
                 )
 
+            if story_version_id is not None:
+                resolved = await resolve_start(session, principal_id, request, lock=True)
+                if resolved.version_id != story_version_id:
+                    raise IdempotencyConflictError("Story version changed during adventure start")
+                scenario = resolved.definition
+            initial = initialization_for(scenario)
+            initial_entities: tuple[InitialCharacter | InitialItem, ...] = (
+                *initial.characters, *initial.items,
+            )
             await session.execute(
                 insert(CampaignModel).values(id=campaign_id, ruleset_version=scenario.ruleset_ref)
             )
@@ -114,7 +141,10 @@ class PostgresAdventureStore:
                     role="player",
                 )
             )
-            target_id, weapon_id, potion_id = uuid4(), uuid4(), uuid4()
+            entity_ids = {
+                "hero": actor_id,
+                **{entity.ref: uuid4() for entity in initial_entities},
+            }
             await session.execute(
                 insert(EntityModel),
                 [
@@ -126,30 +156,17 @@ class PostgresAdventureStore:
                         "ref": "hero",
                         "label": request.player_name,
                     },
-                    {
-                        "id": target_id,
-                        "campaign_id": campaign_id,
-                        "kind": "npc",
-                        "controller_id": None,
-                        "ref": "goblin",
-                        "label": "ゴブリン",
-                    },
-                    {
-                        "id": weapon_id,
-                        "campaign_id": campaign_id,
-                        "kind": "item",
-                        "controller_id": None,
-                        "ref": "iron_sword",
-                        "label": "鉄の剣",
-                    },
-                    {
-                        "id": potion_id,
-                        "campaign_id": campaign_id,
-                        "kind": "item",
-                        "controller_id": None,
-                        "ref": "healing_potion",
-                        "label": "回復ポーション",
-                    },
+                    *(
+                        {
+                            "id": entity_ids[entity.ref],
+                            "campaign_id": campaign_id,
+                            "kind": "npc" if isinstance(entity, InitialCharacter) else "item",
+                            "controller_id": None,
+                            "ref": entity.ref,
+                            "label": entity.label,
+                        }
+                        for entity in initial_entities
+                    ),
                 ],
             )
             scene_ids = {scene.sequence: uuid4() for scene in scenario.scenes}
@@ -176,14 +193,17 @@ class PostgresAdventureStore:
                         "defense": preset.defense,
                         "attack_bonus": preset.attack_bonus,
                     },
-                    {
-                        "campaign_id": campaign_id,
-                        "entity_id": target_id,
-                        "current_hp": 10,
-                        "max_hp": 10,
-                        "defense": 11,
-                        "attack_bonus": 1,
-                    },
+                    *(
+                        {
+                            "campaign_id": campaign_id,
+                            "entity_id": entity_ids[character.ref],
+                            "current_hp": character.max_hp,
+                            "max_hp": character.max_hp,
+                            "defense": character.defense,
+                            "attack_bonus": character.attack_bonus,
+                        }
+                        for character in initial.characters
+                    ),
                 ],
             )
             if scenario.ruleset_ref == "mvp_v2":
@@ -203,33 +223,29 @@ class PostgresAdventureStore:
                         specialty_skill=request.specialty_skill,
                     )
                 )
-            await session.execute(
-                insert(MvpWeaponModel).values(
-                    campaign_id=campaign_id,
-                    entity_id=weapon_id,
-                    damage_expression="1d6",
-                    damage_bonus=0,
-                )
-            )
-            await session.execute(
-                insert(MvpInventoryModel),
-                [
-                    {
-                        "campaign_id": campaign_id,
-                        "owner_id": actor_id,
-                        "item_id": weapon_id,
-                        "quantity": 1,
-                        "equipped": True,
-                    },
-                    {
-                        "campaign_id": campaign_id,
-                        "owner_id": actor_id,
-                        "item_id": potion_id,
-                        "quantity": 2,
-                        "equipped": False,
-                    },
-                ],
-            )
+            weapons = [
+                {
+                    "campaign_id": campaign_id,
+                    "entity_id": entity_ids[item.ref],
+                    "damage_expression": item.weapon.damage_expression,
+                    "damage_bonus": item.weapon.damage_bonus,
+                }
+                for item in initial.items if item.weapon is not None
+            ]
+            if weapons:
+                await session.execute(insert(MvpWeaponModel), weapons)
+            inventory = [
+                {
+                    "campaign_id": campaign_id,
+                    "owner_id": entity_ids[item.owner_ref],
+                    "item_id": entity_ids[item.ref],
+                    "quantity": item.quantity,
+                    "equipped": item.equipped,
+                }
+                for item in initial.items if item.owner_ref is not None
+            ]
+            if inventory:
+                await session.execute(insert(MvpInventoryModel), inventory)
             await session.execute(
                 insert(MvpSkillModifierModel),
                 [
@@ -262,17 +278,16 @@ class PostgresAdventureStore:
                     *(
                         {
                             "campaign_id": campaign_id,
-                            "scene_id": scene_ids[scene.sequence],
-                            "entity_id": target_id,
-                            "is_public": True,
-                            "is_attack_reachable": True,
+                            "scene_id": scene_ids[next(
+                                scene.sequence for scene in scenario.scenes
+                                if scene.scene_ref == placement.scene_ref
+                            )],
+                            "entity_id": entity_ids[placement.entity_ref],
+                            "is_public": placement.visibility == "public",
+                            "is_attack_reachable": placement.attackable,
                         }
-                        for scene in scenario.scenes
-                        if any(
-                            isinstance(action, AttackScenarioAction)
-                            and action.target_ref == "goblin"
-                            for action in scene.actions
-                        )
+                        for placement in initial.placements
+                        if placement.visibility != "author_only"
                     ),
                 ],
             )
@@ -296,9 +311,17 @@ class PostgresAdventureStore:
                     campaign_id=campaign_id,
                     scenario_ref=scenario.scenario_ref,
                     scenario_version=scenario.version,
+                    story_version_id=story_version_id,
                     status="active",
                 )
             )
+            if story_version_id is not None:
+                version = await session.get(StoryVersionModel, story_version_id)
+                if version is not None and version.kind == "playtest":
+                    session.add(StoryPlaytestRecordModel(
+                        campaign_id=campaign_id, story_version_id=story_version_id,
+                        actor_id=principal_id, debug_modified=False, author_acknowledged=False,
+                    ))
         return CreateAdventureResponse(campaign_id=campaign_id, actor_id=actor_id)
 
     async def list_owned(self, principal_id: UUID) -> AdventureListResponse:
@@ -311,6 +334,7 @@ class PostgresAdventureStore:
                         func.coalesce(EntityModel.label, "Player").label("player_name"),
                         MvpScenarioRunModel.scenario_ref,
                         MvpScenarioRunModel.scenario_version,
+                        MvpScenarioRunModel.story_version_id,
                         MvpScenarioRunModel.status,
                         CampaignModel.state_version,
                         CampaignModel.created_at,
@@ -332,18 +356,20 @@ class PostgresAdventureStore:
                     )
                 )
             ).mappings()
-            return AdventureListResponse(
-                adventures=[
-                    AdventureSummary(
-                        **row,
-                        title=BUILTIN_SCENARIOS.get(
-                            row["scenario_ref"],
-                            row["scenario_version"],
-                        ).title,
-                    )
-                    for row in rows
-                ]
-            )
+            adventures = []
+            for row in rows:
+                values = dict(row)
+                version_id = values.pop("story_version_id")
+                if version_id is None:
+                    definition = BUILTIN_SCENARIOS.get(row["scenario_ref"], row["scenario_version"])
+                    title = definition.title
+                else:
+                    version = await session.get(StoryVersionModel, version_id)
+                    assert version is not None
+                    definition = decode_version(version)
+                    title = published_title(version, definition)
+                adventures.append(AdventureSummary(**values, title=title))
+            return AdventureListResponse(adventures=adventures)
 
     async def history(
         self,

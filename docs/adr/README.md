@@ -15,11 +15,12 @@
 | [0009](0009-turn-routing.md) | Turnルーティング |
 | [0010](0010-authenticated-principal.md) | 認証済みprincipal境界 |
 | [0011](0011-scene-entity-scope.md) | Scene entityの公開範囲と攻撃到達可能性 |
-| [0012](0012-scenario-definitions-and-progress.md) | Scenario定義と実行状態の分離 |
+| [0012](0012-scenario-definitions-and-progress.md) | Scenario定義と実行状態の分離（定義の保存先は0017で置換） |
 | [0013](0013-pydantic-ai-orchestration.md) | 用途別Pydantic AI Agentとモデル切替 |
 | [0014](0014-registered-actions-and-enemy-reactions.md) | 登録済み行動の直接実行と敵の反撃 |
 | [0015](0015-browser-oidc-sessions.md) | ブラウザOIDCとサーバー管理セッション |
 | [0016](0016-bounded-open-scenario.md) | 探索領域を定めた自由行動型シナリオ（v3で実装） |
+| [0017](0017-user-authored-stories.md) | 利用者の作品、下書き・不変版・公開、手動依頼のAI作成補助 |
 
 ## 共通方針
 

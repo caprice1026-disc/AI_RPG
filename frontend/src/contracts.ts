@@ -1,6 +1,6 @@
 export interface Session { principal_id: string; mode: 'session' | 'development' | 'bearer'; csrf_token: string | null; expires_at: string | null }
 export interface Catalog {
-  scenarios: { scenario_ref: string; scenario_version: number; title: string; objective: string;
+  scenarios: { scenario_ref: string; scenario_version: number; title: string; objective: string; story_version_id?: string | null; story_id?: string | null;
     character_creation?: { abilities: (keyof AbilityScores)[]; points: number; specialties: string[] } | null }[]
   presets: { preset_ref: string; name: string; description: string; max_hp: number;
     base_abilities?: AbilityScores | null }[]
@@ -13,7 +13,7 @@ export interface AdventureSummary extends AdventureId {
 }
 export type Content = { kind: 'text'; text: string } | { kind: 'scenario_action'; action_ref: string } | { kind: 'choice'; choice_id: string }
   | { kind: 'confirm_action'; proposal_id: string }
-export interface StartBody { request_id: string; scenario_ref: string; scenario_version: number; preset_ref: string; player_name: string;
+export interface StartBody { request_id: string; scenario_ref?: string; scenario_version?: number; preset_ref: string; player_name: string; story_version_id?: string;
   ability_points?: AbilityScores; specialty_skill?: string }
 export interface TurnBody { request_id: string; expected_state_version: number; actor_id: string; content: Content }
 export type Pending = { kind: 'start'; body: StartBody; adventure: AdventureId | null }
@@ -26,6 +26,7 @@ export interface Turn {
   resolution_status: 'pending' | 'resolving' | 'committed' | 'not_applied' | 'failed'
   narration_status: 'pending' | 'generating' | 'completed' | 'fallback'
   committed_state_version: number | null; narration: string | null
+  entity_labels?: Record<string, string>
   choices: { id: string; label: string }[]
   action_results: { action_id: string; ordinal: number; result: Result }[]
   enemy_reactions: { reaction_id: string; actor_id: string; target_id: string; result: Result }[]
@@ -36,7 +37,7 @@ export interface CampaignState {
   state_version: number; latest_turn: Turn | null
   player: { actor_id: string; name: string; current_hp: number; max_hp: number;
     abilities?: AbilityScores | null; specialty_skill?: string | null;
-    inventory: { item_id: string; item_ref: string | null; name: string; quantity: number; equipped: boolean }[] } | null
+    inventory: { item_id: string; item_ref: string | null; effect_ref?: 'healing_potion' | null; name: string; quantity: number; equipped: boolean }[] } | null
   adventure: { scenario_ref: string; title: string; objective: string; status: 'active' | 'completed';
     current_scene: { scene_ref: string; title: string; description: string } | null
     discovered_facts: string[]; available_actions: { action_ref: string; label: string }[]

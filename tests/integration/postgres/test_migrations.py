@@ -978,6 +978,12 @@ def _guard_empty_database(url: str) -> Generator[str, None, None]:
                         connection.execute(text("TRUNCATE TABLE turns,events,actions CASCADE"))
                         if "mvp_character_abilities" in _public_tables(cleanup_engine):
                             connection.execute(text("TRUNCATE TABLE campaigns CASCADE"))
+                        if "stories" in _public_tables(cleanup_engine):
+                            connection.execute(text("TRUNCATE TABLE stories CASCADE"))
+                        if "usage_reservations" in _public_tables(cleanup_engine):
+                            connection.execute(text(
+                                "TRUNCATE TABLE usage_reservations,profiles,moderation_audit CASCADE"
+                            ))
                 cleanup_engine.dispose()
                 _run_alembic(url, "downgrade", "base")
                 cleanup_engine = create_engine(url)
@@ -1144,6 +1150,11 @@ def test_scenario_progress_upgrade_has_no_backfill_and_downgrades_in_dependency_
             "mvp_character_abilities",
             "mvp_scenario_facts",
             "mvp_action_proposals",
+            "stories", "story_drafts", "story_draft_revisions", "story_versions",
+            "builtin_scenario_versions", "story_validation_reports",
+            "story_playtest_records", "story_requests", "authoring_jobs",
+            "authoring_proposals", "authoring_attempts", "usage_reservations",
+            "service_controls", "profiles", "story_reports", "moderation_audit",
         }
         with engine.connect() as connection:
             assert connection.scalar(text("SELECT count(*) FROM mvp_scenario_runs")) == 0
@@ -1210,7 +1221,7 @@ def test_scenario_commit_action_kind_migration_is_forward_only_with_live_rows(
         )
         with engine.connect() as connection:
             assert connection.scalar(text("SELECT version_num FROM alembic_version")) == (
-                "0014_bounded_open_scenario"
+                "0017_community"
             )
             assert connection.scalar(
                 text("SELECT kind FROM actions WHERE id=:action"),
@@ -1343,6 +1354,11 @@ def test_scene_entity_upgrade_has_no_backfill_and_rollback_preserves_data(
             "mvp_character_abilities",
             "mvp_scenario_facts",
             "mvp_action_proposals",
+            "stories", "story_drafts", "story_draft_revisions", "story_versions",
+            "builtin_scenario_versions", "story_validation_reports",
+            "story_playtest_records", "story_requests", "authoring_jobs",
+            "authoring_proposals", "authoring_attempts", "usage_reservations",
+            "service_controls", "profiles", "story_reports", "moderation_audit",
         }
         with engine.begin() as connection:
             assert connection.scalar(text("SELECT count(*) FROM mvp_scene_entities")) == 0
@@ -4213,9 +4229,9 @@ def test_fake_llm_skill_check_round_trip_reopens_turn_acceptance(
                     "specialty_skill": None,
                     "inventory": [
                         {"item_id": WEAPON_A, "item_ref": "iron_sword", "name": "鉄の剣",
-                         "quantity": 1, "equipped": True},
+                         "quantity": 1, "equipped": True, "effect_ref": None},
                         {"item_id": ITEM_A, "item_ref": "healing_potion", "name": "回復ポーション",
-                         "quantity": 2, "equipped": False},
+                         "quantity": 2, "equipped": False, "effect_ref": "healing_potion"},
                     ],
                 },
             }

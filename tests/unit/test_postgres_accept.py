@@ -44,7 +44,11 @@ def test_internal_recovery_reason_uses_explicit_public_mapping(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("max_actions", [3, 5])
-async def test_accept_preserves_policy_and_returns_valid_pending_response(max_actions: int) -> None:
+async def test_accept_preserves_policy_and_returns_valid_pending_response(
+    max_actions: int, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    admission = AsyncMock()
+    monkeypatch.setattr("ai_rpg.infrastructure.postgres.repositories.reserve_usage", admission)
     campaign_id, scene_id, principal_id, turn_id = (uuid4() for _ in range(4))
     turn = PlayerTurnInput.model_validate(
         {
@@ -105,6 +109,9 @@ async def test_accept_preserves_policy_and_returns_valid_pending_response(max_ac
     )
 
     response = await service.accept(_principal(principal_id), campaign_id, turn)
+    admission.assert_awaited_once_with(
+        session, principal_id, "turn", f"{campaign_id}:{turn.request_id}",
+    )
 
     assert response.turn_id == turn_id
     assert response.resolution_status == "pending"

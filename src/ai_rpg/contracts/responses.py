@@ -81,6 +81,7 @@ class TurnResponse(Contract):
     enemy_reactions: list[ResolvedEnemyReaction] = Field(default_factory=list)
     recovery: TurnRecovery
     risk_preview: RiskPreview | None = None
+    entity_labels: dict[Ref, ShortText] = Field(default_factory=dict)
 
     @model_validator(mode="after")
     def consistent_status(self) -> Self:
@@ -163,6 +164,7 @@ class InventoryItem(Contract):
     name: ShortText
     quantity: NonNegativeInt
     equipped: StrictBool
+    effect_ref: Literal["healing_potion"] | None = None
 
 
 class PlayerState(Contract):

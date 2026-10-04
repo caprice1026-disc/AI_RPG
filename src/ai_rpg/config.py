@@ -81,6 +81,30 @@ class Settings(BaseSettings):
     auth_client_secret: SecretStr | None = None
     auth_app_origin: str | None = None
     auth_allow_insecure_loopback: bool = False
+    registration_enabled: bool = False
+    admin_principal_ids: str = ""
+    daily_turn_limit: int = Field(default=100, ge=1, le=10000)
+    daily_story_limit: int = Field(default=10, ge=1, le=1000)
+    daily_story_validation_limit: int = Field(default=50, ge=1, le=10000)
+    daily_authoring_job_limit: int = Field(default=20, ge=1, le=1000)
+    daily_game_llm_limit: int = Field(default=300, ge=1, le=30000)
+    daily_authoring_llm_limit: int = Field(default=100, ge=1, le=10000)
+    daily_global_llm_limit: int = Field(default=5000, ge=1, le=1000000)
+    concurrent_turn_limit: int = Field(default=3, ge=1, le=20)
+    concurrent_authoring_job_limit: int = Field(default=2, ge=1, le=10)
+    authoring_timeout_seconds: int = Field(default=60, ge=5, le=120)
+    authoring_lease_seconds: int = Field(default=90, ge=30, le=180)
+    authoring_max_prompt_bytes: int = Field(default=128000, ge=1000, le=1000000)
+    authoring_max_output_tokens: int = Field(default=8192, ge=100, le=32768)
+    authoring_max_total_tokens: int = Field(default=24000, ge=1000, le=100000)
+    authoring_max_running: int = Field(default=4, ge=1, le=20)
+
+    @field_validator("admin_principal_ids")
+    @classmethod
+    def validate_administrators(cls, value: str) -> str:
+        from uuid import UUID
+
+        return ",".join(str(UUID(item.strip())) for item in value.split(",") if item.strip())
 
     @property
     def browser_auth_enabled(self) -> bool:
@@ -130,6 +154,10 @@ class Settings(BaseSettings):
 
     @model_validator(mode="after")
     def validate_worker_timing(self) -> Self:
+        if self.authoring_timeout_seconds >= self.authoring_lease_seconds:
+            raise ValueError("Authoring timeout must be shorter than its lease")
+        if self.authoring_max_output_tokens > self.authoring_max_total_tokens:
+            raise ValueError("Authoring output budget exceeds total token budget")
         if self.llm_timeout_seconds >= self.worker_lease_seconds:
             raise ValueError("LLM timeoutはworker leaseより短くする必要があります")
         if self.resolution_deadline_seconds < self.worker_lease_seconds:

@@ -86,6 +86,7 @@ from ai_rpg.engine import MvpV1Ruleset
 from ai_rpg.engine.ruleset import MvpV2Ruleset
 from ai_rpg.llm.budget import CallBudgetExceeded
 from ai_rpg.scenarios import AttackScenarioAction, DirectScenarioAction, SkillScenarioAction
+from ai_rpg.scenarios.initialization import item_effect_ref
 
 
 class ResolutionInputError(ValueError):
@@ -118,6 +119,7 @@ class _ActionPreflight:
     weapons: dict[UUID, Mapping[str, object]]
     quantities: dict[tuple[UUID, UUID], int]
     skill_data: dict[str, tuple[Mapping[str, object], int]]
+    item_effects: dict[UUID, str]
 
 
 UnitOfWorkFactory = Callable[[], UnitOfWork]
@@ -211,6 +213,13 @@ class SkillCheckResolutionWorker:
         )
 
     async def run_once(self, turn_id: UUID | None = None) -> bool:
+        try:
+            return await self._run_once(turn_id)
+        except AuthorizationError:
+            # Moderation may land after claim. Admission skips it until unblocked.
+            return False
+
+    async def _run_once(self, turn_id: UUID | None) -> bool:
         async with self._unit_of_work_factory() as unit_of_work:
             lease = await unit_of_work.turns.acquire_lease(
                 turn_id,
@@ -761,8 +770,15 @@ class SkillCheckResolutionWorker:
             supported_actions.append("attack")
         if supported_skills:
             supported_actions.append("skill_check")
+        usable_items = {
+            row["id"] for row in snapshot.entities
+            if row["kind"] == "item" and row["archived_at"] is None
+            and row["ref"] is not None
+            and self._item_effect_ref(snapshot, str(row["ref"])) is not None
+        }
         if any(
             row["owner_id"] == work.actor_id and _stored_int(row["quantity"]) > 0
+            and row["item_id"] in usable_items
             for row in snapshot.inventory
         ):
             supported_actions.append("use_item")
@@ -889,6 +905,9 @@ class SkillCheckResolutionWorker:
                 "name": public_items[row["item_id"]]["label"],
                 "quantity": _stored_int(row["quantity"]),
                 "equipped": bool(row["equipped"]),
+                "effect_ref": self._item_effect_ref(
+                    snapshot, str(public_items[row["item_id"]]["ref"])
+                ),
             }
             for row in snapshot.inventory
             if row["owner_id"] == work.actor_id and row["item_id"] in public_items
@@ -903,18 +922,9 @@ class SkillCheckResolutionWorker:
                 world_context = {
                     "region": world.region_name,
                     "boundary": world.boundary,
-                    "protected_facts": [
-                        fact.statement for fact in world.protected_facts
-                        if fact.scene_ref is None or any(
-                            runtime.status == "active"
-                            and scenario_scene.scene_ref == fact.scene_ref
-                            and runtime.sequence == scenario_scene.sequence
-                            for runtime in snapshot.scenario_run.scenes
-                            for scenario_scene in self._scenario_progressor.definition_for(
-                                snapshot.scenario_run
-                            ).scenes
-                        )
-                    ],
+                    "protected_facts": self._scenario_progressor.public_protected_facts(
+                        snapshot.scenario_run
+                    ),
                 }
         scene_payload: dict[str, object] | None = None
         if scenario_context is not None:
@@ -971,6 +981,16 @@ class SkillCheckResolutionWorker:
         if snapshot.scenario_run is None or self._scenario_progressor is None:
             raise ResolutionInputError("Scenario進行componentが設定されていません")
         return self._scenario_progressor.public_context_for(snapshot.scenario_run)
+
+    def _item_effect_ref(self, snapshot: CanonicalSnapshot, item_ref: str) -> str | None:
+        if snapshot.scenario_run is None:
+            # Retain the original development seed, which predates scenario definitions.
+            return "healing_potion" if item_ref == "healing_potion" else None
+        if self._scenario_progressor is None:
+            raise ResolutionInputError("Scenario進行componentが設定されていません")
+        return item_effect_ref(
+            self._scenario_progressor.definition_for(snapshot.scenario_run), item_ref,
+        )
 
     async def _handle_failure(self, work: ResolutionWorkItem, failure_code: str) -> bool:
         disposition = await _record_failure(
@@ -1082,6 +1102,7 @@ class SkillCheckResolutionWorker:
         # Validate the entire plan against the initial snapshot before any Engine call.
         attackable = self._attackable_entity_ids(work, snapshot)
         skill_data: dict[str, tuple[Mapping[str, object], int]] = {}
+        item_effects: dict[UUID, str] = {}
         for raw_intent in intents:
             if isinstance(raw_intent, ScenarioActionIntent):
                 continue
@@ -1166,13 +1187,15 @@ class SkillCheckResolutionWorker:
                     if raw_intent.target_ref is None
                     else resolve_ref(raw_intent.target_ref)
                 )
-                if target_id != work.actor_id or raw_intent.item_ref != "healing_potion":
+                effect_ref = self._item_effect_ref(snapshot, raw_intent.item_ref)
+                if target_id != work.actor_id or effect_ref != "healing_potion":
                     raise ResolutionInputError("登録済み回復itemの有効な対象ではありません")
                 inventory = inventory_rows.get((work.actor_id, item_id))
                 if inventory is None or _stored_int(inventory["quantity"]) < 1:
                     raise ResolutionInputError("actorが使用可能なitemを所有していません")
                 if actor.current_hp >= actor.max_hp:
                     raise ResolutionInputError("HPが満タンのため回復itemを使用できません")
+                item_effects[item_id] = effect_ref
             else:
                 raise ResolutionInputError("未対応のAction Intentです")
 
@@ -1184,6 +1207,7 @@ class SkillCheckResolutionWorker:
             weapons=weapons,
             quantities=quantities,
             skill_data=skill_data,
+            item_effects=item_effects,
         )
 
     def _resolve_actions(
@@ -1366,7 +1390,7 @@ class SkillCheckResolutionWorker:
                     ordinal=ordinal,
                     item_id=item_id,
                     target_id=target_id,
-                    effect_ref="healing_potion",
+                    effect_ref=plan.item_effects[item_id],
                 )
                 quantity = quantities[(work.actor_id, item_id)]
                 if quantity == 0:
@@ -1588,6 +1612,13 @@ class NarrationWorker:
         self._choice_id_factory = choice_id_factory
 
     async def run_once(self, turn_id: UUID | None = None) -> bool:
+        try:
+            return await self._run_once(turn_id)
+        except AuthorizationError:
+            # Keep committed resolution intact when moderation stops narration.
+            return False
+
+    async def _run_once(self, turn_id: UUID | None) -> bool:
         async with self._unit_of_work_factory() as unit_of_work:
             lease = await unit_of_work.narration.acquire_lease(
                 turn_id,

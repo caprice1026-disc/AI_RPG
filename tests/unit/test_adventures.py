@@ -1,6 +1,7 @@
 """Adventure boundary validation and authenticated catalog."""
 
 from datetime import UTC, datetime
+from unittest.mock import AsyncMock
 from uuid import UUID, uuid4
 
 import pytest
@@ -9,6 +10,8 @@ from pydantic import ValidationError
 
 from ai_rpg.api import create_app
 from ai_rpg.application import AuthenticatedPrincipal
+from ai_rpg.application.adventures import AdventureService
+from ai_rpg.application.ports.adventures import AdventureStore
 from ai_rpg.cli import _parser
 from ai_rpg.contracts.adventures import CreateAdventureRequest
 
@@ -43,7 +46,10 @@ async def test_adventure_endpoints_require_authentication() -> None:
 
 @pytest.mark.asyncio
 async def test_catalog_exposes_only_public_scenario_and_preset_fields() -> None:
-    app = create_app(principal_provider=authenticated)
+    app = create_app(
+        principal_provider=authenticated,
+        adventure_service=AdventureService(AsyncMock(spec=AdventureStore)),
+    )
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
         response = await c.get("/adventures/catalog")
     assert response.status_code == 200
@@ -52,6 +58,8 @@ async def test_catalog_exposes_only_public_scenario_and_preset_fields() -> None:
         {
             "scenario_ref": "ruined_chapel",
             "scenario_version": 3,
+            "story_version_id": None,
+            "story_id": None,
             "title": "廃礼拝堂の聖印",
             "objective": "廃礼拝堂にある銀の聖印を村へ戻す。別の解決や撤退も選べる。",
             "character_creation": {
@@ -65,6 +73,8 @@ async def test_catalog_exposes_only_public_scenario_and_preset_fields() -> None:
         {
             "scenario_ref": "mist_lighthouse",
             "scenario_version": 1,
+            "story_version_id": None,
+            "story_id": None,
             "title": "霧灯台の航海日誌",
             "objective": "灯台の航海日誌を港へ届ける。灯火の復旧、別の解決、撤退も選べる。",
             "character_creation": {
@@ -142,7 +152,10 @@ def test_invalid_player_name_is_rejected(name: str) -> None:
     ],
 )
 async def test_invalid_start_is_rejected_before_database(change: dict[str, object]) -> None:
-    app = create_app(principal_provider=authenticated)
+    app = create_app(
+        principal_provider=authenticated,
+        adventure_service=AdventureService(AsyncMock(spec=AdventureStore)),
+    )
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
         response = await c.post(
             "/adventures",

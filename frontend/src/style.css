@@ -83,10 +83,12 @@ input:disabled, select:disabled, textarea:disabled { opacity: .65; }
 .result-block { border-left: 2px solid var(--brass); padding: .5rem .9rem; margin: 1rem 0; background: #d6b77707; font-size: .87rem; }
 .result-block h3 { margin: 0 0 .4rem; color: var(--brass); font-size: .8rem; }
 .result-block p { margin: .2rem 0; white-space: pre-wrap; }
-.dice-wait { display: flex; align-items: center; gap: .8rem; margin: 1rem 0; color: var(--teal); font-size: .88rem; }
-.die-spinner { display: grid; place-items: center; width: 44px; height: 44px; flex: 0 0 44px; clip-path: polygon(50% 0, 93% 25%, 93% 75%, 50% 100%, 7% 75%, 7% 25%); background: var(--brass); color: #14202a; font-weight: 700; animation: dice-turn 1.2s ease-in-out infinite; }
-.narration-wait { margin: 1rem 0; color: var(--teal); font-size: .88rem; }
-@keyframes dice-turn { 50% { transform: rotate(180deg) scale(.87); } to { transform: rotate(360deg); } }
+.thinking-wait, .narration-wait { margin: 1rem 0; color: var(--teal); font-size: .88rem; }
+.thinking-wait::before { content: '✦'; display: inline-block; margin-right: .6rem; animation: thinking-glow 1.5s ease-in-out infinite; }
+.dice-wait { display: flex; align-items: center; gap: 1rem; margin: 1rem 0; padding: .8rem 1rem; border: 1px solid #705f42; border-radius: 8px; background: radial-gradient(circle at 12% 50%, #d6b77721, #d6b77708 62%); color: var(--ivory); font-size: .88rem; line-height: 1.7; }
+.die-spinner { display: grid; place-items: center; width: 58px; height: 58px; flex: 0 0 58px; clip-path: polygon(50% 0, 93% 25%, 93% 75%, 50% 100%, 7% 75%, 7% 25%); background: linear-gradient(145deg, #f3dfab, var(--brass) 55%, #957647); color: #14202a; font-size: 1.1rem; font-weight: 700; animation: dice-turn 1.5s ease-in-out infinite; }
+@keyframes thinking-glow { 50% { opacity: .25; transform: scale(.7); } }
+@keyframes dice-turn { 25% { transform: rotate(-22deg) scale(1.08); } 50% { transform: rotate(18deg) scale(.88); } 75% { transform: rotate(-12deg) scale(1.04); } }
 .enemy-reaction { border-color: #af857b; }
 .enemy-reaction h3 { color: var(--danger); }
 .fallback { border-left: 2px solid var(--teal); padding-left: .8rem; }

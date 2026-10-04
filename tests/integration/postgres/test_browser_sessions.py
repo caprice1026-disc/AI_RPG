@@ -29,6 +29,24 @@ database = test_migrations.database
 empty_database_url = test_migrations.empty_database_url
 
 
+def test_explicit_join_registers_verified_identity_once_but_never_reenables(database: Engine):
+    async def exercise():
+        async with stores(database) as (store, identities, _):
+            now = datetime.now(UTC)
+            values = dict(issuer=ISSUER, subject=SUBJECT, token="join-token", csrf_token="csrf",
+                          created_at=now, expires_at=now + timedelta(hours=1))
+            assert await store.create_session(**values) is None
+            first = await store.create_session(**values, allow_registration=True)
+            assert first is not None
+            replay = await store.create_session(**{**values, "token": "second"}, allow_registration=True)
+            assert replay == first
+            await identities.disable(ISSUER, SUBJECT)
+            assert await store.create_session(**{**values, "token": "third"}, allow_registration=True) is None
+            assert await store.resolve_session(token="join-token", now=now) is None
+    with asyncio.Runner(loop_factory=asyncio.SelectorEventLoop) as runner:
+        runner.run(exercise())
+
+
 @asynccontextmanager
 async def stores(
     database: Engine,
@@ -49,6 +67,7 @@ def test_browser_schema_has_private_identity_reference_and_expiry_indexes(databa
             "nonce_digest",
             "code_verifier",
             "expires_at",
+            "registration_requested",
         },
         "browser_sessions": {
             "token_digest",

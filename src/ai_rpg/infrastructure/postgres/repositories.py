@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from collections.abc import Callable, Mapping, Sequence
 from typing import Literal
 from uuid import UUID, uuid4
@@ -54,6 +55,7 @@ from ai_rpg.application.resolution import (
     project_resolution,
 )
 from ai_rpg.application.scenarios import ScenarioActionUnavailableError, ScenarioProgressor
+from ai_rpg.application.stories import StoryError
 from ai_rpg.contracts import (
     CampaignStateResponse,
     PlayerTurnInput,
@@ -77,6 +79,7 @@ from ai_rpg.domain.commands import (
 )
 from ai_rpg.domain.events import NarrationGeneratedPayload
 from ai_rpg.domain.results import AppliedResult, NotApplicableResult
+from ai_rpg.infrastructure.postgres.community import reserve_usage
 from ai_rpg.infrastructure.postgres.models import (
     ActionModel,
     CampaignMemberModel,
@@ -98,7 +101,14 @@ from ai_rpg.infrastructure.postgres.models import (
     TurnChoiceModel,
     TurnModel,
 )
+from ai_rpg.infrastructure.postgres.scenario_source import (
+    authorize_story_run,
+    load_pinned_definition,
+    published_title,
+)
+from ai_rpg.infrastructure.postgres.story_models import StoryVersionModel
 from ai_rpg.scenarios import BUILTIN_SCENARIOS
+from ai_rpg.scenarios.initialization import initialization_for
 
 
 def _json(value: object) -> str:
@@ -391,6 +401,11 @@ class PostgresTurnRepository:
 
     @staticmethod
     def _to_response(row: RowMapping) -> TurnResponse:
+        narration_input = row.get("narration_input") or {}
+        public_text = (row["narration"] or "") + " " + " ".join(
+            choice["label"] for choice in row["replay_choices"]
+        )
+        mentioned = set(re.findall(r"@([a-z][a-z0-9_]*)", public_text))
         return TurnResponse.model_validate(
             {
                 "turn_id": row["id"],
@@ -399,6 +414,11 @@ class PostgresTurnRepository:
                 "narration_status": row["narration_status"],
                 "committed_state_version": row["committed_state_version"],
                 "narration": row["narration"],
+                "entity_labels": {
+                    entity["ref"]: entity["label"]
+                    for entity in narration_input.get("allowed_entity_refs", [])
+                    if entity["ref"] in mentioned
+                },
                 "choices": row["replay_choices"],
                 "action_results": [
                     {
@@ -482,6 +502,7 @@ class PostgresTurnRepository:
                 .with_for_update()
             )
         ).scalar_one()
+        await authorize_story_run(self._session, campaign_id)
         player = None
         if principal_id is not None:
             member = await self._session.scalar(
@@ -535,6 +556,22 @@ class PostgresTurnRepository:
                         )
                     )
                 ).all()
+                # Inventory capabilities come from this run's immutable definition.
+                effects: dict[str, Literal["healing_potion"] | None] = {
+                    "healing_potion": "healing_potion",
+                }
+                scenario_run = await self._session.get(MvpScenarioRunModel, campaign_id)
+                if scenario_run is not None:
+                    definition = (
+                        await load_pinned_definition(self._session, scenario_run.story_version_id)
+                        if scenario_run.story_version_id is not None
+                        else BUILTIN_SCENARIOS.get(
+                            scenario_run.scenario_ref, scenario_run.scenario_version,
+                        )
+                    )
+                    effects = {
+                        item.ref: item.effect_ref for item in initialization_for(definition).items
+                    }
                 player = PlayerState(
                     actor_id=character.id,
                     name=character.label or "Player",
@@ -547,6 +584,7 @@ class PostgresTurnRepository:
                             name=item.label or "Item",
                             quantity=item.quantity,
                             equipped=item.equipped,
+                            effect_ref=effects.get(item.ref or ""),
                         )
                         for item in inventory
                     ],
@@ -609,6 +647,7 @@ class PostgresTurnRepository:
         )
         if not await self._can_access_campaign(campaign_id, principal_id):
             raise AuthorizationError("Campaignを参照する権限がありません")
+        await authorize_story_run(self._session, campaign_id)
         if await self._request_row(campaign_id, principal_id, turn.request_id) is not None:
             return None
         scenario_status = (
@@ -741,6 +780,9 @@ class PostgresTurnRepository:
             "max_actions": max_actions,
             "llm_call_budget": llm_call_budget,
         }
+        await reserve_usage(
+            self._session, principal_id, "turn", f"{campaign_id}:{turn.request_id}",
+        )
         result = await self._session.execute(
             insert(TurnModel).on_conflict_do_nothing().returning(*TurnModel.__table__.c),
             params,
@@ -769,6 +811,12 @@ class PostgresTurnRepository:
                     FROM turns
                     WHERE (CAST(:id AS uuid) IS NULL OR id=CAST(:id AS uuid))
                       AND resolution_status IN ('pending','resolving')
+                      AND NOT EXISTS (
+                          SELECT 1 FROM mvp_scenario_runs r
+                          JOIN story_versions v ON v.id=r.story_version_id
+                          JOIN stories s ON s.id=v.story_id
+                          WHERE r.campaign_id=turns.campaign_id AND s.lifecycle='blocked'
+                      )
                       AND (resolution_status='pending' OR lease_until<clock_timestamp())
                       AND (
                           (
@@ -1098,6 +1146,7 @@ class PostgresTurnRepository:
         await self._session.execute(
             select(CampaignModel.id).where(CampaignModel.id == campaign_id).with_for_update()
         )
+        await authorize_story_run(self._session, campaign_id)
         turn = (
             await self._session.execute(
                 select(TurnModel).where(TurnModel.id == turn_id).with_for_update()
@@ -1176,6 +1225,7 @@ class PostgresTurnRepository:
             .mappings()
             .one()
         )
+        await authorize_story_run(self._session, bundle.campaign_id)
         turn = (
             (
                 await self._session.execute(
@@ -1565,6 +1615,7 @@ class PostgresTurnRepository:
             .mappings()
             .one()
         )
+        await authorize_story_run(self._session, commit.campaign_id)
         turn = (
             (
                 await self._session.execute(
@@ -1674,10 +1725,15 @@ class PostgresScenarioRepository:
                         MvpScenarioRunModel.campaign_id,
                         MvpScenarioRunModel.scenario_ref,
                         MvpScenarioRunModel.scenario_version,
+                        MvpScenarioRunModel.story_version_id,
                         MvpScenarioRunModel.status,
                         MvpScenarioRunModel.ending_ref,
                         MvpScenarioRunModel.elapsed_actions,
                         MvpScenarioRunModel.alert_level,
+                        StoryVersionModel,
+                    ).outerjoin(
+                        StoryVersionModel,
+                        StoryVersionModel.id == MvpScenarioRunModel.story_version_id,
                     ).where(MvpScenarioRunModel.campaign_id == campaign_id)
                 )
             )
@@ -1706,10 +1762,18 @@ class PostgresScenarioRepository:
             .where(MvpScenarioFactModel.campaign_id == campaign_id)
             .order_by(MvpScenarioFactModel.created_by_turn_id, MvpScenarioFactModel.id)
         )
+        definition = (
+            await load_pinned_definition(self._session, run["story_version_id"])
+            if run["story_version_id"] is not None else None
+        )
         return ScenarioRunSnapshot(
             campaign_id=run["campaign_id"],
             scenario_ref=run["scenario_ref"],
             scenario_version=int(run["scenario_version"]),
+            story_version_id=run["story_version_id"],
+            definition=definition,
+            public_title=published_title(run["StoryVersionModel"], definition)
+            if definition is not None else None,
             status=run["status"],
             ending_ref=run["ending_ref"],
             scenes=tuple(
@@ -1800,6 +1864,15 @@ class PostgresLLMCallRepository:
         phase: LLMPhase,
         worker_epoch: int,
     ) -> bool:
+        campaign_id = await self._session.scalar(
+            select(TurnModel.campaign_id).where(TurnModel.id == turn_id)
+        )
+        if campaign_id is None:
+            return False
+        await self._session.execute(
+            select(CampaignModel.id).where(CampaignModel.id == campaign_id).with_for_update()
+        )
+        await authorize_story_run(self._session, campaign_id)
         ownership = {
             "resolution": (
                 "resolution_status='resolving' "
@@ -1815,6 +1888,7 @@ class PostgresLLMCallRepository:
         }.get(phase)
         if ownership is None:
             raise ValueError(f"未対応のLLM phaseです: {phase}")
+        savepoint = await self._session.begin_nested()
         result = await self._session.execute(
             text(
                 f"""
@@ -1824,12 +1898,30 @@ class PostgresLLMCallRepository:
                   AND {ownership}
                   AND llm_call_count<llm_call_budget
                   AND (route IS DISTINCT FROM 'narrative' OR llm_call_count<1)
-                RETURNING llm_call_count
+                RETURNING llm_call_count,created_by
                 """
             ),
             {"turn": turn_id, "epoch": worker_epoch},
         )
-        return result.scalar_one_or_none() is not None
+        row = result.one_or_none()
+        if row is not None:
+            try:
+                await reserve_usage(
+                    self._session, row.created_by, "llm_game", f"{turn_id}:{row.llm_call_count}",
+                )
+            except StoryError:
+                await savepoint.rollback()
+                return False
+            # The global usage lock can outlast this worker's lease/deadline.
+            current = await self._session.scalar(
+                text(f"SELECT 1 FROM turns WHERE id=:turn AND {ownership}"),
+                {"turn": turn_id, "epoch": worker_epoch},
+            )
+            if current is None:
+                await savepoint.rollback()
+                return False
+        await savepoint.commit()
+        return row is not None
 
     async def record_failure(
         self,
@@ -1848,6 +1940,7 @@ class PostgresLLMCallRepository:
         await self._session.execute(
             select(CampaignModel.id).where(CampaignModel.id == campaign_id).with_for_update()
         )
+        await authorize_story_run(self._session, campaign_id)
         if phase == "resolution":
             ownership = (
                 "resolution_status='resolving' "
@@ -1974,6 +2067,12 @@ class PostgresNarrationRepository:
                     WHERE (CAST(:id AS uuid) IS NULL OR id=CAST(:id AS uuid))
                       AND resolution_status IN ('committed','not_applied','failed')
                       AND narration_status IN ('pending','generating')
+                      AND NOT EXISTS (
+                          SELECT 1 FROM mvp_scenario_runs r
+                          JOIN story_versions v ON v.id=r.story_version_id
+                          JOIN stories s ON s.id=v.story_id
+                          WHERE r.campaign_id=turns.campaign_id AND s.lifecycle='blocked'
+                      )
                       AND (
                           narration_status='pending'
                           OR narration_lease_until<clock_timestamp()
@@ -2097,6 +2196,7 @@ class PostgresNarrationRepository:
             .mappings()
             .one()
         )
+        await authorize_story_run(self._session, campaign_id)
         result = await self._session.execute(
             text(
                 """

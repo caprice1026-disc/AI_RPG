@@ -11,7 +11,7 @@ export const terminal = (turn: Turn) => ['completed', 'fallback'].includes(turn.
   && ['committed', 'not_applied', 'failed'].includes(turn.resolution_status)
 const storageMessage = '送信内容をブラウザーに保存できません。保存を許可してから送信してください。'
 const conflictMessage = '冒険の状態が更新されました。行動内容を確認してから、改めて選んでください。'
-class HttpError extends Error {
+export class HttpError extends Error {
   constructor(public status: number) { super(status === 409 ? conflictMessage : status === 403
     ? 'この操作は許可されていません。ログイン状態を確認してください。'
     : status === 422 ? '入力内容を確認してください。'
@@ -26,7 +26,9 @@ function validPending(v: unknown): v is Pending {
   if (!v || typeof v !== 'object' || !('kind' in v) || !('body' in v)) return false
   const p = v as Pending, b = p.body
   if (!b || typeof b.request_id !== 'string') return false
-  if (p.kind === 'start') return typeof p.body.scenario_ref === 'string' && Number.isInteger(p.body.scenario_version)
+  if (p.kind === 'start') return ((typeof p.body.scenario_ref === 'string' && Number.isInteger(p.body.scenario_version))
+    || (p.body.scenario_ref === undefined && p.body.scenario_version === undefined && typeof p.body.story_version_id === 'string'))
+    && (p.body.story_version_id === undefined || typeof p.body.story_version_id === 'string')
     && typeof p.body.preset_ref === 'string' && typeof p.body.player_name === 'string' && (p.adventure === null || isId(p.adventure))
     && (p.body.ability_points === undefined || ['strength', 'agility', 'insight', 'presence']
       .every(key => Number.isInteger(p.body.ability_points?.[key as keyof typeof p.body.ability_points])))
@@ -57,8 +59,8 @@ export function createGame(options: Options = {}) {
   let observedTurn: Turn | null = null
   const requests = new Map<AbortController, boolean>()
   const key = (suffix: string) => `ai-rpg:vue:${state.session!.principal_id}:${suffix}`
-  const canStart = computed(() => state.auth === 'ready' && !state.pending && !state.busy && !state.storageBlocked
-    && !!state.catalog.scenarios.length && !!state.catalog.presets.length)
+  const canStartVersion = computed(() => state.auth === 'ready' && !state.pending && !state.busy && !state.storageBlocked && !!state.catalog.presets.length)
+  const canStart = computed(() => canStartVersion.value && !!state.catalog.scenarios.length)
   const canAct = computed(() => state.auth === 'ready' && state.stateReady && !state.loading && !state.busy
     && !state.pending && !state.tracking && !state.storageBlocked && state.campaign?.adventure?.status === 'active'
     && (!state.campaign.latest_turn || terminal(state.campaign.latest_turn)))
@@ -87,7 +89,7 @@ export function createGame(options: Options = {}) {
     const controller = new AbortController(); requests.set(controller, view)
     const timeout = setTimeout(() => controller.abort(), 20000)
     const headers = new Headers(init.headers)
-    if (init.method === 'POST') {
+    if (init.method === 'POST' || init.method === 'PATCH' || init.method === 'PUT') {
       headers.set('Content-Type', 'application/json')
       if (state.session?.csrf_token) headers.set('X-CSRF-Token', state.session.csrf_token)
     }
@@ -242,7 +244,7 @@ export function createGame(options: Options = {}) {
     observedTurn = state.records.find(r => r.turn.turn_id === turn.turn_id)!.turn
     if (state.campaign) state.campaign.latest_turn = state.records.find(r => r.turn.turn_id === turn.turn_id)!.turn
     state.notice = terminal(turn) ? '行動を保存しました。' : turn.resolution_status === 'committed'
-      ? '判定と状態は保存済みです。物語の描写を準備しています…' : '行動を受け付けました。判定しています…'
+      ? '行動と状態は保存済みです。物語の描写を準備しています…' : '行動を受け付けました。GMが内容を確認しています…'
     if (terminal(turn) && pending) {
       if (!persist(null, pending)) return
       if (pending.kind === 'turn' && pending.body.content.kind === 'text' && state.draft === pending.body.content.text) state.draft = ''
@@ -370,26 +372,40 @@ export function createGame(options: Options = {}) {
       if (active() && activeOperation === operation) { state.busy = false; activeOperation = null }
     }
   }
-  async function startAdventure(input: Omit<StartBody, 'request_id' | 'scenario_version'>) {
+  async function startAdventure(input: Omit<StartBody, 'request_id' | 'scenario_version'>, displayedScenario?: Catalog['scenarios'][number]) {
     if (!canStart.value) return
-    const scenario = state.catalog.scenarios.find(s => s.scenario_ref === input.scenario_ref)
-    if (!scenario || !state.catalog.presets.some(p => p.preset_ref === input.preset_ref) || !input.player_name.trim()
+    const scenario = displayedScenario?.scenario_ref === input.scenario_ref ? displayedScenario
+      : state.catalog.scenarios.find(s => s.scenario_ref === input.scenario_ref)
+    if (!scenario) { state.error = 'シナリオを選択してください。'; return }
+    await startWith({ ...input, scenario_ref: scenario.scenario_ref, scenario_version: scenario.scenario_version,
+      ...(scenario.story_version_id ? { story_version_id: scenario.story_version_id } : {}) }, !!scenario.character_creation)
+  }
+  async function startPublishedAdventure(input: Omit<StartBody, 'request_id' | 'scenario_ref' | 'scenario_version'>, ruleset: 'mvp_v1' | 'mvp_v2') {
+    if (!input.story_version_id || !canStartVersion.value) return
+    await startWith({ story_version_id: input.story_version_id, preset_ref: input.preset_ref, player_name: input.player_name,
+      ability_points: input.ability_points, specialty_skill: input.specialty_skill }, ruleset === 'mvp_v2')
+  }
+  async function startWith(input: Omit<StartBody, 'request_id'>, allocation: boolean) {
+    if (!canStartVersion.value) return
+    if (!state.catalog.presets.some(p => p.preset_ref === input.preset_ref) || !input.player_name.trim()
       || [...input.player_name].length > 40 || /[\p{C}\p{Zl}\p{Zp}]/u.test(input.player_name)) {
       state.error = 'シナリオ、冒険者のタイプと1〜40文字の名前を確認してください。'; return
     }
     const preset = state.catalog.presets.find(p => p.preset_ref === input.preset_ref)!
-    if (scenario.character_creation) {
+    if (allocation) {
       const points = input.ability_points, base = preset.base_abilities
-      const abilities = scenario.character_creation.abilities
-      if (!points || !base || !input.specialty_skill || !scenario.character_creation.specialties.includes(input.specialty_skill)
-        || abilities.reduce((sum, key) => sum + points[key], 0) !== scenario.character_creation.points
+      const abilities = ['strength', 'agility', 'insight', 'presence'] as const
+      if (!points || !base || !input.specialty_skill || !['athletics', 'acrobatics', 'perception', 'stealth', 'persuasion'].includes(input.specialty_skill)
+        || abilities.reduce((sum, key) => sum + points[key], 0) !== 2
         || abilities.some(key => !Number.isInteger(points[key]) || points[key] < 0 || points[key] > 2 || base[key] + points[key] > 3)) {
         state.error = '能力ポイントをすべて配分し、得意技能を選んでください。'; return
       }
     }
-    const pending: Pending = { kind: 'start', body: { request_id: crypto.randomUUID(), scenario_ref: input.scenario_ref,
-      scenario_version: scenario.scenario_version, preset_ref: input.preset_ref, player_name: input.player_name,
-      ...(scenario.character_creation ? { ability_points: input.ability_points, specialty_skill: input.specialty_skill } : {}) }, adventure: null }
+    const pending: Pending = { kind: 'start', body: { request_id: crypto.randomUUID(),
+      ...(input.scenario_ref ? { scenario_ref: input.scenario_ref, scenario_version: input.scenario_version } : {}),
+      ...(input.story_version_id ? { story_version_id: input.story_version_id } : {}),
+      preset_ref: input.preset_ref, player_name: input.player_name,
+      ...(allocation ? { ability_points: input.ability_points, specialty_skill: input.specialty_skill } : {}) }, adventure: null }
     if (persist(pending)) await retry(pending)
   }
   async function submit(content: Content, displayText: string) {
@@ -445,7 +461,7 @@ export function createGame(options: Options = {}) {
     }
   }
   function dispose() { disposed = true; clearPrivate('signed-out') }
-  return { state, canStart, canAct, boot, refreshHome, refreshState, loadHistory, selectAdventure,
-    startAdventure, submit, bindAction, retry, recover, goHome, logout, dispose }
+  return { state, canStart, canStartVersion, canAct, boot, refreshHome, refreshState, loadHistory, selectAdventure,
+    startAdventure, startPublishedAdventure, submit, bindAction, retry, recover, goHome, logout, dispose, request }
 }
 export type Game = ReturnType<typeof createGame>

@@ -8,6 +8,10 @@ from uuid import UUID
 from sqlalchemy import delete, func, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from ai_rpg.infrastructure.postgres.identities import (
+    IdentityRegistrationConflict,
+    PostgresIdentityStore,
+)
 from ai_rpg.infrastructure.postgres.models import (
     BrowserSessionModel,
     LoginAttemptModel,
@@ -19,6 +23,7 @@ from ai_rpg.infrastructure.postgres.models import (
 class LoginAttempt:
     nonce_digest: str
     code_verifier: str
+    registration_requested: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -47,6 +52,7 @@ class PostgresBrowserSessionStore:
         nonce: str,
         code_verifier: str,
         expires_at: datetime,
+        registration_requested: bool = False,
     ) -> None:
         async with self._sessions.begin() as session:
             await session.execute(
@@ -61,6 +67,7 @@ class PostgresBrowserSessionStore:
                     nonce_digest=_digest(nonce),
                     code_verifier=code_verifier,
                     expires_at=expires_at,
+                    registration_requested=registration_requested,
                 )
             )
 
@@ -75,12 +82,14 @@ class PostgresBrowserSessionStore:
                     LoginAttemptModel.binding_digest == _digest(binding),
                     LoginAttemptModel.expires_at > now,
                 )
-                .returning(LoginAttemptModel.nonce_digest, LoginAttemptModel.code_verifier)
+                .returning(LoginAttemptModel.nonce_digest, LoginAttemptModel.code_verifier,
+                           LoginAttemptModel.registration_requested)
             )
             row = result.one_or_none()
             if row is None:
                 return None
-            return LoginAttempt(nonce_digest=row.nonce_digest, code_verifier=row.code_verifier)
+            return LoginAttempt(nonce_digest=row.nonce_digest, code_verifier=row.code_verifier,
+                                registration_requested=row.registration_requested)
 
     async def create_session(
         self,
@@ -91,7 +100,14 @@ class PostgresBrowserSessionStore:
         csrf_token: str,
         created_at: datetime,
         expires_at: datetime,
+        allow_registration: bool = False,
     ) -> UUID | None:
+        if allow_registration:
+            try:
+                await PostgresIdentityStore(self._sessions).register(issuer, subject)
+            except IdentityRegistrationConflict:
+                # Explicitly disabled identities must never self-enable.
+                return None
         async with self._sessions.begin() as session:
             await session.execute(
                 delete(BrowserSessionModel).where(

@@ -9,6 +9,7 @@ from ai_rpg.application.ports.adventures import (
     InvalidAdventureError,
     InvalidHistoryCursorError,
 )
+from ai_rpg.application.ports.scenario_source import ScenarioSource
 from ai_rpg.contracts.adventures import (
     AbilityScores,
     AdventureCatalogResponse,
@@ -49,8 +50,17 @@ PRESETS = (
 
 
 class AdventureService:
-    def __init__(self, store: AdventureStore) -> None:
+    def __init__(self, store: AdventureStore, source: ScenarioSource | None = None) -> None:
         self._store = store
+        self._source = source
+
+    async def catalog_for(self, principal: AuthenticatedPrincipal) -> AdventureCatalogResponse:
+        if self._source is None:
+            return self.catalog()
+        return AdventureCatalogResponse(
+            scenarios=await self._source.catalog(principal.principal_id),
+            presets=[preset.summary for preset in PRESETS],
+        )
 
     def catalog(self) -> AdventureCatalogResponse:
         scenarios = (
@@ -81,9 +91,16 @@ class AdventureService:
         principal: AuthenticatedPrincipal,
         request: CreateAdventureRequest,
     ) -> CreateAdventureResponse:
+        version_id = None
         try:
-            scenario = BUILTIN_SCENARIOS.get(request.scenario_ref, request.scenario_version)
             preset = next(p for p in PRESETS if p.summary.preset_ref == request.preset_ref)
+            if self._source is not None:
+                resolved = await self._source.for_start(principal.principal_id, request)
+                scenario, version_id = resolved.definition, resolved.version_id
+            else:
+                if request.scenario_ref is None or request.scenario_version is None:
+                    raise InvalidAdventureError("Story storage is not configured")
+                scenario = BUILTIN_SCENARIOS.get(request.scenario_ref, request.scenario_version)
         except (KeyError, StopIteration) as error:
             raise InvalidAdventureError("Unknown scenario or preset") from error
         if scenario.ruleset_ref == "mvp_v2":
@@ -99,6 +116,10 @@ class AdventureService:
                 raise InvalidAdventureError("Ability score exceeds the allowed maximum")
         elif request.ability_points is not None or request.specialty_skill is not None:
             raise InvalidAdventureError("This scenario does not use ability allocation")
+        if version_id is not None:
+            return await self._store.create(
+                principal.principal_id, request, scenario, preset, story_version_id=version_id,
+            )
         return await self._store.create(principal.principal_id, request, scenario, preset)
 
     async def list_owned(self, principal: AuthenticatedPrincipal) -> AdventureListResponse:

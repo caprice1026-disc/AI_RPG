@@ -1,4 +1,44 @@
 {
+  "initialization": {
+    "characters": [
+      {
+        "ref": "goblin",
+        "label": "ゴブリン",
+        "kind": "monster",
+        "max_hp": 10,
+        "defense": 11,
+        "attack_bonus": 1
+      }
+    ],
+    "items": [
+      {
+        "ref": "iron_sword",
+        "label": "鉄の剣",
+        "weapon": {
+          "damage_expression": "1d6",
+          "damage_bonus": 0
+        },
+        "owner_ref": "hero",
+        "quantity": 1,
+        "equipped": true
+      },
+      {
+        "ref": "healing_potion",
+        "label": "回復ポーション",
+        "effect_ref": "healing_potion",
+        "owner_ref": "hero",
+        "quantity": 2
+      }
+    ],
+    "placements": [
+      {
+        "entity_ref": "goblin",
+        "scene_ref": "sanctum",
+        "visibility": "public",
+        "attackable": true
+      }
+    ]
+  },
   "scenario_ref": "ruined_chapel",
   "version": 1,
   "title": "廃礼拝堂の聖印",

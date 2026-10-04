@@ -62,7 +62,7 @@ DEVELOPMENT_FIXTURE = DevelopmentFixture(
 
 
 class RunnableWorker(Protocol):
-    async def run_once(self, turn_id: UUID | None = None) -> bool: ...
+    async def run_once(self) -> bool: ...
 
 
 def selector_event_loop() -> asyncio.AbstractEventLoop:
@@ -355,3 +355,27 @@ async def run_worker(
             processed = False
         if not processed:
             await asyncio.sleep(poll_seconds)
+
+
+async def run_authoring_worker(settings: Settings, *, fake: bool, once: bool) -> bool:
+    """Run the authoring queue separately from resolution/narration workloads."""
+    from ai_rpg.application.story_jobs import StoryAuthoringWorker
+    from ai_rpg.infrastructure.postgres.story_jobs import PostgresStoryJobStore
+    from ai_rpg.llm.models import build_provider_models
+    from ai_rpg.llm.story_authoring import DevelopmentFakeStoryAuthoring, PydanticAIStoryAuthoring
+
+    store = PostgresStoryJobStore(create_session_factory(settings.database_url),
+                                 model_id=settings.background_model, settings=settings)
+    if fake:
+        return await run_worker(
+            StoryAuthoringWorker(store, DevelopmentFakeStoryAuthoring()),
+            once=once, poll_seconds=1.0,
+        )
+    # Only the SDK request timeout changes; game workers keep their own shorter lease.
+    authoring_settings = settings.model_copy(update={
+        "llm_timeout_seconds": settings.authoring_timeout_seconds,
+        "fast_model": settings.background_model, "quality_model": settings.background_model,
+    })
+    async with build_provider_models(authoring_settings) as models:
+        return await run_worker(StoryAuthoringWorker(store, PydanticAIStoryAuthoring(models)),
+                                once=once, poll_seconds=1.0)

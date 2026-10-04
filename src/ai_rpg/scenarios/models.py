@@ -4,9 +4,60 @@ from typing import Annotated, Literal, Self, TypeAlias
 
 from pydantic import Field, model_validator
 
-from ai_rpg.contracts.common import Contract, NonNegativeInt, PositiveInt, Ref, ShortText
+from ai_rpg.contracts.common import Contract, PositiveInt, Ref, ShortText
 
 SUPPORTED_SKILL_REFS = frozenset({"perception", "persuasion", "stealth"})
+Visibility: TypeAlias = Literal["public", "secret", "author_only"]
+Capability: TypeAlias = Literal[
+    "skill_checks", "combat", "item_use", "open_actions", "protected_facts"
+]
+
+
+class InitialCharacter(Contract):
+    ref: Ref
+    label: ShortText
+    kind: Literal["npc", "monster"] = "npc"
+    max_hp: int = Field(default=1, strict=True, ge=1, le=1000)
+    defense: int = Field(default=0, strict=True, ge=0, le=30)
+    attack_bonus: int = Field(default=0, strict=True, ge=-20, le=20)
+
+
+class InitialWeapon(Contract):
+    damage_expression: Literal["1d4", "1d6"]
+    damage_bonus: int = Field(default=0, strict=True, ge=0, le=20)
+
+
+class InitialItem(Contract):
+    ref: Ref
+    label: ShortText
+    effect_ref: Literal["healing_potion"] | None = None
+    weapon: InitialWeapon | None = None
+    owner_ref: Ref | None = None
+    quantity: int = Field(default=1, strict=True, ge=1, le=99)
+    equipped: bool = Field(default=False, strict=True)
+
+    @model_validator(mode="after")
+    def valid_equipment(self) -> Self:
+        if self.weapon is not None and self.effect_ref is not None:
+            raise ValueError("An item cannot be both a weapon and a consumable")
+        if self.equipped and (self.weapon is None or self.owner_ref is None):
+            raise ValueError("Equipped items need a weapon and an owner")
+        if self.owner_ref is None and self.quantity != 1:
+            raise ValueError("Unowned items represent one entity, not an inventory stack")
+        return self
+
+
+class InitialPlacement(Contract):
+    entity_ref: Ref
+    scene_ref: Ref
+    visibility: Visibility = "public"
+    attackable: bool = Field(default=False, strict=True)
+
+
+class ScenarioInitialization(Contract):
+    characters: tuple[InitialCharacter, ...] = Field(default=(), max_length=100)
+    items: tuple[InitialItem, ...] = Field(default=(), max_length=100)
+    placements: tuple[InitialPlacement, ...] = Field(default=(), max_length=500)
 
 
 class ScenarioEndingOverride(Contract):
@@ -38,7 +89,7 @@ class SkillScenarioAction(ScenarioActionConditions):
     action_ref: Ref
     label: ShortText
     kind: Literal["skill_check"]
-    check_ref: Ref
+    check_ref: Literal["easy", "normal", "hard"]
     skill_ref: Ref
     success: ScenarioEffect
     failure: ScenarioEffect
@@ -63,7 +114,7 @@ class ScenarioCombatDefinition(Contract):
     started_flag: Ref
     defeat_ending_ref: Ref
     damage_expression: Literal["1d4", "1d6"]
-    damage_bonus: NonNegativeInt = 0
+    damage_bonus: int = Field(default=0, strict=True, ge=0, le=20)
 
 
 class SceneDefinition(Contract):
@@ -98,9 +149,13 @@ class EndingDefinition(Contract):
 
 class ProtectedFact(Contract):
     fact_ref: Ref
-    kind: Literal["location", "motive", "rule"]
+    kind: Literal["location", "motive", "rule", "existence"]
     statement: ShortText
     scene_ref: Ref | None = None
+    visibility: Visibility = "secret"
+    reveal_flag_ref: Ref | None = None
+    entity_ref: Ref | None = None
+    acquired_flag_ref: Ref | None = None
 
 
 class BoundedWorld(Contract):
@@ -115,6 +170,7 @@ class BoundedWorld(Contract):
 
 
 class ScenarioDefinition(Contract):
+    schema_version: Literal[1, 2] = 1
     scenario_ref: Ref
     version: PositiveInt
     title: ShortText
@@ -122,8 +178,10 @@ class ScenarioDefinition(Contract):
     scenes: tuple[SceneDefinition, ...]
     flags: tuple[ScenarioFlagDefinition, ...]
     endings: tuple[EndingDefinition, ...]
-    ruleset_ref: Ref = "mvp_v1"
+    ruleset_ref: Literal["mvp_v1", "mvp_v2"] = "mvp_v1"
     world: BoundedWorld | None = None
+    required_capabilities: tuple[Capability, ...] = ()
+    initialization: ScenarioInitialization | None = None
 
     @model_validator(mode="after")
     def valid_graph(self) -> Self:
@@ -222,4 +280,93 @@ class ScenarioDefinition(Contract):
                         if override.ending_ref not in known_endings:
                             raise ValueError("Ending overrideが存在しないEndingを参照しています")
 
+        self._validate_initialization(known_scenes, known_flags)
         return self
+
+    def _validate_initialization(self, scenes: set[str], flags: set[str]) -> None:
+        initial = self.initialization
+        if initial is None:
+            if self.schema_version == 2:
+                raise ValueError("Schema 2 requires explicit initialization (empty is allowed)")
+            return  # Historical definitions remain readable; not executable without initialization.
+        characters = {value.ref: value for value in initial.characters}
+        items = {value.ref: value for value in initial.items}
+        refs = [value.ref for value in initial.characters] + [value.ref for value in initial.items]
+        if len(refs) != len(set(refs)) or "hero" in refs:
+            raise ValueError("Initialization entity refs must be unique; hero is reserved")
+        equipped_owners = [value.owner_ref for value in initial.items if value.equipped]
+        if len(equipped_owners) != len(set(equipped_owners)):
+            raise ValueError("Only one weapon may be equipped per owner")
+        for item in initial.items:
+            if item.owner_ref is not None and item.owner_ref not in {"hero", *characters}:
+                raise ValueError("Item owner references an unknown character")
+        placements = {(value.entity_ref, value.scene_ref): value for value in initial.placements}
+        if len(placements) != len(initial.placements):
+            raise ValueError("Duplicate entity placement")
+        for placement in initial.placements:
+            if placement.entity_ref not in refs or placement.scene_ref not in scenes:
+                raise ValueError("Placement references an unknown entity or Scene")
+            if placement.attackable and (
+                placement.visibility != "public" or placement.entity_ref not in characters
+            ):
+                raise ValueError("Attackable placements must be public characters")
+            if placement.entity_ref in items and items[placement.entity_ref].owner_ref is not None:
+                raise ValueError("An owned item cannot also be placed in a Scene")
+        needed: set[str] = set()
+        if any(item.effect_ref is not None for item in initial.items):
+            needed.add("item_use")
+        if self.world is not None and self.ruleset_ref == "mvp_v2":
+            needed.add("open_actions")
+        for scene in self.scenes:
+            skills = [action.skill_ref for action in scene.actions
+                      if isinstance(action, SkillScenarioAction)]
+            targets = [action.target_ref for action in scene.actions
+                       if isinstance(action, AttackScenarioAction)]
+            if len(skills) != len(set(skills)) or len(targets) != len(set(targets)):
+                raise ValueError("Scene skill and attack bindings must be unambiguous")
+            if skills:
+                needed.add("skill_checks")
+            for target in targets:
+                needed.add("combat")
+                target_placement = placements.get((target, scene.scene_ref))
+                if target_placement is None or not target_placement.attackable:
+                    raise ValueError("Attack target needs an attackable placement in its Scene")
+        if self.world is not None:
+            for fact in self.world.protected_facts:
+                if (self.schema_version == 2 and fact.kind in {"location", "existence"}
+                        and fact.entity_ref is None):
+                    raise ValueError("Structural protected facts require an entity reference")
+                if fact.reveal_flag_ref is not None and fact.reveal_flag_ref not in flags:
+                    raise ValueError("Protected fact reveal references an unknown Flag")
+                if fact.acquired_flag_ref is not None and fact.acquired_flag_ref not in flags:
+                    raise ValueError("Protected fact acquisition references an unknown Flag")
+                if fact.visibility == "author_only" and fact.reveal_flag_ref is not None:
+                    raise ValueError("Author-only facts cannot be revealed")
+                if fact.entity_ref is not None:
+                    needed.add("protected_facts")
+                    if fact.entity_ref not in refs:
+                        raise ValueError("Protected fact references an unknown entity")
+                    if fact.kind in {"location", "existence"} and (
+                        fact.scene_ref is None
+                        or (fact.entity_ref, fact.scene_ref) not in placements
+                    ):
+                        raise ValueError("Protected entity must be placed in its declared Scene")
+                    if fact.kind == "location" and any(
+                        placement.entity_ref == fact.entity_ref
+                        and placement.scene_ref != fact.scene_ref
+                        for placement in initial.placements
+                    ):
+                        raise ValueError("Protected item location contradicts another placement")
+                if fact.acquired_flag_ref is not None and (
+                    fact.kind != "location" or fact.entity_ref not in items
+                ):
+                    raise ValueError("Acquisition facts must describe a placed item location")
+        if len(self.required_capabilities) != len(set(self.required_capabilities)):
+            raise ValueError("Duplicate capability requirement")
+        if "open_actions" in self.required_capabilities and (
+            self.ruleset_ref != "mvp_v2" or self.world is None
+        ):
+            raise ValueError("Open actions require mvp_v2 and a bounded world")
+        if self.schema_version == 2 and not needed <= set(self.required_capabilities):
+            missing = sorted(needed - set(self.required_capabilities))
+            raise ValueError(f"Missing capability requirements: {missing}")

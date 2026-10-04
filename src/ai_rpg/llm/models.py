@@ -27,6 +27,18 @@ async def build_language_models(settings: Settings, *, fake: bool) -> AsyncItera
         yield DevelopmentFakeLLM()
         return
 
+    async with build_provider_models(settings) as models:
+        try:
+            llm = PydanticAILLM(models)
+        except Exception:
+            raise ValueError("LLM client initialization failed") from None
+        yield llm
+
+
+@asynccontextmanager
+async def build_provider_models(settings: Settings) -> AsyncIterator[dict[str, Model]]:
+    """Shared provider lifecycle; SDK retries remain disabled for all agent uses."""
+
     model_ids = tuple(dict.fromkeys((
         settings.fast_model, settings.quality_model, settings.background_model,
     )))
@@ -89,8 +101,7 @@ async def build_language_models(settings: Settings, *, fake: bool) -> AsyncItera
                     )
                     for model_id in model_ids if model_id.startswith("openai-responses:")
                 })
-            llm = PydanticAILLM(models)
         except Exception:
             # SDK validation errors may include constructor arguments containing secrets.
             raise ValueError("LLM client initialization failed") from None
-        yield llm
+        yield models

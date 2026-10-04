@@ -54,7 +54,7 @@ def _parser() -> argparse.ArgumentParser:
     disable = auth_commands.add_parser("disable")
     disable.add_argument("--subject", required=True)
 
-    for name in ("resolution-worker", "narration-worker"):
+    for name in ("resolution-worker", "narration-worker", "authoring-worker"):
         worker = commands.add_parser(name)
         worker.add_argument("--fake", action="store_true")
         worker.add_argument("--once", action="store_true")
@@ -106,6 +106,10 @@ async def _run_auth_command(
 
 
 async def _run_worker_command(args: argparse.Namespace, settings: Settings) -> bool:
+    if args.command == "authoring-worker":
+        from ai_rpg.runtime import run_authoring_worker
+
+        return await run_authoring_worker(settings, fake=args.fake, once=args.once)
     async with build_language_models(settings, fake=args.fake) as llm:
         worker = (
             build_resolution_worker(settings, llm, deterministic=args.fake)

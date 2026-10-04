@@ -1,0 +1,66 @@
+{
+  "schema_version": 2,
+  "scenario_ref": "clockwork_garden",
+  "version": 1,
+  "title": "The Clockwork Garden",
+  "objective": "Collect the last seed pod, or leave the greenhouse untouched.",
+  "ruleset_ref": "mvp_v2",
+  "required_capabilities": ["skill_checks", "combat", "item_use", "open_actions", "protected_facts"],
+  "initialization": {
+    "characters": [
+      {"ref": "botanist", "label": "The gardener", "kind": "npc", "max_hp": 6, "defense": 9},
+      {"ref": "brass_moth", "label": "Brass moth", "kind": "monster", "max_hp": 4, "defense": 8, "attack_bonus": 1}
+    ],
+    "items": [
+      {"ref": "pruning_hook", "label": "Pruning hook", "owner_ref": "hero", "equipped": true, "weapon": {"damage_expression": "1d4", "damage_bonus": 1}},
+      {"ref": "leaf_tonic", "label": "Leaf tonic", "owner_ref": "hero", "quantity": 2, "effect_ref": "healing_potion"},
+      {"ref": "seed_pod", "label": "Last seed pod"}
+    ],
+    "placements": [
+      {"entity_ref": "botanist", "scene_ref": "garden"},
+      {"entity_ref": "brass_moth", "scene_ref": "greenhouse", "attackable": true},
+      {"entity_ref": "seed_pod", "scene_ref": "greenhouse", "visibility": "secret"}
+    ]
+  },
+  "world": {
+    "region_name": "Clockwork garden",
+    "boundary": "The garden and its greenhouse.",
+    "goal_scene_ref": "greenhouse",
+    "goal_flag_ref": "seeds_collected",
+    "outside_ending_ref": "left",
+    "protected_facts": [
+      {"fact_ref": "gardener_presence", "kind": "existence", "statement": "The gardener waits in the garden.", "entity_ref": "botanist", "scene_ref": "garden", "visibility": "public"},
+      {"fact_ref": "seed_location", "kind": "location", "statement": "The seed pod hangs beneath the greenhouse clock.", "entity_ref": "seed_pod", "scene_ref": "greenhouse", "visibility": "secret", "reveal_flag_ref": "seed_seen", "acquired_flag_ref": "seeds_collected"},
+      {"fact_ref": "author_note", "kind": "rule", "statement": "Author-only planning note.", "visibility": "author_only"}
+    ]
+  },
+  "scenes": [
+    {
+      "scene_ref": "garden", "sequence": 1, "title": "Garden", "description": "A gardener tends brass flowers.",
+      "open_destinations": ["greenhouse"], "open_flags": ["seed_seen"],
+      "actions": [
+        {"kind": "scenario_action", "action_ref": "enter_greenhouse", "label": "Enter the greenhouse", "public_fact": "Entered the greenhouse.", "success": {"next_scene_ref": "greenhouse"}},
+        {"kind": "scenario_action", "action_ref": "leave_garden", "label": "Leave", "public_fact": "Left the garden.", "success": {"ending_ref": "left"}}
+      ]
+    },
+    {
+      "scene_ref": "greenhouse", "sequence": 2, "title": "Greenhouse", "description": "A brass moth circles an enormous clock.",
+      "open_destinations": ["garden"], "open_flags": ["seed_seen", "seeds_collected"],
+      "actions": [
+        {"kind": "skill_check", "action_ref": "find_seed", "label": "Find the seed", "check_ref": "easy", "skill_ref": "perception", "success": {"add_flags": ["seed_seen"]}, "failure": {}},
+        {"kind": "attack", "action_ref": "stop_moth", "label": "Stop the brass moth", "target_ref": "brass_moth", "defeated": {"add_flags": ["moth_stopped"]}},
+        {"kind": "scenario_action", "action_ref": "collect_seed", "label": "Collect the seed", "public_fact": "Collected the last seed pod.", "success": {"add_flags": ["seeds_collected"], "ending_ref": "harvested"}},
+        {"kind": "scenario_action", "action_ref": "leave_greenhouse", "label": "Leave", "public_fact": "Left the greenhouse.", "success": {"ending_ref": "left"}}
+      ]
+    }
+  ],
+  "flags": [
+    {"flag_ref": "seed_seen", "public_fact": "The seed pod is under the clock."},
+    {"flag_ref": "seeds_collected", "public_fact": "The seed pod was collected."},
+    {"flag_ref": "moth_stopped", "public_fact": "The brass moth stopped."}
+  ],
+  "endings": [
+    {"ending_ref": "harvested", "title": "A new garden", "summary": "The seed will grow again.", "required_flags": ["seeds_collected"], "reward": {"tier": "full", "description": "The gardener thanks you."}},
+    {"ending_ref": "left", "title": "Undisturbed", "summary": "The clock keeps turning.", "reward": {"tier": "none", "description": "The garden is unchanged."}}
+  ]
+}

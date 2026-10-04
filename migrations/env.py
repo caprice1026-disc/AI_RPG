@@ -5,6 +5,11 @@ import os
 from alembic import context
 from sqlalchemy import engine_from_config, pool
 
+from ai_rpg.infrastructure.postgres import (
+    community_models,  # noqa: F401
+    job_models,  # noqa: F401
+    story_models,  # noqa: F401
+)
 from ai_rpg.infrastructure.postgres.models import Base
 
 config = context.config

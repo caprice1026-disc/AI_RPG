@@ -130,8 +130,14 @@ it('keeps guidance and feedback in the adventure rail rather than the story', as
   expect(w.get('.feedback').element).toBe(feedback)
   expect((w.get('#feedback-lost').element as HTMLTextAreaElement).value).toBe('入口で迷った')
 })
-it('uses a healing potion beside its inventory row without changing the draft', async () => {
+it.each([
+  { item_ref: 'healing_potion', name: '回復ポーション' },
+  { item_ref: 'healing_potion', name: '回復ポーション', effect_ref: 'healing_potion' as const },
+  { item_ref: 'leaf_tonic', name: '葉の強壮薬', effect_ref: 'healing_potion' as const },
+  { item_ref: null, name: '名前だけの回復薬', effect_ref: 'healing_potion' as const },
+])('uses $name beside its inventory row without changing the draft', async item => {
   const c = healingCampaign()
+  Object.assign(c.player!.inventory[0]!, item)
   c.player!.inventory.push({ item_id: 'sword', item_ref: 'iron_sword', name: '鉄の剣', quantity: 1, equipped: true })
   const api = server((path, init) => path.endsWith('/state') ? response(c)
     : init.method === 'POST' ? response(turn()) : undefined)
@@ -144,24 +150,50 @@ it('uses a healing potion beside its inventory row without changing the draft', 
   await w.get('#action-text').setValue('書きかけの行動')
   await rows[0]!.get('button').trigger('click'); await flushPromises()
   expect(JSON.parse(String(api.posts()[0]!.init.body)).content).toEqual({
-    kind: 'text', text: '回復ポーションを使って、自分の傷を回復する。',
+    kind: 'text', text: `${item.name}を使って、自分の傷を回復する。`,
   })
   expect((w.get('#action-text').element as HTMLTextAreaElement).value).toBe('書きかけの行動')
 })
-it('disables potion use with a reason when the player cannot benefit from it', async () => {
+it('does not infer healing from an item ref when the explicit effect is null', async () => {
   const c = healingCampaign()
-  c.player!.current_hp = c.player!.max_hp
+  c.player!.inventory[0]!.effect_ref = null
+  const w = await render(server(path => path.endsWith('/state') ? response(c) : undefined))
+  await w.get('[data-adventure="campaign-a"]').trigger('click'); await flushPromises()
+  expect(w.find('.inventory button').exists()).toBe(false)
+})
+it.each(['HPは満タン', '残りがありません'])('disables custom healing items with reason: %s', async reason => {
+  const c = healingCampaign()
+  Object.assign(c.player!.inventory[0]!, { item_ref: 'leaf_tonic', name: '葉の強壮薬', effect_ref: 'healing_potion' })
+  if (reason === 'HPは満タン') c.player!.current_hp = c.player!.max_hp
+  else c.player!.inventory[0]!.quantity = 0
   const w = await render(server(path => path.endsWith('/state') ? response(c) : undefined))
   await w.get('[data-adventure="campaign-a"]').trigger('click'); await flushPromises()
   expect(w.get('.inventory button').attributes('disabled')).toBeDefined()
-  expect(w.get('.inventory .hint').text()).toContain('HPは満タン')
+  expect(w.get('.inventory .hint').text()).toContain(reason)
 })
-it('shows a rolling placeholder only until the result is committed', async () => {
+it('rolls only committed dice while the GM narration is pending', async () => {
   Events.instances = []; vi.stubGlobal('EventSource', Events)
   const api = server(path => path.endsWith('/state') ? response(campaign({ latest_turn: waiting() })) : undefined)
   const w = await render(api); await w.get('[data-adventure="campaign-a"]').trigger('click'); await flushPromises()
-  expect(w.get('.dice-wait').text()).toContain('判定しています')
-  expect(w.get('.dice-wait').text()).not.toMatch(/\b\d{1,2}\b/)
+  expect(w.find('.dice-wait').exists()).toBe(false)
+  expect(w.get('.thinking-wait').text()).toContain('行動を確認')
+  const committed = { ...turn(), narration_status: 'generating' as const, narration: null,
+    action_results: [{ action_id: 'check', ordinal: 1, result: { kind: 'applied' as const,
+      outcome: 'success' as const, facts: ['扉を開けた'],
+      dice: [{ expression: '1d20+2', rolls: [14], modifier: 2, total: 16 }] } }] }
+  Events.instances.at(-1)!.emit(committed); await flushPromises()
+  expect(w.find('.thinking-wait').exists()).toBe(false)
+  expect(w.get('.dice-wait').text()).toContain('GMが描写')
+  expect(w.get('.die-spinner').attributes('aria-hidden')).toBe('true')
+  expect(w.get('.result-block').text()).toContain('1d20+2: 14 +2 = 16')
+  expect(vi.mocked(HTMLElement.prototype.scrollIntoView).mock.contexts.at(-1)).toBe(w.get('.dice-wait').element)
+  Events.instances.at(-1)!.emit(turn()); await flushPromises()
+  expect(w.find('.dice-wait').exists()).toBe(false)
+})
+it('keeps dice animation off for a committed action without dice', async () => {
+  Events.instances = []; vi.stubGlobal('EventSource', Events)
+  const api = server(path => path.endsWith('/state') ? response(campaign({ latest_turn: waiting() })) : undefined)
+  const w = await render(api); await w.get('[data-adventure="campaign-a"]').trigger('click'); await flushPromises()
   Events.instances.at(-1)!.emit({ ...turn(), narration_status: 'generating', narration: null }); await flushPromises()
   expect(w.find('.dice-wait').exists()).toBe(false)
   expect(w.get('.narration-wait').text()).toContain('描写')
@@ -193,6 +225,46 @@ it('narration humanizes known public refs as text without changing the API value
   expect(w.get('.narration').text()).toBe('葵はゴブリンを見た。葵 は <img src=x onerror=alert(1)> を読んだ。@unknown @hero_other')
   expect(w.find('img[src="x"]').exists()).toBe(false)
   expect(t.narration).toBe(original)
+})
+it('uses allowed turn labels for authored entities, with escaped text and existing-name fallback', async () => {
+  const label = '航海日誌<img src=x onerror=alert(1)>'
+  const originalChoice = '@object_journal_locationを調べる'
+  const t = { ...turn('authored', 0),
+    entity_labels: { hero: '当時の葵', object_journal_location: label },
+    narration: '@heroは@object_journal_locationを見た。@goblin @potion @hidden_archive @object_journal_location_other @constructor',
+    action_results: [{ action_id: 'found', ordinal: 1, result: { kind: 'applied' as const,
+      outcome: 'success' as const, facts: ['@object_journal_locationを発見した。'], dice: [] } }],
+    enemy_reactions: [{ reaction_id: 'reaction', actor_id: 'enemy', target_id: 'actor-a',
+      result: { kind: 'applied' as const, outcome: 'neutral' as const, facts: ['@goblinは@object_journal_locationを見た。'], dice: [] } }],
+    choices: [{ id: 'journal-choice', label: originalChoice }],
+  }
+  const original = JSON.stringify(t)
+  const api = server((path, init) => path.endsWith('/state') ? response(campaign({ latest_turn: t }))
+    : init.method === 'POST' ? response(turn('next', 0)) : undefined)
+  const w = await render(api); await w.get('[data-adventure="campaign-a"]').trigger('click'); await flushPromises()
+  expect(w.get('.narration').text()).toBe(`当時の葵は${label}を見た。ゴブリン 回復ポーション @hidden_archive @object_journal_location_other @constructor`)
+  expect(w.get('.result-block').text()).toContain(`${label}を発見した。`)
+  expect(w.get('.enemy-reaction').text()).toContain(`ゴブリンは${label}を見た。`)
+  expect(w.find('img[src="x"]').exists()).toBe(false)
+  await button(w, `${label}を調べる`).trigger('click'); await flushPromises()
+  expect(JSON.parse(String(api.posts()[0]!.init.body)).content).toEqual({ kind: 'choice', choice_id: 'journal-choice' })
+  const events = w.findAllComponents({ name: 'TurnRecord' }).flatMap(r => r.emitted('choice') ?? [])
+  expect(events).toEqual([['journal-choice', originalChoice]])
+  expect(JSON.stringify(t)).toBe(original)
+})
+it('keeps entity labels local to each turn without inventing names for other refs', async () => {
+  const older = { ...turn('older', 0), entity_labels: { object_journal_location: '古い日誌', old_only: '古い灯台' },
+    narration: '@object_journal_location @old_only' }
+  const latest = { ...turn('latest', 0), entity_labels: { object_journal_location: '新しい日誌' },
+    narration: '@object_journal_location @old_only' }
+  const w = await render(server(path => path.endsWith('/state') ? response(campaign({ latest_turn: latest }))
+    : path.includes('/history?') ? response({ items: [
+      { turn: older, player_input: '以前の質問', created_at: '2026-09-22T00:00:00Z' },
+      { turn: latest, player_input: '今の質問', created_at: '2026-09-22T00:01:00Z' },
+    ], next_before_turn_id: null }) : undefined))
+  await w.get('[data-adventure="campaign-a"]').trigger('click'); await flushPromises()
+  expect(w.get('[data-turn-id="older"] .narration').text()).toBe('古い日誌 古い灯台')
+  expect(w.get('[data-turn-id="latest"] .narration').text()).toBe('新しい日誌 @old_only')
 })
 it.each([
   ['success', '技能判定：成功（合計19）'],

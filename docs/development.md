@@ -2,8 +2,8 @@
 
 [日本語README](../README.md) · [English README](../README.en.md) · [プレイテストガイド](playtest-guide.md)
 
-ローカルで遊ぶための準備と3プロセスの起動はREADMEを参照してください。
-この文書には、開発・検証で必要になるDB、API、シナリオ互換性、モデル設定、障害復旧の詳細をまとめています。
+Docker Composeで遊ぶ場合はREADMEを参照してください。
+この文書には、手動起動、作品の保存と公開、開発用DB、API、シナリオ互換性、モデル設定、障害復旧をまとめています。
 コマンドはWindows PowerShellで、指定がなければリポジトリのルートから実行します。
 
 ## 処理の境界と構成
@@ -18,7 +18,7 @@ Narrativeは通常会話、Mechanicalは判定や状態変更を伴う処理で�
 | Application | 認可、参照解決、所有・行動条件、Engine結果の検証、永続化projection |
 | Engine | ダイス、難易度、補正、ダメージ、回復、アイテム消費 |
 | PostgreSQL | atomic保存、同一 `request_id` の冪等受付、並行受付、commit応答喪失時の照会 |
-| Worker | 解決・描写で独立したleaseとepoch、古いworkerによる保存の拒否 |
+| Worker | 解決・描写・作品作成補助を別processで処理。leaseによって古いworkerの保存を拒否 |
 | 実行制限 | LLM予算、試行回数、deadlineをDBへ保存し、再起動後も維持 |
 | 公開範囲 | Scene単位のEntity公開と攻撃到達可能性、Actorのprivate inventory |
 | 認可 | 受付時、LLM呼出前、確定直前にCampaign membershipとActor操作権を再確認 |
@@ -32,7 +32,7 @@ src/ai_rpg/
 ├── engine/           # 決定的なゲームルール
 ├── infrastructure/   # PostgreSQL行lock、保存前値照合、Repository
 ├── llm/              # Pydantic AI Agent、モデル構成、Fake LLM
-└── scenarios/        # version付きScenario定義（固定v1・v2と自由行動型v3）
+└── scenarios/        # 型付き定義、初期状態、組込みScenarioのJSON
 migrations/           # Alembic migration
 frontend/             # Vue 3、TypeScript、Vite、画面の回帰テスト
 tests/                # Unit、contract、PostgreSQL integration等
@@ -40,6 +40,111 @@ docs/                 # 設計、ADR、検証記録
 ```
 
 設計の判断は[ADR一覧](adr/README.md)を参照してください。採用済みADRは、古い設計資料の候補・未決定の記述より優先します。
+
+<a id="manual-local"></a>
+## 手動起動とFake LLM
+
+Python 3.11以上、uv、Docker Desktopを用意し、既存のcheckoutのルートで実行します。`uv sync --frozen` は `.venv` を作成・更新するため、先に仮想環境を作成・有効化する必要はありません。
+
+```powershell
+uv sync --frozen
+if (-not (Test-Path -LiteralPath .env)) { Copy-Item .env.example .env }
+docker run --name ai-rpg-dev-postgres `
+  -e POSTGRES_USER=airpg -e POSTGRES_PASSWORD=airpg -e POSTGRES_DB=airpg `
+  -v ai-rpg-dev-data:/var/lib/postgresql/data `
+  -p 127.0.0.1:5432:5432 -d postgres:16
+docker exec ai-rpg-dev-postgres pg_isready -U airpg -d airpg
+```
+
+同名コンテナやvolumeがある場合は、用途を確認して再利用するか別名にします。`accepting connections` を確認してから、実行用DBにmigrationを適用します。Alembicは `.env` を直接読み込まないため、URLを明示します。
+
+```powershell
+$env:AIRPG_DATABASE_URL = "postgresql+psycopg://airpg:airpg@localhost:5432/airpg"
+uv run --frozen alembic upgrade head
+```
+
+次に4つのPowerShellを開き、それぞれ同じリポジトリのルートへ移動し、上と同じ `AIRPG_DATABASE_URL` を設定します。各ターミナルで対応する1つのコマンドを常駐させます。
+
+| ターミナル | コマンド |
+| --- | --- |
+| API | `uv run --frozen ai-rpg api --dev-principal` |
+| 行動の解決 | `uv run --frozen ai-rpg resolution-worker --fake` |
+| 結果の描写 | `uv run --frozen ai-rpg narration-worker --fake` |
+| 作品作成補助 | `uv run --frozen ai-rpg authoring-worker --fake` |
+
+`http://127.0.0.1:8000/` を開きます。`--dev-principal` は全接続を同じ開発プレイヤーとして扱うローカル専用の認証で、通常起動では暗黙に有効になりません。作品の手動編集・構造検証はauthoring-workerを止めても使えますが、AIジョブは進みません。
+
+Fakeでは外部LLM通信もキーも不要です。ただしゲームの自由文は限定的で、作品作成補助のFakeも空の提案を返す動作確認用です。構成案の生成や文章品質の評価には使えません。実モデルへ切り替える場合は `.env` のproviderとキーを設定し、workerを停止して `--fake` なしで再起動します。
+
+停止は各ターミナルの `Ctrl+C` と `docker stop ai-rpg-dev-postgres`、再開は `docker start ai-rpg-dev-postgres` と同じDB・principalでのprocess再起動です。コード更新後は必要なDBをバックアップし、API・workerの起動前にmigrationを適用してください。Composeのホスト側ポートは `AIRPG_PORT` で変更できますが、手動起動のAPIポートは `--port` で指定します。
+
+<a id="story-authoring"></a>
+## 作品の編集・検証・公開
+
+作品は、作者が編集する `AuthoringDraft` と、実行できる `ScenarioDefinition` を分けて扱います。未入力や参照切れのある下書きもサイズ制限内なら保存できます。試遊・公開の前に型と参照を検証して実行可能な定義へ変換します。組込み短編を元にした2つのテンプレート、または空の原稿から作成でき、実行処理は作品名による分岐を前提にしません。
+
+### 保存履歴と固定した実行版
+
+下書きの保存は `expected_revision` と `request_id` を使います。同じ要求の再送は同じ結果を返し、別タブなどが先に更新した場合は409になります。画面は入力から2秒後に保存し、未保存・保存中・保存済み・失敗・競合を表示します。競合時はローカルの入力を保持し、保存済みの原稿と比較してから採用する内容を選びます。未保存の入力があるままページを離れても復元できるという保証ではないため、保存済み表示を確認してください。
+
+履歴の復元も新しい下書きrevisionを作り、既存の履歴を上書きしません。試遊版と公開版はDBの `story_versions` に不変のpayloadとcontent hashを保存します。冒険は開始時の `story_version_id` に固定し、下書きの編集、公開版の更新、作品の公開停止で進行中の定義を差し替えません。DBに結び付いたrunでは、その固定版を読み、最新catalogへフォールバックしません。
+
+API起動時に組込みの全保存対象versionを冪等にDBへ取り込み、旧runの未設定のversion参照を対応する旧定義へ結び付けます。HP、在庫、進行を再初期化する処理ではありません。以前の「DBには実行状態だけを保存する」という方針の変更範囲は[ADR-0017](adr/0017-user-authored-stories.md)を参照してください。
+
+### 初期状態とゲームの制約
+
+新しい作者作品はschema 2で、`initialization.characters`、`items`、`placements` を明示します。NPC・monsterの能力値、所持品、装備、配置、公開範囲を型で検証します。非戦闘作品に固定のゴブリンを追加する処理はありません。`required_capabilities` は `skill_checks`、`combat`、`item_use`、`open_actions`、`protected_facts` の既知の機能から選びます。
+
+技能判定の難易度は `easy`・`normal`・`hard`、初期武器のダイスは `1d4`・`1d6`、使用効果は現在 `healing_potion` のみです。アイテムの表示名やrefは効果名と別にできます。回復量は既存ルールの `1d6+2` と最大HPの上限に従い、所有・在庫・対象・適用可能性をダイスより前に検証します。公開inventoryの `effect_ref` は `"healing_potion"` または `null` で、使用ボタンは名前の一致ではなくこの値とHP・在庫を使って判断します。効果の定義は固定した作品版、消費後の数量はゲーム状態から読みます。
+
+保護する事実にはentity・場所・取得flagの参照を持たせ、取得場所や参照の上書きを構造的に検証します。公開contextには現在地に関係する公開済みの事実だけを渡し、`author_only` は含めません。自然言語のあらゆる矛盾を判別する保証ではありません。旧短編に固有の文字列検査はlegacy policyに隔離し、新しい作品へ流用しません。[ADR-0016](adr/0016-bounded-open-scenario.md)の提案・検証・Engine確定の境界は維持します。
+
+### 構造検証と公開条件
+
+「原稿を検証」はLLMを呼ばず、型・参照・初期状態・対応機能と、登録行動から到達する有限のflag状態を調べます。上限は50 Scene、64 flag、1 Sceneあたり100行動、経路探索は10,000状態です。上限到達は部分検証として報告します。戦闘結果は抽象化しており、生存可能性やバランス、自由入力の全経路、文章の意味は未検証です。エラーがなくても、警告とcoverageを読んで試遊してください。
+
+公開には現在のrevision・hash・validator versionに対応するエラーなしの検証結果、全警告codeの確認、同じ定義hashを使って作者が少なくとも1つの結末まで完了した試遊記録が必要です。debugで改変した試遊は対象外です。加えて `author_playtest_acknowledged=true` を作者が明示します。このフラグは人の確認の申告であり、自動テストが作者本人の確認や作品品質を証明するものではありません。
+
+公開範囲は `private`（作者のみ）、`unlisted`（一覧に載せずURLで共有）、`public`（検索対象）です。一般公開作品の一覧と、公開・限定共有作品の紹介は匿名で閲覧できますが、新規冒険の開始は認証・公開範囲・lifecycleを再確認します。紹介APIには下書き、作者メモ、秘密の定義を含めません。公開停止は新規開始を止め、既存runの固定版は保持します。
+
+| 操作 | API |
+| --- | --- |
+| テンプレート・自作一覧・作成 | `GET /stories/templates`、`GET /stories/mine`、`POST /stories` |
+| 下書きと履歴 | `GET/PUT /stories/{id}/draft`、`GET /stories/{id}/revisions`、`POST /stories/{id}/restore` |
+| 複製・検証・試遊・公開 | `POST /stories/{id}/duplicate`、`/validate`、`/playtests`、`/publish` |
+| 公開範囲・停止 | `PUT /stories/{id}/settings` |
+| 公開検索・紹介 | `GET /public/stories?q=...&tag=...`、`GET /public/stories/{id}` |
+
+### 手動で依頼するAI作成補助
+
+自動保存と構造検証はAIを呼びません。作者が明示した `check`（整合性チェック）、`fill`（不足部分の補完）、`outline`（構成案）、`concretize`（承認済み構成案の具体化）だけを独立したauthoring-workerで処理します。構成案を編集すると承認は無効になり、具体化の前にそのrevisionを承認し直します。
+
+ジョブは依頼時の下書きrevisionとsnapshotに固定し、API応答後もDBで追跡できます。画面を再読み込みした後も、AI作成補助の履歴から実行中のジョブに戻り、過去の結果を選択できます。結果は変更前後・理由を持つ提案で、選んだchange IDだけを明示的に採用すると新しい下書きになります。元の下書きが変わっていれば409で拒否し、自動でマージしません。`fixed` の項目を守り、`fillable`・`undecided` の項目も採用前に確認します。AIに原稿の直接更新、公開、ゲーム状態の更新を許可しません。
+
+`POST /stories/{id}/authoring-jobs` で依頼し、`GET /authoring-jobs/{job_id}` で状態・提案・利用量を取得します。キャンセルは `/authoring-jobs/{job_id}/cancel`、提案の採用は `/stories/{id}/proposals/{proposal_id}/apply` です。ジョブと結果は作者だけが取得できます。キャンセルしても既に送ったprovider要求の料金を取り消せるとは限りません。
+
+<a id="authoring-limits"></a>
+### 利用上限とauthoring-workerの設定
+
+設定の正本は [Settings](../src/ai_rpg/config.py)、値を置く例は [.env.example](../.env.example)です。日次はUTC日付で集計し、受付・LLM要求の予約をDBに保存します。同じ要求の再送で重複計上せず、再起動でも利用量は消えません。APIとworkerで同じ設定を使ってください。
+
+| 設定 | 既定値 | 対象 |
+| --- | --- | --- |
+| `AIRPG_DAILY_TURN_LIMIT` | 100 | 1人のTurn受付/日 |
+| `AIRPG_DAILY_STORY_LIMIT` | 10 | 1人の作品作成/日 |
+| `AIRPG_DAILY_STORY_VALIDATION_LIMIT` | 50 | 1人の新規構造検証/日 |
+| `AIRPG_DAILY_AUTHORING_JOB_LIMIT` | 20 | 1人のAI作成ジョブ/日 |
+| `AIRPG_DAILY_GAME_LLM_LIMIT` | 300 | 1人のゲーム用LLM要求/日 |
+| `AIRPG_DAILY_AUTHORING_LLM_LIMIT` | 100 | 1人の作品作成用LLM要求/日 |
+| `AIRPG_DAILY_GLOBAL_LLM_LIMIT` | 5000 | 全体のLLM要求/日 |
+| `AIRPG_CONCURRENT_TURN_LIMIT` | 3 | 1人の処理中Turn |
+| `AIRPG_CONCURRENT_AUTHORING_JOB_LIMIT` | 2 | 1人の待機・処理中AI作成ジョブ |
+| `AIRPG_AUTHORING_MAX_RUNNING` | 4 | 全体の処理中AI作成ジョブ |
+| `AIRPG_AUTHORING_TIMEOUT_SECONDS` / `AIRPG_AUTHORING_LEASE_SECONDS` | 60 / 90秒 | 作成要求のtimeout / lease。timeoutはlease未満 |
+| `AIRPG_AUTHORING_MAX_PROMPT_BYTES` | 128000 | 作成要求の入力サイズ |
+| `AIRPG_AUTHORING_MAX_OUTPUT_TOKENS` / `AIRPG_AUTHORING_MAX_TOTAL_TOKENS` | 8192 / 24000 | 出力 / 総token予算 |
+
+上限到達の受付は429、運用者による受付停止は503を返します。既に受け付けたジョブはGETで状態とerror codeを確認します。LLM物理要求はジョブごとに最大1回を予約し、SDKの自動再送・自動修復を無効にしています。providerが利用量を返さない場合は `usage_complete=false` を残し、0回・0tokenの成功として扱いません。
 
 <a id="test-database"></a>
 ## 専用テストDBと検証
@@ -115,7 +220,7 @@ timeoutや不正出力も予算を消費し、worker再生成後も予算とdead
 <a id="scenario-compatibility"></a>
 ## 自由行動型シナリオと旧v1・v2
 
-ブラウザの新規冒険は「廃礼拝堂」v3か「霧灯台」v1です。どちらも自由行動型の`mvp_v2`ルールを使います。開始時にプリセットを選び、`strength`・`agility`・`insight`・`presence`へ計2点を配分して、得意技能を1つ選びます。旧礼拝堂v1・v2の保存済み冒険は自動移行しません。
+組込みの新規冒険は「廃礼拝堂」v3か「霧灯台」v1です。どちらも自由行動型の`mvp_v2`ルールを使い、公開された作者作品も選べます。開始時にプリセットを選び、`strength`・`agility`・`insight`・`presence`へ計2点を配分して、得意技能を1つ選びます。旧礼拝堂v1・v2の保存済み冒険を新しい内容へ自動移行しません。
 
 自由行動型シナリオの自由文は、LLMが`open_action`として方法、必要なら能力・技能・難易度と成功/失敗の効果を提案します。Applicationが現在地、到達可能な主要地点、許可されたflag、結末条件、生成事実の参照を出目より前に検証します。生成事実は公開文・安定した`fact_ref`・作られた主要地点を保存し、再開後のContextと状態APIへ戻します。小さな場所は独立したSceneではなく、同じ主要地点内で参照できる事実です。AIの提案でHP・在庫・報酬を直接更新しません。
 
@@ -172,7 +277,7 @@ uv run --frozen ai-rpg seed-dev
 
 ### 開発用HTTPリクエスト
 
-READMEのAPIを `--dev-principal` で、両workerを `--fake` で起動しておきます。
+[手動起動](#manual-local)のAPIを `--dev-principal` で、ゲームの解決・描写workerを `--fake` で起動しておきます。
 次は別ターミナルから固定のv1 fixtureを作り、現在のstate versionで入力する例です。通常のブラウザ冒険には使いません。
 
 ```powershell
@@ -231,7 +336,7 @@ data: {"id":12,"type":"turn.updated","schema_version":1,"payload":{"turn":{...}}
 | `AIRPG_LLM_MODEL` | 共通モデル。既定値 `google:gemini-3.5-flash` |
 | `AIRPG_FAST_MODEL` | 意図抽出・通常会話。未指定なら共通モデル |
 | `AIRPG_QUALITY_MODEL` | 確定結果の描写。未指定なら共通モデル |
-| `AIRPG_BACKGROUND_MODEL` | 将来のbackground用途。未指定なら共通モデル |
+| `AIRPG_BACKGROUND_MODEL` | 手動依頼の作品作成補助。未指定なら共通モデル |
 | `AIRPG_GEMINI_API_KEY` / `GEMINI_API_KEY` | Google API認証。両方を同じ設定元で指定した場合は左を優先 |
 | `AIRPG_OPENAI_API_KEY` / `OPENAI_API_KEY` | OpenAI API認証。両方を同じ設定元で指定した場合は左を優先 |
 
@@ -290,6 +395,7 @@ NarrativeからMechanicalへ昇格した最初の呼出も、Turn全体の予算
 
 Bearer APIでは単一の `AIRPG_AUTH_ISSUER`、必須の `AIRPG_AUTH_AUDIENCE`、非対称署名方式のallowlistを使います。
 事前登録したIdP subjectを、内部の安定した `principal_id` に対応付けます。
+参加登録は `AIRPG_REGISTRATION_ENABLED=false` が既定です。有効にした場合だけ、ブラウザで明示的に `/auth/login?join=true` を開いたOIDCフローから未登録identityを作成できます。通常の `/auth/login` とBearer APIのtoken照会では自動登録しません。既に無効化されたidentityを参加登録で復活させることもできません。
 次はHTTPSのIdPを使う管理用の例です。値は利用するIdPに合わせて置き換えます。
 
 ```powershell
@@ -328,7 +434,7 @@ Cookie認証の更新要求はOriginとCSRF tokenを検証し、provider token�
 <a id="failure-recovery"></a>
 ## 障害復旧とクライアントの再送
 
-API、解決worker、描写workerは独立したprocessです。
+API、解決worker、描写worker、authoring-workerは独立したprocessです。
 workerの `--once` は一回だけ取得を試みて終了します。通常は常駐させ、各processを `Ctrl+C` で停止します。
 再起動時はTurn、予算、lease、確定結果をDBから引き継ぎ、設定変更で既存Turnの予算やdeadlineをリセットしません。
 
@@ -336,6 +442,9 @@ workerの `--once` は一回だけ取得を試みて終了します。通常は�
 | --- | --- |
 | 接続できない | 対象DBの `pg_isready` と、API・両workerが同じDB URLを使うことを確認する |
 | Turnが処理中のまま | 解決・描写worker両方の稼働とDB接続を確認する。期限切れleaseはworkerが回収する |
+| AI作成ジョブが順番待ち | authoring-workerの稼働、DB接続、利用上限を確認し、同じjob IDで状態を再取得する |
+| 原稿保存が競合した | 入力を保持して保存済みrevisionと比較する。古いrevisionを新しい値へ自動置換しない |
+| 公開で拒否された | 最新原稿の検証結果、警告確認、同じ内容の作者試遊完了、作者の確認を調べる |
 | 描写timeout、不正出力 | 残予算と試行・deadlineの範囲で再試行し、尽きた場合はfallbackで終端化する |
 | ゲーム確定後の描写失敗 | 保存済み結果を保持し、描写だけを回収する。判定・ダメージ・反撃は再適用しない |
 | 古いstate versionによる409 | 最新stateを読み直し、操作を再確認する。古い行動を新versionで自動実行しない |
@@ -357,6 +466,8 @@ Campaign切替、ログアウト、画面の破棄時は追跡を止め、セッ
 
 ## 過去の検証記録と未確認の範囲
 
+作者本人による編集・試遊・公開の受入確認と、公開HTTPS環境の[Issue #19](https://github.com/caprice1026-disc/AI_RPG/issues/19)の受入条件は未解決です。コードが作者確認フラグを受け付けることと、人が内容を確認したことは区別します。
+
 以下はREADMEから移した過去の記録で、今回の文書整理による新しい実行結果ではありません。
 
 2026-09-22の実Gemini検証では短編v2を13Turnの自由入力で完走し、会話、依頼受諾、探索、攻撃失敗と敵の命中、回復後の反撃、撃破、回収・帰還を確認したと記録されています。
@@ -368,5 +479,5 @@ OpenAI側の当時の確認範囲は、実SDKとHTTP mockまでです。
 この過去の検証を、以降の変更の再検証、人の少人数試遊、公開HTTPS環境の受入検証として扱いません。
 20〜30分の所要時間、会話品質、楽しさは人の試遊で確認し、[記録テンプレート](playtest-record-template.md)で自動テスト・エージェント検証と区別します。
 
-文書やテストから参加する場合のラベルはREADMEのContributingを参照してください。
+文書やテストから参加する場合も、README末尾の案内と既存のIssuesを確認してください。
 GitHubの運用参考: [Community Profile](https://docs.github.com/en/communities/setting-up-your-project-for-healthy-contributions/about-community-profiles-for-public-repositories) / [good first issueの活用](https://docs.github.com/en/communities/setting-up-your-project-for-healthy-contributions/encouraging-helpful-contributions-to-your-project-with-labels)。

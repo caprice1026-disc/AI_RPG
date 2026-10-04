@@ -130,6 +130,7 @@ class LoginAttemptModel(Base):
     nonce_digest: Mapped[str] = mapped_column(Text, nullable=False)
     code_verifier: Mapped[str] = mapped_column(Text, nullable=False)
     expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    registration_requested: Mapped[bool] = mapped_column(Boolean, server_default=text("false"))
 
     __table_args__ = (Index("login_attempts_expires_at", "expires_at"),)
 
@@ -591,6 +592,9 @@ class MvpScenarioRunModel(Base):
     )
     scenario_ref: Mapped[str] = mapped_column(Text, nullable=False)
     scenario_version: Mapped[int] = mapped_column(Integer, nullable=False)
+    story_version_id: Mapped[UUID | None] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("story_versions.id")
+    )
     status: Mapped[str] = mapped_column(Text, nullable=False)
     ending_ref: Mapped[str | None] = mapped_column(Text)
     elapsed_actions: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"))

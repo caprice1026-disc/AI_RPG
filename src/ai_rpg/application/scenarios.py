@@ -4,6 +4,7 @@ import re
 from dataclasses import dataclass
 from typing import Literal, TypeAlias
 
+from ai_rpg.application.legacy_scenario_policy import contradicts_legacy_lore
 from ai_rpg.application.ports import ScenarioRunSnapshot, ScenarioSceneSnapshot
 from ai_rpg.application.ports.repositories import ScenarioFact, ScenarioProgressUpdate
 from ai_rpg.contracts.llm_decisions import OpenActionIntent
@@ -75,36 +76,20 @@ def _impossible_trip(text: str, destinations: tuple[str, ...]) -> bool:
     )
 
 
-def _contradicts_chapel_lore(text: str, protected_terms: tuple[str, ...]) -> bool:
-    # ponytail: narrow v3 chapel claims, not general semantic consistency;
-    # grow the evaluated examples before replacing this with a broader policy.
-    if not any(term in text for term in protected_terms):
-        return False
-    patterns = (
-        r"(?:最奥の間|奥の部屋|祭壇).{0,25}(?:空|誰も.{0,5}(?:いな|おらず)|何も.{0,8}(?:ない|置かれていな)|品物も存在しない)",
-        r"(?:聖印|依頼品).{0,20}(?:存在しない|消えた|奪われた|もうない)",
-        r"(?:聖印|依頼品).{0,25}(?:広間|長椅子|記録庫|裏庭).{0,10}(?:ある|置かれ|隠され)",
-        r"(?:広間|長椅子|記録庫|裏庭).{0,12}(?:聖印|依頼品).{0,12}(?:ある|置かれ|隠され)",
-        r"(?:ゴブリン|守衛|見張り).{0,40}(?:いない|おらず|立ち去|見張りをやめ|理由を聞かず)",
-    )
-    return any(re.search(pattern, text) for pattern in patterns)
-
-
-def _contradicts_lighthouse_lore(text: str) -> bool:
-    # ponytail: only explicit journal relocation; add evaluated patterns if playtests find more.
-    journal = r"(?:航海日誌|日誌)"
-    other_place = r"(?:船着き場|舟小屋|外階段|岩礁)"
-    return any(re.search(pattern, text) for pattern in (
-        rf"{journal}(?:は|が).{{0,25}}{other_place}.{{0,12}}(?:ある|置かれ|隠され|見つか)",
-        rf"{other_place}.{{0,25}}{journal}(?:は|が).{{0,12}}(?:ある|置かれ|隠され|見つか)",
-    ))
-
-
 class ScenarioProgressor:
     def __init__(self, catalog: ScenarioCatalog) -> None:
         self._catalog = catalog
 
     def definition_for(self, snapshot: ScenarioRunSnapshot) -> ScenarioDefinition:
+        if snapshot.definition is not None:
+            definition = snapshot.definition
+            if (definition.scenario_ref, definition.version) != (
+                snapshot.scenario_ref, snapshot.scenario_version
+            ):
+                raise ScenarioStateError("Pinned definition does not match the saved run")
+            return definition
+        if snapshot.story_version_id is not None:
+            raise ScenarioStateError("Pinned story definition is missing")
         try:
             return self._catalog.get(snapshot.scenario_ref, snapshot.scenario_version)
         except KeyError as error:
@@ -113,6 +98,32 @@ class ScenarioProgressor:
     def supports_open_actions(self, snapshot: ScenarioRunSnapshot) -> bool:
         definition = self.definition_for(snapshot)
         return definition.ruleset_ref == "mvp_v2" and definition.world is not None
+
+    def public_protected_facts(self, snapshot: ScenarioRunSnapshot) -> tuple[str, ...]:
+        definition, scene, _active = self._current_scene(snapshot)
+        if definition.world is None:
+            return ()
+        return tuple(
+            fact.statement for fact in definition.world.protected_facts
+            if (fact.scene_ref is None or fact.scene_ref == scene.scene_ref)
+            and fact.visibility != "author_only"
+            and (fact.visibility == "public" or fact.reveal_flag_ref in snapshot.flags)
+            and fact.acquired_flag_ref not in snapshot.flags
+        )
+
+    @staticmethod
+    def _validate_protected_effect(
+        definition: ScenarioDefinition, scene: SceneDefinition,
+        before_flags: frozenset[str], added_flags: set[str],
+    ) -> None:
+        if definition.world is None:
+            return
+        for fact in definition.world.protected_facts:
+            if (fact.acquired_flag_ref in added_flags - before_flags
+                    and fact.scene_ref != scene.scene_ref):
+                raise ScenarioActionUnavailableError(
+                    "A protected item cannot be acquired outside its authored location"
+                )
 
     def validate_player_request(self, snapshot: ScenarioRunSnapshot, text: str) -> None:
         definition = self.definition_for(snapshot)
@@ -133,7 +144,9 @@ class ScenarioProgressor:
             r"|抜け(?:る|たい)|侵入(?:す|し|を試み)|忍び込(?:む|んで|みたい)"
             r"|(?:踏み|飛び)込(?:む|んで|みたい)"
             r"|移動(?:する|したい)|渡(?:る|った|りたい)"
-            r"|登(?:る|った|りたい)|通(?:る|った|りたい))",
+            r"|登(?:る|った|りたい)|通(?:る|った|りたい)"
+            r"|(?:(?:向か|行|入|戻|渡|登|通)って|抜けて|移動して)(?!い[るた])"
+            r"|(?:向かい|行き|入り|進み|戻り|渡り|登り|通り|移動し)(?=[、,]))",
             player_text,
         ) is None and re.search(
             r"(?:扉|ドア|門)を開け(?:てもらう|てほしい|てもらいたい)", player_text
@@ -273,6 +286,12 @@ class ScenarioProgressor:
                 ending_ref = override.ending_ref
                 break
 
+        self._validate_protected_effect(definition, scene, snapshot.flags, set(effect.add_flags))
+        if definition.schema_version == 2 and ending_ref is not None:
+            ending = next(value for value in definition.endings if value.ending_ref == ending_ref)
+            if not set(ending.required_flags) <= snapshot.flags | set(effect.add_flags):
+                raise ScenarioActionUnavailableError("Ending conditions are not met")
+
         to_scene_id = None
         if effect.next_scene_ref is not None:
             target = next(
@@ -320,6 +339,7 @@ class ScenarioProgressor:
         ):
             raise ScenarioActionUnavailableError("The goal object is not at this location")
         resulting_flags = snapshot.flags | flags
+        self._validate_protected_effect(definition, scene, snapshot.flags, flags)
         if effect.ending_ref is not None:
             if effect.ending_ref in {
                 candidate.combat.defeat_ending_ref
@@ -359,15 +379,15 @@ class ScenarioProgressor:
             self.validate_player_request(snapshot, fact.public_text)
             if fact.fact_ref in {item.fact_ref for item in definition.world.protected_facts}:
                 raise ScenarioActionUnavailableError("Generated fact reference is protected")
-            if (
-                (definition.scenario_ref == "ruined_chapel" and definition.version == 3
-                 and _contradicts_chapel_lore(
-                     fact.public_text, definition.world.protected_terms
-                 ))
-                or (definition.scenario_ref == "mist_lighthouse" and definition.version == 1
-                    and definition.world.goal_flag_ref not in resulting_flags
-                    and _contradicts_lighthouse_lore(fact.public_text))
-            ):
+            if (definition.schema_version == 2 and definition.initialization is not None
+                    and fact.fact_ref in (
+                {entity.ref for entity in definition.initialization.characters}
+                | {item.ref for item in definition.initialization.items} | {"hero"}
+            )):
+                raise ScenarioActionUnavailableError(
+                    "Generated fact cannot replace an authored entity"
+                )
+            if contradicts_legacy_lore(definition, fact.public_text, resulting_flags):
                 raise ScenarioActionUnavailableError("A proposed fact contradicts protected lore")
             previous = next((value for value in snapshot.facts
                              if value.fact_ref == fact.fact_ref), None)

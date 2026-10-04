@@ -13,6 +13,7 @@ from ai_rpg.contracts.responses import MechanicalNarrationInput
 from ai_rpg.domain.commands import Command
 from ai_rpg.domain.events import EnemyReaction, RNGMetadata
 from ai_rpg.domain.results import ActionResult
+from ai_rpg.scenarios.models import ScenarioDefinition
 
 
 class AuthorizationError(Exception):
@@ -147,6 +148,9 @@ class ScenarioRunSnapshot:
     elapsed_actions: int = 0
     alert_level: int = 0
     facts: tuple["ScenarioFact", ...] = ()
+    story_version_id: UUID | None = None
+    definition: ScenarioDefinition | None = None
+    public_title: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
