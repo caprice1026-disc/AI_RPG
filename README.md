@@ -5,6 +5,8 @@
 AI_RPGは、自由入力と行動候補で遊び、ブラウザで自分の短編を作れるAI TRPGのMVPです。
 LLMが行動を提案し、確定した結果を描写します。判定・乱数・HP・所持品の変更はGame Engineが計算し、PostgreSQLへ保存します。
 
+[Gemini 3.6 Flashへの移行手順・料金・検証範囲](docs/gemini-36-migration-20261011.md)
+
 ## Docker Composeで始める
 
 Windows PowerShell、Docker Desktop、Gitを使います。プレイだけならPython・Node.jsのインストールは不要です。
@@ -15,7 +17,7 @@ Set-Location AI_RPG
 if (-not (Test-Path -LiteralPath .env)) { Copy-Item .env.example .env }
 ```
 
-既存の `.env` を保ったまま、`GEMINI_API_KEY` に自分のキーを設定します。既定モデルは `google:gemini-3.5-flash` で、実モデルの呼出には料金が発生します。キーをブラウザやGitへ入れないでください。
+既存の `.env` を保ったまま、`GEMINI_API_KEY` に自分のキーを設定します。既定モデルは `google:gemini-3.6-flash` で、実モデルの呼出には料金が発生します。キーをブラウザやGitへ入れないでください。
 `AIRPG_LLM_MODEL` が共通モデル、`AIRPG_FAST_MODEL` が行動の解釈、`AIRPG_QUALITY_MODEL` が描写、`AIRPG_BACKGROUND_MODEL` が作品作成補助の上書き設定です。
 
 ```powershell

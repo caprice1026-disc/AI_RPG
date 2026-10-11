@@ -2,11 +2,12 @@
 
 - 状態: 採用
 - 決定日: 2026-09-22
+- 更新日: 2026-10-11（[3.5 Flashから3.6 Flashへの移行](../gemini-36-migration-20261011.md)）
 - 置換対象: [ADR-0006](0006-llm-provider.md)
 
 ## 文脈と決定
 
-手書きのOpenAI Responses HTTP transportをPydantic AIのAgentへ置き換える。初期の実モデルはGemini 3.5 Flashとし、GoogleとOpenAI Responsesの切替を設定で行う。Pydantic v2によるDTO検証と、Pydantic AIによるモデル実行は別の責務である。
+手書きのOpenAI Responses HTTP transportをPydantic AIのAgentへ置き換える。初期採用時はGemini 3.5 Flash、2026-10-11以降の既定モデルはGemini 3.6 Flashとし、GoogleとOpenAI Responsesの切替を設定で行う。Pydantic v2によるDTO検証と、Pydantic AIによるモデル実行は別の責務である。
 
 Applicationには`NarrativeGenerator`、`IntentExtractor`、`ResultNarrator`を置く。入力は既存の公開Context、出力は既存の型付き判断または描写であり、SDKの型を公開しない。Agent間の受け渡しはworkerが順に行う。AgentにEngineやDB更新のtoolを渡さず、自律的なAgent間呼出やGraphは導入しない。
 
@@ -28,7 +29,7 @@ timeout、拒否、不正出力でも予約を返却しない。再試行は既�
 
 ## 設定と情報の扱い
 
-`AIRPG_LLM_MODEL`は`google:gemini-3.5-flash`を既定値とし、既存のFAST／QUALITY／BACKGROUND overrideを維持する。GoogleとOpenAI Responses以外は起動時に拒否する。別providerの追加時はextra、client寿命、retry無効化、例外変換、実際のSchemaの適合試験を追加する。
+`AIRPG_LLM_MODEL`は`google:gemini-3.6-flash`を既定値とし、既存のFAST／QUALITY／BACKGROUND overrideを維持する。GoogleとOpenAI Responses以外は起動時に拒否する。別providerの追加時はextra、client寿命、retry無効化、例外変換、実際のSchemaの適合試験を追加する。
 
 OpenAIは`store=False`とし、provider側の会話継続を使わない。履歴は既存DBの公開範囲から組み立て、SSEは確定済みの公開Turn eventだけを配信する。SDKへ渡すキーはSecretStr設定から取り出し、raw response・秘密値は公開例外に含めない。外部telemetryは有効にしない。ローカル開発の`.env`はGit管理外、本番はsecret storeから注入する。
 
