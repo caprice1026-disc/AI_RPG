@@ -20,10 +20,10 @@ def isolated_settings(monkeypatch: pytest.MonkeyPatch) -> None:
 def test_tiers_inherit_common_gemini_model() -> None:
     settings = Settings()
 
-    assert settings.llm_model == "google:gemini-3.5-flash"
-    assert settings.fast_model == "google:gemini-3.5-flash"
-    assert settings.quality_model == "google:gemini-3.5-flash"
-    assert settings.background_model == "google:gemini-3.5-flash"
+    assert settings.llm_model == "google:gemini-3.6-flash"
+    assert settings.fast_model == "google:gemini-3.6-flash"
+    assert settings.quality_model == "google:gemini-3.6-flash"
+    assert settings.background_model == "google:gemini-3.6-flash"
 
 
 def test_common_model_and_explicit_tier_overrides(monkeypatch: pytest.MonkeyPatch) -> None:

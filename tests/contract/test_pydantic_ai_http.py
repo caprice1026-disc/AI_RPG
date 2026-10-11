@@ -16,7 +16,7 @@ from ai_rpg.contracts.responses import MechanicalNarrationInput
 from ai_rpg.llm.models import build_language_models
 
 pytestmark = pytest.mark.contract
-MODELS = ["google:gemini-3.5-flash", "openai-responses:gpt-5-mini"]
+MODELS = ["google:gemini-3.6-flash", "openai-responses:gpt-5-mini"]
 
 
 def _context():
@@ -36,7 +36,7 @@ def _response(model, raw, failure=None):
         if failure == "refusal":
             return {"promptFeedback": {"blockReason": "SAFETY"}}
         return {
-            "modelVersion": "gemini-3.5-flash",
+            "modelVersion": "gemini-3.6-flash",
             "candidates": [
                 {
                     "index": 0,
@@ -149,6 +149,7 @@ async def test_runtime_agents_send_typed_object_schema_once(monkeypatch, model, 
     body = json.loads(requests[0].content)
     if model.startswith("google:"):
         assert requests[0].url.host == "generativelanguage.googleapis.com"
+        assert requests[0].url.path.endswith("/models/gemini-3.6-flash:generateContent")
         assert requests[0].headers["x-goog-api-key"] == "test-google"
         assert body["generationConfig"]["responseMimeType"] == "application/json"
         schema = body["generationConfig"]["responseJsonSchema"]

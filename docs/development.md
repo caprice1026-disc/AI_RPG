@@ -351,7 +351,7 @@ data: {"id":12,"type":"turn.updated","schema_version":1,"payload":{"turn":{...}}
 
 | 設定 | 用途・優先順位 |
 | --- | --- |
-| `AIRPG_LLM_MODEL` | 共通モデル。既定値 `google:gemini-3.5-flash` |
+| `AIRPG_LLM_MODEL` | 共通モデル。既定値 `google:gemini-3.6-flash` |
 | `AIRPG_FAST_MODEL` | 意図抽出・通常会話。未指定なら共通モデル |
 | `AIRPG_QUALITY_MODEL` | 確定結果の描写。未指定なら共通モデル |
 | `AIRPG_BACKGROUND_MODEL` | 手動依頼の作品作成補助。未指定なら共通モデル |

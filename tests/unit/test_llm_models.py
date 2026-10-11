@@ -54,7 +54,7 @@ async def test_fake_needs_no_clients_or_keys(monkeypatch: pytest.MonkeyPatch) ->
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("model", ["google:gemini-3.5-flash", "gpt-5-mini"])
+@pytest.mark.parametrize("model", ["google:gemini-3.6-flash", "gpt-5-mini"])
 @pytest.mark.parametrize("key", [None, "", "   ", "test\nkey", "test\x00key"])
 async def test_selected_provider_needs_valid_key_before_client_creation(
     monkeypatch: pytest.MonkeyPatch, model: str, key: str | None,
@@ -108,7 +108,7 @@ async def test_tier_mapping_has_canonical_ids_and_clients_close(
     factory = import_module("ai_rpg.llm.models")
     captured = _capture_models(monkeypatch)
     settings = Settings(
-        fast_model="google:gemini-3.5-flash", quality_model="openai:gpt-5.4",
+        fast_model="google:gemini-3.6-flash", quality_model="openai:gpt-5.4",
         background_model="gpt-5-mini", gemini_api_key="google-test", openai_api_key="openai-test",
     )
     monkeypatch.setenv("OPENAI_BASE_URL", "https://untrusted.invalid/")
@@ -118,13 +118,13 @@ async def test_tier_mapping_has_canonical_ids_and_clients_close(
 
     async with factory.build_language_models(settings, fake=False):
         assert set(captured) == {
-            "google:gemini-3.5-flash", "openai-responses:gpt-5.4", "openai-responses:gpt-5-mini",
+            "google:gemini-3.6-flash", "openai-responses:gpt-5.4", "openai-responses:gpt-5-mini",
         }
-        google = captured["google:gemini-3.5-flash"]
+        google = captured["google:gemini-3.6-flash"]
         openai = captured["openai-responses:gpt-5.4"]
         assert isinstance(google, GoogleModel)
         assert isinstance(openai, OpenAIResponsesModel)
-        assert google.model_name == "gemini-3.5-flash"
+        assert google.model_name == "gemini-3.6-flash"
         assert openai.model_name == "gpt-5.4"
         google_client = google.client._api_client
         openai_client = openai.client

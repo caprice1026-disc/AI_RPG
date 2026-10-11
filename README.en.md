@@ -5,6 +5,8 @@
 AI_RPG is a tabletop-style RPG MVP for playing short adventures and authoring your own in the browser.
 The LLM proposes actions and narrates confirmed results. The Game Engine calculates checks, dice, HP, and inventory changes; the application persists them in PostgreSQL.
 
+[Gemini 3.6 Flash migration and validation (2026-10-11)](docs/gemini-36-migration-20261011.md)
+
 ## Start with Docker Compose
 
 On Windows, use PowerShell, Docker Desktop, and Git. Python and Node.js are not required just to play.
@@ -15,7 +17,7 @@ Set-Location AI_RPG
 if (-not (Test-Path -LiteralPath .env)) { Copy-Item .env.example .env }
 ```
 
-Preserve any existing `.env` and set your `GEMINI_API_KEY` locally. The default model is `google:gemini-3.5-flash`; real model calls incur charges. Never put keys in the browser or Git.
+Preserve any existing `.env` and set your `GEMINI_API_KEY` locally. The default model is `google:gemini-3.6-flash`; real model calls incur charges. Never put keys in the browser or Git.
 `AIRPG_LLM_MODEL` sets the shared model. `AIRPG_FAST_MODEL`, `AIRPG_QUALITY_MODEL`, and `AIRPG_BACKGROUND_MODEL` override intent interpretation, narration, and story-authoring assistance respectively.
 
 ```powershell

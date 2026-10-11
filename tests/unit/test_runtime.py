@@ -182,7 +182,7 @@ def test_scenario_state_changing_verbs_route_to_mechanical(player_text: str) -> 
 
 def test_default_resolution_worker_receives_scenario_progressor() -> None:
     llm = DevelopmentFakeLLM()
-    settings = Settings(fast_model="gpt-5-mini", quality_model="google:gemini-3.5-flash")
+    settings = Settings(fast_model="gpt-5-mini", quality_model="google:gemini-3.6-flash")
     worker = build_resolution_worker(
         settings, llm, deterministic=True
     )
@@ -192,4 +192,4 @@ def test_default_resolution_worker_receives_scenario_progressor() -> None:
     assert worker._policy.model_id == "openai-responses:gpt-5-mini"
     narrator = build_narration_worker(settings, llm)
     assert narrator._narrator is llm
-    assert narrator._policy.model_id == "google:gemini-3.5-flash"
+    assert narrator._policy.model_id == "google:gemini-3.6-flash"
